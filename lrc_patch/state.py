@@ -31,14 +31,14 @@ def state_lock(state_dir: Path, timeout: float = 3.0) -> Iterable[None]:
         except BlockingIOError:
             if not waiting:
                 print(
-                    f"状态目录被占用，等待另一个 lyrics.py 结束（最多 {timeout:.0f} 秒）…",
+                    f"状态目录被占用，等待另一个 lrcpatch 结束（最多 {timeout:.0f} 秒）…",
                     flush=True,
                 )
                 waiting = True
             if time.monotonic() >= deadline:
                 handle.close()
                 raise ToolError(
-                    f"状态目录正被另一个 lyrics.py 占用：{state_dir}\n"
+                    f"状态目录正被另一个 lrcpatch 占用：{state_dir}\n"
                     "等它结束再运行；如果是残留进程，可用 --state-dir 指定别的目录。"
                 ) from None
             time.sleep(0.2)

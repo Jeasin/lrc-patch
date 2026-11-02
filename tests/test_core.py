@@ -454,5 +454,70 @@ class JsonClientTests(unittest.TestCase):
         self.assertEqual(cached["data"]["result"]["songs"], [])
 
 
+class ScanListTests(unittest.TestCase):
+    def _track(
+        self,
+        folder: str,
+        name: str,
+        *,
+        lyrics: str = "",
+        album: str = "Album",
+    ) -> Track:
+        return Track(
+            path=Path(folder) / name,
+            relpath=name,
+            fmt="m4a",
+            title="Title",
+            artist="Artist",
+            album=album,
+            albumartist="Artist",
+            duration=213.0,
+            existing_lyrics=lyrics,
+            size=1024 * 1024,
+            mtime_ns=0,
+        )
+
+    def test_duration_and_size_units(self) -> None:
+        self.assertEqual(render.format_duration(213), "03:33")
+        self.assertEqual(render.format_duration(3725), "1:02:05")
+        self.assertEqual(render.format_size(1024), "1.0 KB")
+        self.assertEqual(render.format_size(1536), "1.5 KB")
+
+    def test_scan_list_marks_lyrics_and_tag_gaps(self) -> None:
+        tracks = [
+            self._track(
+                "/lib/A/(2020)Album",
+                "01 A.m4a",
+                lyrics="[00:01.00]x\n[00:02.00]y",
+            ),
+            self._track("/lib/A/(2020)Album", "02 B.m4a", album=""),
+        ]
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            render.print_scan_list(tracks, Path("/lib"))
+        out = buffer.getvalue()
+        self.assertIn("✓ 01 A.m4a", out)
+        self.assertIn("LRC 2 行", out)
+        self.assertIn("· 02 B.m4a", out)
+        self.assertIn("无歌词", out)
+        self.assertIn("缺 专辑", out)
+
+        # Every row's format column starts at the same display column.
+        offsets = set()
+        for line in out.splitlines():
+            if "M4A" not in line:
+                continue
+            plain = render.strip_ansi(line)
+            offsets.add(render.disp_width(plain[: plain.index("M4A")]))
+        self.assertEqual(len(offsets), 1)
+
+    def test_scan_lists_everything_by_default(self) -> None:
+        parser = build_parser()
+        scan = parser.parse_args(["scan", "--", "somewhere"])
+        plan = parser.parse_args(["plan", "--", "somewhere"])
+        self.assertEqual(scan.tree_limit, 0)
+        self.assertEqual(plan.tree_limit, 200)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

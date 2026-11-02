@@ -43,14 +43,14 @@ def _disp_width(text: str) -> int:
 
 
 _EXAMPLES = [
-    ('lyrics.py "結束バンド"', "拖入目录 = 只读 plan"),
-    ('lyrics.py --lrc "Ado" "YOASOBI"', "选项在前；一次多个目录"),
-    ('lyrics.py candidates "Ado" --top 3', "看候选 ID"),
-    ('lyrics.py "Ado/某首.m4a" --pick netease:123', "人工指定后重新 plan"),
-    ('lyrics.py "Ado/某首.m4a" --pick netease:123 --apply', "选中并直接写入"),
-    ('lyrics.py apply "Ado"', "只写 ✓ 可写入"),
-    ('lyrics.py verify "Ado"', "写入后复核"),
-    ('lyrics.py rollback "Ado" --yes', "回滚"),
+    ('lrcpatch "結束バンド"', "拖入目录 = 只读 plan"),
+    ('lrcpatch --lrc "Ado" "YOASOBI"', "选项在前；一次多个目录"),
+    ('lrcpatch candidates "Ado" --top 3', "看候选 ID"),
+    ('lrcpatch "Ado/某首.m4a" --pick netease:123', "人工指定后重新 plan"),
+    ('lrcpatch "Ado/某首.m4a" --pick netease:123 --apply', "选中并直接写入"),
+    ('lrcpatch apply "Ado"', "只写 ✓ 可写入"),
+    ('lrcpatch verify "Ado"', "写入后复核"),
+    ('lrcpatch rollback "Ado" --yes', "回滚"),
 ]
 
 
@@ -64,12 +64,12 @@ def _example_block() -> str:
 
 MAIN_EPILOG = f"""\
 用法
-  lyrics.py [命令] [选项] [路径 ...]
+  lrcpatch [命令] [选项] [路径 ...]
   命令可省略（默认 plan，只读）。选项和路径顺序随意；路径可以一次拖入多个
   文件或文件夹，目录递归；相对路径按音乐库根目录解析。
 
 命令
-  scan        只读扫描格式与已有歌词，不联网
+  scan        只读扫描：格式汇总 + 逐文件明细，不联网
   plan        查询候选并生成计划（默认命令），不写音频
   candidates  列出候选 SOURCE:ID 和分数，供 --pick 使用
   apply       写入 ready 计划，逐文件校验后原子替换
@@ -137,32 +137,32 @@ MAIN_EPILOG = f"""\
 
 环境
   Python 3.9+；依赖 mutagen（写标签），可选 curl_cffi（浏览器指纹）。
-  直接运行 lyrics.py 时 uv 会按文件头的 PEP 723 声明自动安装，无需手动 pip。
-  没有 uv 也能跑：python3 lyrics.py 会切到已装依赖的解释器。
+  直接运行 lrcpatch 时 uv 会按文件头的 PEP 723 声明自动安装，无需手动 pip。
+  没有 uv 也能跑：python3 lrcpatch 会切到已装依赖的解释器。
   状态、HTTP 缓存与报告在 ~/.local/state/lrc-patch，不要删除，否则丢失断点与回滚记录。
 """
 
 PLAN_EPILOG = """\
 示例
-  lyrics.py plan "結束バンド"
-  lyrics.py "Ado" "YOASOBI/(2023)THE BOOK 3" --workers 2
-  lyrics.py "米津玄師" --lrc --lrc-dir ~/.cache/lrc-patch/lrc
-  lyrics.py "結束バンド" --html
-  lyrics.py "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467
-  lyrics.py "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467 --apply
+  lrcpatch plan "結束バンド"
+  lrcpatch "Ado" "YOASOBI/(2023)THE BOOK 3" --workers 2
+  lrcpatch "米津玄師" --lrc --lrc-dir ~/.cache/lrc-patch/lrc
+  lrcpatch "結束バンド" --html
+  lrcpatch "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467
+  lrcpatch "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467 --apply
 
 说明
   plan 只读：不写音频，只更新状态数据库、CSV 和可选的 HTML 复核页。
   ≥85 分且时长在容差内才判 ✓ 可写入；其余是 ! 需确认，需人工 --pick。
   --apply 会在 plan 之后直接写本次的 ✓；! 需确认、✗ 失败/无匹配仍不会写入。
-  打分规则见 lyrics.py -h 的「匹配与打分」。
+  打分规则见 lrcpatch -h 的「匹配与打分」。
   请求失败（✗）不是结论，下次 plan 会自动重试；也可 --retry-failed 重查其余失败类。
 """
 
 APPLY_EPILOG = """\
 示例
-  lyrics.py apply "結束バンド"
-  lyrics.py apply "Ado" --workers 2
+  lrcpatch apply "結束バンド"
+  lrcpatch apply "Ado" --workers 2
 
 说明
   只写状态为 ready 的曲目；已有歌词、需确认、无匹配、请求失败都不会写入，
@@ -173,7 +173,7 @@ APPLY_EPILOG = """\
 
 VERIFY_EPILOG = """\
 示例
-  lyrics.py verify "結束バンド"
+  lrcpatch verify "結束バンド"
 
 说明
   逐首比对歌词、其他标签、封面和音频数据与写入时的记录。
@@ -182,8 +182,8 @@ VERIFY_EPILOG = """\
 
 ROLLBACK_EPILOG = """\
 示例
-  lyrics.py rollback "結束バンド"         只预览，不改文件
-  lyrics.py rollback "結束バンド" --yes   执行移除
+  lrcpatch rollback "結束バンド"         只预览，不改文件
+  lrcpatch rollback "結束バンド" --yes   执行移除
 
 说明
   只处理 journal 中由本工具写入、且歌词之后没有被改动过的曲目。
@@ -212,13 +212,6 @@ def add_common(parser: argparse.ArgumentParser) -> None:
         help="状态、缓存与报告目录（默认 $XDG_STATE_HOME/lrc-patch）",
     )
     parser.add_argument(
-        "--tree-limit",
-        type=int,
-        default=200,
-        metavar="N",
-        help="终端树状明细最多展开 N 行；0 表示不展开（默认 200）",
-    )
-    parser.add_argument(
         "--wrap",
         action="store_true",
         help="长备注按窗口折行；默认不折，超宽直接横向溢出",
@@ -239,6 +232,21 @@ def add_common(parser: argparse.ArgumentParser) -> None:
         nargs="*",
         metavar="路径",
         help="文件或目录；可拖入多个；目录递归；相对路径按音乐库解析",
+    )
+
+
+def add_tree_option(
+    parser: argparse.ArgumentParser,
+    *,
+    default: int = 200,
+    help_text: str = "终端树状明细最多展开 N 行；0 表示不展开（默认 200）",
+) -> None:
+    parser.add_argument(
+        "--tree-limit",
+        type=int,
+        default=default,
+        metavar="N",
+        help=help_text,
     )
 
 
@@ -270,10 +278,10 @@ def add_help_option(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="lyrics.py",
-        usage="lyrics.py [命令] [选项] [路径 ...]",
+        prog="lrcpatch",
+        usage="lrcpatch [命令] [选项] [路径 ...]",
         description=(
-            f"lyrics {APP_VERSION} · 批量歌词：匹配 → 写入 → 校验 → 回滚"
+            f"lrcpatch {APP_VERSION} · 批量歌词：匹配 → 写入 → 校验 → 回滚"
             "（只改歌词字段）；不带命令时默认只读 plan。"
         ),
         epilog=MAIN_EPILOG,
@@ -290,24 +298,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan = sub.add_parser(
         "scan",
-        prog="lyrics.py scan",
-        help="只读扫描格式和已有歌词",
-        description="只读扫描：统计格式、数量与已有歌词，不修改任何文件。",
+        prog="lrcpatch scan",
+        help="只读扫描：逐文件列出格式、时长、大小与歌词状态",
+        description="只读扫描：统计格式与数量，并逐文件列出格式、时长、大小和歌词状态。",
         add_help=False,
         formatter_class=HelpFormatter,
         epilog=(
             "示例\n"
-            '  lyrics.py scan "結束バンド"\n'
-            "  lyrics.py scan --limit 20\n\n"
-            "只读；不打开状态数据库，可以和 plan/apply 同时运行。"
+            '  lrcpatch scan "結束バンド"\n'
+            '  lrcpatch scan "結束バンド" --summary\n'
+            "  lrcpatch scan --limit 20\n\n"
+            "说明\n"
+            "  明细按专辑目录分组，一行一首：✓ 已有歌词 / · 待补，后面是格式、\n"
+            "  时长、大小、歌词类型与行数；标题、艺术家或专辑缺失会标出「缺 …」。\n"
+            "  --summary 只看格式与数量汇总；--tree-limit N 限制明细行数（0 = 全部）。\n"
+            "  只读；不打开状态数据库，可以和 plan/apply 同时运行。"
         ),
     )
     add_help_option(scan)
     add_common(scan)
+    add_tree_option(
+        scan,
+        default=0,
+        help_text="明细最多列出 N 行；0 表示全部（默认 0）",
+    )
+    scan.add_argument(
+        "--summary",
+        action="store_true",
+        help="只看格式与数量汇总，不逐文件列出",
+    )
 
     plan = sub.add_parser(
         "plan",
-        prog="lyrics.py plan",
+        prog="lrcpatch plan",
         help="生成计划，不修改音频",
         description="匹配歌词，写入状态数据库和 CSV；不修改音频。",
         epilog=PLAN_EPILOG,
@@ -316,6 +339,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_help_option(plan)
     add_common(plan)
+    add_tree_option(plan)
     add_lrc_options(plan)
     add_network_options(plan)
     plan.add_argument(
@@ -383,21 +407,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     candidates = sub.add_parser(
         "candidates",
-        prog="lyrics.py candidates",
+        prog="lrcpatch candidates",
         help="列出候选 ID，供 --pick 使用（只读）",
         description="逐首查询并列出候选（ID、分数、时长差），不修改音频和计划。",
         epilog=(
             "示例\n"
-            '  lyrics.py candidates "結束バンド" --top 3\n'
-            '  lyrics.py candidates "Ado" --tsv > picks.tsv\n\n'
+            '  lrcpatch candidates "結束バンド" --top 3\n'
+            '  lrcpatch candidates "Ado" --tsv > picks.tsv\n\n'
             "输出中的 SOURCE:ID 可以直接给 plan --pick，或整理成 --pick-file。\n"
-            "分数与排序规则见 lyrics.py -h 的「匹配与打分」。"
+            "分数与排序规则见 lrcpatch -h 的「匹配与打分」。"
         ),
         formatter_class=HelpFormatter,
         add_help=False,
     )
     add_help_option(candidates)
     add_common(candidates)
+    add_tree_option(candidates)
     add_network_options(candidates)
     candidates.add_argument(
         "--sources",
@@ -424,7 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     apply_cmd = sub.add_parser(
         "apply",
-        prog="lyrics.py apply",
+        prog="lrcpatch apply",
         help="执行 ready 计划并逐文件校验",
         description="把 ready 的歌词写入音频；先写临时副本，校验通过后替换原文件。",
         epilog=APPLY_EPILOG,
@@ -433,6 +458,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_help_option(apply_cmd)
     add_common(apply_cmd)
+    add_tree_option(apply_cmd)
     add_lrc_options(apply_cmd)
     apply_cmd.add_argument(
         "--workers", type=int, metavar="N", default=4, help="写入并发 1..10（默认 4）"
@@ -449,7 +475,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = sub.add_parser(
         "verify",
-        prog="lyrics.py verify",
+        prog="lrcpatch verify",
         help="校验已写入文件的歌词、标签、封面和音频",
         description="逐首比对写入时的歌词、其他标签、封面和音频数据。",
         epilog=VERIFY_EPILOG,
@@ -458,10 +484,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_help_option(verify)
     add_common(verify)
+    add_tree_option(verify)
 
     rollback = sub.add_parser(
         "rollback",
-        prog="lyrics.py rollback",
+        prog="lrcpatch rollback",
         help="移除本工具写入且未改动的歌词",
         description="移除 journal 中由本工具写入、且之后未被改动过的歌词。",
         epilog=ROLLBACK_EPILOG,
@@ -470,6 +497,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_help_option(rollback)
     add_common(rollback)
+    add_tree_option(rollback)
     rollback.add_argument(
         "--yes", action="store_true", help="确认执行移除（不加只预览）"
     )
@@ -534,7 +562,7 @@ def reject_unknown_options(options: list[str], specs: dict[str, int]) -> None:
             hint = f"未知选项 {name}"
         messages.append(hint)
     if messages:
-        raise ToolError("\n".join(messages) + "\n可用 lyrics.py -h 查看全部选项。")
+        raise ToolError("\n".join(messages) + "\n可用 lrcpatch -h 查看全部选项。")
 
 
 def normalize_argv(

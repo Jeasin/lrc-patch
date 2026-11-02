@@ -6,7 +6,7 @@
 """Batch lyrics planner/embedder for a local music library.
 
 Entry point only. The implementation lives in the ``lrc_patch`` package next to
-this file; ``lyrics.py -h`` documents usage, and a bare ``lyrics.py`` prints a
+this file; ``lrcpatch -h`` documents usage, and a bare ``lrcpatch`` prints a
 short intro.
 
 Dependencies
@@ -18,7 +18,7 @@ Dependencies
     urllib automatically (and ``--no-impersonate`` forces that at runtime).
   * Everything else is the standard library, including sqlite3; the sqlite3
     command-line tool is NOT required.
-  * ``python3 lyrics.py`` still works: it re-execs into an interpreter that has
+  * ``python3 lrcpatch`` still works: it re-execs into an interpreter that has
     mutagen (uv tool env, or $LYRICS_MUTAGEN_PYTHON).
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ from pathlib import Path
 
 
 # The user's mutagen is installed in an isolated ``uv tool`` environment.
-# Re-exec into that interpreter so `./lyrics.py` also works from stock python3.
+# Re-exec into that interpreter so `./lrcpatch` also works from stock python3.
 def _ensure_mutagen() -> None:
     if importlib.util.find_spec("mutagen") is not None:
         return
@@ -60,8 +60,8 @@ def _ensure_mutagen() -> None:
         if candidate.is_file():
             os.execv(str(candidate), [str(candidate), me, *sys.argv[1:]])
     sys.exit(
-        "未找到 mutagen。推荐直接运行 lyrics.py（shebang 会让 uv 自动安装依赖）；"
-        "也可以先运行 uv run lyrics.py，或 uv tool install mutagen。"
+        "未找到 mutagen。推荐直接运行 lrcpatch（shebang 会让 uv 自动安装依赖）；"
+        "也可以先运行 uv run lrcpatch，或 uv tool install mutagen。"
     )
 
 

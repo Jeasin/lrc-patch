@@ -45,6 +45,7 @@ from .render import (
     plan_note,
     print_header,
     print_meta,
+    print_scan_list,
     print_summary,
     print_tree,
     rule,
@@ -67,6 +68,20 @@ from .text import lyric_hash, lyric_kind, match_note
 def summarize_plans(rows: list[sqlite3.Row]) -> Counter:
     return Counter(row["status"] for row in rows)
 
+def scan_scope(args: argparse.Namespace, library: Path) -> str:
+    """Readable description of what was scanned: relative paths, not $PWD joins."""
+    paths = getattr(args, "path", None) or []
+    if not paths:
+        return short_path(library)
+    parts: list[str] = []
+    for raw in paths:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = library / candidate
+        parts.append(short_path(candidate, library))
+    return " · ".join(parts)
+
+
 def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
     library = args.library.expanduser().resolve()
     live = ProgressLine()
@@ -75,7 +90,11 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
     live.close()
     formats = Counter(track.fmt for track in tracks)
     existing = Counter(track.fmt for track in tracks if track.has_lyrics)
-    print_header("scan", short_path(library))
+    print_header(
+        "scan",
+        f"{truncate_display(scan_scope(args, library), max(20, screen_width() - 30))}"
+        f"  ·  {len(tracks)} 首",
+    )
     print("  " + style("▸ ", "36") + style("格式", "1;36"))
     items = sorted(formats)
     for index, fmt in enumerate(items):
@@ -90,6 +109,10 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
         )
         print(line)
     print()
+
+    if not getattr(args, "summary", False):
+        print_scan_list(tracks, library, getattr(args, "tree_limit", 0) or 0)
+
     have_total = sum(existing.values())
     print_meta(
         "曲目",
@@ -371,14 +394,14 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             "  "
             + style("待确认", "33")
             + f"  {review} 首不会写入。先看候选："
-            + style(f"lyrics.py candidates{suffix}", "36")
+            + style(f"lrcpatch candidates{suffix}", "36")
         )
         print(
             "  "
             + style("指定", "90")
             + "  选中后："
             + style(
-                f"lyrics.py{suffix} --pick netease:歌曲ID"
+                f"lrcpatch{suffix} --pick netease:歌曲ID"
                 + (" --apply" if getattr(args, "apply", False) else ""),
                 "36",
             )
@@ -415,7 +438,7 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             "  "
             + style("未修改任何音频文件。", "32")
             + "确认后运行 "
-            + style(f"lyrics.py apply{suffix}", "36")
+            + style(f"lrcpatch apply{suffix}", "36")
         )
     print()
     return 0
@@ -821,7 +844,7 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         )
         print()
         return 1
-    print("  " + style("写入完成，可运行 lyrics.py verify 复核。", "32"))
+    print("  " + style("写入完成，可运行 lrcpatch verify 复核。", "32"))
     print()
     return 0
 

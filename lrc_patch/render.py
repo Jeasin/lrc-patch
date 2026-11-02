@@ -17,8 +17,8 @@ from html import escape as html_escape
 from pathlib import Path
 
 from .config import APP_VERSION
-from .models import TreeEntry
-from .text import write_text_atomic
+from .models import Track, TreeEntry
+from .text import lyrics_line_count, lyric_kind, write_text_atomic
 
 
 def default_report_path(state_dir: Path, prefix: str) -> Path:
@@ -520,6 +520,154 @@ def print_tree(
         print()
 
 
+def format_duration(seconds: float) -> str:
+    """mm:ss, or h:mm:ss for the rare album-length track."""
+    total = int(round(max(0.0, float(seconds or 0.0))))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def format_size(size: int) -> str:
+    value = float(max(0, size))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def lyric_summary(text: str) -> str:
+    if not (text or "").strip():
+        return "无歌词"
+    kind = lyric_kind(text).upper()
+    lines = lyrics_line_count(text)
+    return f"{kind} {lines} 行" if lines else kind
+
+
+def tag_gaps(track: Track) -> str:
+    missing = [
+        name
+        for name, value in (
+            ("标题", track.title),
+            ("艺术家", track.artist),
+            ("专辑", track.album),
+        )
+        if not (value or "").strip()
+    ]
+    return "缺 " + "、".join(missing) if missing else ""
+
+
+def _lyric_counts(with_lyrics: int, missing: int) -> str:
+    parts = []
+    if with_lyrics:
+        parts.append(style(f"✓{with_lyrics}", "1;32"))
+    if missing:
+        parts.append(style(f"·{missing}", "90"))
+    return "  " + "  ".join(parts) if parts else ""
+
+
+def print_scan_list(tracks: list[Track], library: Path, limit: int = 0) -> None:
+    """Per-file scan detail, one row per track, grouped by album folder.
+
+    Columns are fixed across the whole listing rather than per folder, so
+    format/duration/size/lyrics line up all the way down the page, and missing
+    title/artist/album tags surface in the last column.
+    """
+    if not tracks:
+        print("  " + style("没有可列出的音频文件。", "90"))
+        print()
+        return
+
+    groups: dict[Path, list[Track]] = {}
+    for track in tracks:
+        groups.setdefault(track.path.parent, []).append(track)
+    folders = sorted(groups, key=lambda item: str(item))
+
+    name_cap = max(28, min(56, screen_width() - 52))
+    names = {id(track): truncate_display(track.path.name, name_cap) for track in tracks}
+    name_width = max(disp_width(name) for name in names.values())
+
+    cells = {
+        id(track): (
+            track.fmt.upper(),
+            format_duration(track.duration),
+            format_size(track.size),
+            lyric_summary(track.existing_lyrics),
+            tag_gaps(track),
+        )
+        for track in tracks
+    }
+    fmt_width = max(3, max(len(row[0]) for row in cells.values()))
+    dur_width = max(5, max(len(row[1]) for row in cells.values()))
+    size_width = max(8, max(len(row[2]) for row in cells.values()))
+    lyric_width = max(6, max(disp_width(row[3]) for row in cells.values()))
+
+    with_lyrics = sum(1 for track in tracks if track.has_lyrics)
+    print(
+        "  "
+        + style("▸ ", "36")
+        + style("明细", "1;36")
+        + style(f"   {len(tracks)} 首", "90")
+        + _lyric_counts(with_lyrics, len(tracks) - with_lyrics)
+    )
+    print()
+
+    shown = 0
+    for folder in folders:
+        if limit and shown >= limit:
+            break
+        items = groups[folder]
+        room = len(items) if not limit else max(0, limit - shown)
+        visible = items[:room]
+        here = sum(1 for track in items if track.has_lyrics)
+        header = (
+            "  "
+            + style("▸ ", "36")
+            + style(short_path(folder, library), "1;36")
+            + style(f"   {len(items)} 首", "90")
+            + _lyric_counts(here, len(items) - here)
+        )
+        print(header)
+
+        for index, track in enumerate(visible):
+            branch = "    └─ " if index == len(visible) - 1 else "    ├─ "
+            symbol, code = ("✓", "1;32") if track.has_lyrics else ("·", "90")
+            fmt, duration, size, lyric, gaps = cells[id(track)]
+            line = (
+                style(branch, "90")
+                + style(symbol, code)
+                + " "
+                + pad_display(names[id(track)], name_width)
+                + "  "
+                + style(fmt.ljust(fmt_width), "90")
+                + "  "
+                + style(duration.rjust(dur_width), "90")
+                + "  "
+                + style(size.rjust(size_width), "90")
+                + "  "
+                + style(
+                    pad_display(lyric, lyric_width),
+                    "32" if track.has_lyrics else "90",
+                )
+            )
+            if gaps:
+                line += "  " + style(gaps, "33")
+            print(line.rstrip())
+        print()
+        shown += len(visible)
+
+    if limit and len(tracks) > shown:
+        print(
+            "  "
+            + style(
+                f"… 另有 {len(tracks) - shown} 首未列出；--tree-limit 0 可列出全部。",
+                "33",
+            )
+        )
+        print()
+
+
 class ProgressLine:
     """Animated status line; silent when its stream is not a TTY.
 
@@ -656,7 +804,7 @@ def print_intro() -> None:
     print()
     print(
         "  "
-        + style("lyrics", "1;36")
+        + style("lrcpatch", "1;36")
         + style(f"  {APP_VERSION}", "90")
         + "   批量歌词：匹配 → 写入 → 校验 → 回滚"
     )
@@ -666,12 +814,12 @@ def print_intro() -> None:
     print()
     print("  " + style("常用", "1"))
     rows = [
-        ('lyrics.py "結束バンド"', "拖入目录 = 只读 plan"),
-        ('lyrics.py "Ado" --html', "生成计划与 HTML 复核页"),
-        ('lyrics.py candidates "Ado"', "查看候选 ID（配合 --pick）"),
-        ('lyrics.py apply "Ado"', "只写入 ✓ ready 的曲目"),
-        ('lyrics.py verify "Ado"', "校验歌词与其他标签"),
-        ('lyrics.py rollback "Ado" --yes', "回滚本工具写入的歌词"),
+        ('lrcpatch "結束バンド"', "拖入目录 = 只读 plan"),
+        ('lrcpatch "Ado" --html', "生成计划与 HTML 复核页"),
+        ('lrcpatch candidates "Ado"', "查看候选 ID（配合 --pick）"),
+        ('lrcpatch apply "Ado"', "只写入 ✓ ready 的曲目"),
+        ('lrcpatch verify "Ado"', "校验歌词与其他标签"),
+        ('lrcpatch rollback "Ado" --yes', "回滚本工具写入的歌词"),
     ]
     width = max(disp_width(command) for command, _ in rows)
     for command, note in rows:
@@ -690,8 +838,8 @@ def print_intro() -> None:
     print(
         "  "
         + style("详细参数", "90")
-        + "  lyrics.py -h"
+        + "  lrcpatch -h"
         + style("      单个命令", "90")
-        + "  lyrics.py plan -h"
+        + "  lrcpatch plan -h"
     )
     print()
