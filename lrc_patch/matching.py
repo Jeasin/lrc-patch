@@ -273,6 +273,9 @@ def assign_picks(
         preview.append((track, candidate, score, diff))
 
     unresolved = [value for value in dict.fromkeys(values) if value not in used]
+    # Greedy order is by score, but the preview should read like the album does.
+    order = {str(track.path): index for index, track in enumerate(tracks)}
+    preview.sort(key=lambda item: order.get(str(item[0].path), len(order)))
     return assignments, unresolved, preview
 
 

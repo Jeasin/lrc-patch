@@ -392,7 +392,8 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
 
     print("  " + rule())
     print_summary(summary)
-    for path in picks:
+    order = {str(track.path): index for index, track in enumerate(tracks)}
+    for path in sorted(picks, key=lambda item: order.get(item, len(order))):
         row = state.get_plan(path)
         if row:
             symbol, code, label = status_style(row["status"])
