@@ -21,6 +21,7 @@ from .config import AUDIO_EXTS, LYRICS_LANG
 from .errors import ToolError, VerificationError
 from .models import Track
 from .paths import iter_selected_files, resolve_selection, selection_matches
+from .sorting import sort_paths
 from .text import (
     first_text,
     lyric_hash,
@@ -79,7 +80,9 @@ def load_tracks(
     tracks: list[Track] = []
     errors: list[tuple[Path, str]] = []
     selected = resolve_selection(library, paths)
-    for path in sorted(iter_selected_files(library, selected)):
+    # Finder order before --limit truncates: the first N files then match the
+    # order the user sees in the terminal, not the raw code-point order.
+    for path in sort_paths(iter_selected_files(library, selected), library):
         if not selection_matches(path, library, album, selected):
             continue
         try:

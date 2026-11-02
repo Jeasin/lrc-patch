@@ -7,13 +7,14 @@ from . import commands
 from .cli_args import (
     COMMAND_NAMES,
     build_parser,
+    main_help,
     normalize_argv,
     option_specs,
     reject_unknown_options,
 )
 from .config import APP_VERSION, SOURCE_NAMES, default_state_dir
 from .errors import ToolError
-from .render import print_intro, set_color, set_wrap
+from .render import print_intro, set_color
 from .state import State, state_lock
 
 
@@ -29,8 +30,10 @@ def main() -> int:
     if not argv:
         print_intro()
         return 0
+    if "--no-color" in argv:
+        set_color(False)
     if argv[0] in {"help", "?"}:
-        parser.print_help()
+        print(main_help())
         return 0
     if "--version" in argv:
         print(APP_VERSION)
@@ -38,7 +41,7 @@ def main() -> int:
 
     has_command = any(token in COMMAND_NAMES for token in argv)
     if ("-h" in argv or "--help" in argv) and not has_command:
-        parser.print_help()
+        print(main_help())
         return 0
 
     specs = option_specs(parser)
@@ -51,7 +54,6 @@ def main() -> int:
 
     if getattr(args, "no_color", False):
         set_color(False)
-    set_wrap(bool(getattr(args, "wrap", False)))
     args.path = list(getattr(args, "paths", []) or [])
     state_dir = (args.state_dir or default_state_dir()).resolve()
     args.sources = [
@@ -98,9 +100,8 @@ def main() -> int:
         if args.command == "rollback":
             return commands.cmd_rollback(args, state, state_dir)
 
-    parser.print_help()
+    print(main_help())
     return 2
-
 
 def run() -> int:
     """Console-script entry point: turn expected failures into one clear line."""

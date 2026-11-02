@@ -5,11 +5,11 @@ import io
 import tempfile
 import unittest
 import urllib.error
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from lrc_patch import render, sources
+from lrc_patch import render, sorting, sources
 from lrc_patch.cli_args import (
     build_parser,
     normalize_argv,
@@ -22,6 +22,8 @@ from lrc_patch.models import Candidate, Track, TreeEntry
 from lrc_patch.state import State
 from lrc_patch.text import (
     lrc_timestamp_issue,
+    lyric_kind,
+    lyric_tag,
     match_note,
     sha256_text,
     strip_edition,
@@ -61,16 +63,18 @@ class FailingSource:
 
 
 class DefaultsTests(unittest.TestCase):
-    def test_notes_do_not_wrap_by_default(self) -> None:
-        self.assertFalse(render._WRAP_ENABLED)
+    def test_wrap_flags_are_gone(self) -> None:
+        parser = build_parser()
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["plan", "--wrap"])
 
     def test_unknown_option_is_suggested(self) -> None:
         specs = option_specs(build_parser())
         with self.assertRaises(ToolError) as ctx:
             reject_unknown_options(["--no-warp"], specs)
         message = str(ctx.exception)
-        self.assertIn("--no-wrap", message)
-        self.assertIn("默认已经不换行", message)
+        self.assertIn("已移除", message)
+        self.assertIn("折行", message)
 
     def test_known_options_pass(self) -> None:
         specs = option_specs(build_parser())
@@ -247,13 +251,11 @@ class VersionScoringTests(unittest.TestCase):
 class TreeAlignmentTests(unittest.TestCase):
     def setUp(self) -> None:
         render.set_color(False)
-        render.set_wrap(True)
         self._width = render.screen_width
         render.screen_width = lambda: 100
 
     def tearDown(self) -> None:
         render.screen_width = self._width
-        render.set_wrap(False)
 
     def _render(self, entries: list[TreeEntry]) -> list[str]:
         buffer = io.StringIO()
@@ -278,15 +280,24 @@ class TreeAlignmentTests(unittest.TestCase):
         for line in wrapped:
             self.assertEqual(len(line) - len(line.lstrip()), column)
 
-    def test_no_wrap_keeps_note_on_one_line(self) -> None:
-        render.set_wrap(False)
+    def test_long_notes_always_wrap(self) -> None:
         long_note = "错误：" + "x" * 300
         lines = self._render(
             [TreeEntry(Path("/library/A/01 track.m4a"), "error", long_note)]
         )
         matching = [line for line in lines if "错误：" in line]
         self.assertEqual(len(matching), 1)
-        self.assertGreater(len(matching[0]), 200)
+        self.assertLess(len(matching[0]), 120)
+        self.assertGreater(len(lines), 2)
+
+    def test_line_counts_align_within_an_album(self) -> None:
+        entries = [
+            TreeEntry(Path("/library/A/01 a.m4a"), "ready", "netease · 100分 · LRC 6行"),
+            TreeEntry(Path("/library/A/02 b.m4a"), "ready", "netease · 100分 · LRC 23行"),
+        ]
+        lines = self._render(entries)
+        columns = {line.index("行") for line in lines if "LRC" in line}
+        self.assertEqual(len(columns), 1)
 
 
 class StateMigrationTests(unittest.TestCase):
@@ -466,12 +477,13 @@ class ScanListTests(unittest.TestCase):
         *,
         lyrics: str = "",
         album: str = "Album",
+        title: str = "Title",
     ) -> Track:
         return Track(
             path=Path(folder) / name,
             relpath=name,
             fmt="m4a",
-            title="Title",
+            title=title,
             artist="Artist",
             album=album,
             albumartist="Artist",
@@ -494,7 +506,7 @@ class ScanListTests(unittest.TestCase):
                 "01 A.m4a",
                 lyrics="[00:01.00]x\n[00:02.00]y",
             ),
-            self._track("/lib/A/(2020)Album", "02 B.m4a", album=""),
+            self._track("/lib/A/(2020)Album", "02 B.m4a", title=""),
         ]
         buffer = io.StringIO()
         with redirect_stdout(buffer):
@@ -504,7 +516,9 @@ class ScanListTests(unittest.TestCase):
         self.assertIn("LRC 2 行", out)
         self.assertIn("· 02 B.m4a", out)
         self.assertIn("无歌词", out)
-        self.assertIn("缺 专辑", out)
+        self.assertIn("缺 标题", out)
+        # Singles have no album tag on purpose: that must not be reported.
+        self.assertNotIn("缺 专辑", out)
 
         # Every row's format column starts at the same display column.
         offsets = set()
@@ -515,12 +529,150 @@ class ScanListTests(unittest.TestCase):
             offsets.add(render.disp_width(plain[: plain.index("M4A")]))
         self.assertEqual(len(offsets), 1)
 
+    def test_scan_line_counts_align_within_an_album(self) -> None:
+        tracks = [
+            self._track("/lib/A/Album", "01 A.m4a", lyrics="[00:01.00]x"),
+            self._track(
+                "/lib/A/Album",
+                "02 B.m4a",
+                lyrics="\n".join(f"[00:{i:02d}.00]x" for i in range(12)),
+            ),
+        ]
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            render.print_scan_list(tracks, Path("/lib"))
+        rows = [
+            render.strip_ansi(line)
+            for line in buffer.getvalue().splitlines()
+            if "LRC" in line
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({row.index("行") for row in rows}), 1)
+
+    def test_scan_uses_finder_folder_order(self) -> None:
+        tracks = [
+            self._track("/lib/Aimer/Album", "01 A.m4a"),
+            self._track("/lib/五月天/(2016)自传", "01 B.m4a"),
+        ]
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            render.print_scan_list(tracks, Path("/lib"))
+        out = render.strip_ansi(buffer.getvalue())
+        self.assertLess(out.index("五月天"), out.index("Aimer"))
+
     def test_scan_lists_everything_by_default(self) -> None:
         parser = build_parser()
         scan = parser.parse_args(["scan", "--", "somewhere"])
         plan = parser.parse_args(["plan", "--", "somewhere"])
         self.assertEqual(scan.tree_limit, 0)
         self.assertEqual(plan.tree_limit, 200)
+
+
+class LyricFormatTests(unittest.TestCase):
+    def test_formats_are_distinguished(self) -> None:
+        self.assertEqual(lyric_kind("just words\nno timing"), "plain")
+        self.assertEqual(lyric_kind("[00:12.34]line\n[00:15.00]two"), "lrc")
+        self.assertEqual(
+            lyric_kind("[00:12.34]<00:12.34>word <00:12.80>two"), "enhanced"
+        )
+        self.assertEqual(lyric_kind("[1234,567](1234,567,0)word"), "yrc")
+        self.assertEqual(
+            lyric_kind('<?xml version="1.0"?><tt xmlns="http://www.w3.org/ns/ttml">'),
+            "ttml",
+        )
+
+    def test_tags_and_colours_differ(self) -> None:
+        self.assertEqual(lyric_tag("plain"), "TXT")
+        self.assertEqual(lyric_tag("lrc"), "LRC")
+        self.assertEqual(lyric_tag("enhanced"), "LRC+")
+        colours = {
+            render.LYRIC_COLORS[kind]
+            for kind in ("plain", "lrc", "enhanced", "yrc", "ttml")
+        }
+        self.assertEqual(len(colours), 5)
+
+    def test_timeline_check_skips_advanced_formats(self) -> None:
+        yrc = "[1000,500](1000,500,0)word"
+        self.assertEqual(lrc_timestamp_issue(yrc, 200.0), "")
+        self.assertIn(
+            "超过", lrc_timestamp_issue("[00:10.00]a\n[05:00.00]b", 200.0)
+        )
+
+
+class SortingTests(unittest.TestCase):
+    def test_script_groups_follow_finder(self) -> None:
+        names = ["YOASOBI", "ヨルシカ", "Aimer", "『ユイカ』", "88rising", "五月天"]
+        self.assertEqual(
+            sorting.sort_names(names),
+            ["『ユイカ』", "88rising", "五月天", "Aimer", "YOASOBI", "ヨルシカ"],
+        )
+
+    @unittest.skipIf(
+        sorting.collation_name() == "code-point", "zh_CN collation not installed"
+    )
+    def test_han_names_sort_by_pinyin(self) -> None:
+        names = ["周杰伦", "五月天", "久石譲", "宮脇咲良", "林俊杰", "张杰"]
+        self.assertEqual(
+            sorting.sort_names(names),
+            ["宮脇咲良", "久石譲", "林俊杰", "五月天", "张杰", "周杰伦"],
+        )
+
+    def test_numbers_compare_naturally(self) -> None:
+        self.assertEqual(
+            sorting.sort_names(["10 x.m4a", "2 x.m4a", "1 x.m4a"]),
+            ["1 x.m4a", "2 x.m4a", "10 x.m4a"],
+        )
+
+
+class SearchRequestCountTests(unittest.TestCase):
+    """One search per track unless the first batch has nothing usable."""
+
+    class Client:
+        def __init__(self, batches: list[list[dict]]) -> None:
+            self.batches = batches
+            self.queries: list[str] = []
+
+        def request(self, source, url, min_interval, **kwargs):
+            self.queries.append(kwargs.get("body", {}).get("s", ""))
+            index = min(len(self.queries) - 1, len(self.batches) - 1)
+            return 200, {"code": 200, "result": {"songs": self.batches[index]}}
+
+        def get(self, *args, **kwargs):  # pragma: no cover - search only
+            raise AssertionError("search must not fetch lyrics")
+
+    @staticmethod
+    def song(title: str, artist: str = "Artist", album: str = "Album") -> dict:
+        return {
+            "id": 1,
+            "name": title,
+            "artists": [{"name": artist}],
+            "album": {"name": album},
+            "duration": 200000,
+        }
+
+    def test_perfect_first_batch_costs_one_request(self) -> None:
+        client = self.Client([[self.song("Track")], [self.song("Track")]])
+        source = sources.NeteaseSource(client)
+        found = source.search(make_track(title="Track", artist="Artist", album="Album"))
+        self.assertEqual(len(client.queries), 1)
+        self.assertEqual(found[0].title, "Track")
+
+    def test_unrelated_first_batch_triggers_the_fallback(self) -> None:
+        client = self.Client(
+            [[self.song("Something Else", artist="Nobody")], [self.song("Track")]]
+        )
+        source = sources.NeteaseSource(client)
+        source.search(make_track(title="Track", artist="Artist", album="Album"))
+        self.assertEqual(len(client.queries), 2)
+        self.assertEqual(client.queries[1], "Track")
+
+    def test_force_search_keeps_both_queries_for_pick(self) -> None:
+        client = self.Client([[self.song("Track")], [self.song("Track")]])
+        source = sources.NeteaseSource(client)
+        source.search(
+            make_track(title="Track", artist="Artist", album="Album"), exhaustive=True
+        )
+        self.assertEqual(len(client.queries), 2)
 
 
 if __name__ == "__main__":

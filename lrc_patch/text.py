@@ -18,6 +18,23 @@ from .config import (
     TIMESTAMP_RE,
 )
 
+# Lyric markup beyond plain LRC.  Detection is deliberately conservative: a
+# wrong "advanced" label only changes the colour, but a wrong "ttml" label
+# would skip the timeline check for an ordinary LRC.
+_TTML_RE = re.compile(
+    r"<\s*(?:tt|tt:tt|p)\b[^>]*\b(?:begin|xmlns|dur|end)=", re.IGNORECASE
+)
+_WORD_TIME_RE = re.compile(r"<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>")
+_YRC_LINE_RE = re.compile(r"^\[\d{1,4},\d{1,5}\]", re.MULTILINE)
+
+LYRIC_TAGS = {
+    "plain": "TXT",
+    "lrc": "LRC",
+    "enhanced": "LRC+",
+    "yrc": "YRC",
+    "ttml": "TTML",
+}
+
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -220,14 +237,46 @@ def sanitize_lyrics(text: str) -> str:
     return text.strip() + "\n" if text.strip() else ""
 
 def lyric_kind(text: str) -> str:
-    return "lrc" if TIMESTAMP_RE.search(text or "") else "plain"
+    """Classify lyric markup: plain / lrc / enhanced / yrc / ttml.
+
+    Providers and local files use more than one lyric format, and they look
+    identical in a green column.  ``enhanced`` is LRC with per-word
+    timestamps (``[00:12.34]<00:12.34>word``), ``yrc``/``qrc`` are the
+    ``[start,duration](start,duration,0)`` line formats used by QQ Music and
+    karaoke players, ``ttml`` is Apple Music's XML.  Only the first two share
+    the line-timestamp checks; the rest are still accepted as lyrics.
+    """
+    body = (text or "").lstrip("\ufeff")
+    if not body.strip():
+        return "plain"
+    head = body[:4000]
+    if head.startswith("<?xml") or _TTML_RE.search(head):
+        return "ttml"
+    if _YRC_LINE_RE.search(body):
+        return "yrc"
+    if TIMESTAMP_RE.search(body):
+        return "enhanced" if _WORD_TIME_RE.search(body) else "lrc"
+    return "plain"
+
+
+def lyric_tag(kind: str) -> str:
+    """Short uppercase label used by the terminal and the scan list."""
+    return LYRIC_TAGS.get(kind, kind.upper())
+
+
+def lyric_line_count(text: str, kind: str | None = None) -> int:
+    """Meaningful line count; TTML counts <p> blocks instead of XML lines."""
+    body = text or ""
+    if (kind or lyric_kind(body)) == "ttml":
+        return len(re.findall(r"<p\b", body))
+    return len([line for line in body.splitlines() if line.strip()])
 
 def is_placeholder(text: str) -> bool:
     plain = re.sub(r"\[[^\]]*\]", "", text or "").strip().casefold()
     return not plain or plain in PLACEHOLDERS
 
 def lyrics_line_count(text: str) -> int:
-    return len([line for line in (text or "").splitlines() if line.strip()])
+    return lyric_line_count(text)
 
 def lrc_time_values(text: str) -> list[float]:
     """Return every timestamp in seconds; metadata tags like [ar:] are ignored."""
@@ -240,8 +289,13 @@ def lrc_time_values(text: str) -> list[float]:
     return values
 
 def lrc_timestamp_issue(text: str, duration: float) -> str:
-    """Describe a suspicious LRC timeline, or return "" when it looks sane."""
-    if duration <= 0 or lyric_kind(text) != "lrc":
+    """Describe a suspicious LRC timeline, or return "" when it looks sane.
+
+    Only line-timestamped formats can be checked this way; word-level
+    (enhanced), YRC and TTML carry their own timing model and are left alone
+    rather than guessed at.
+    """
+    if duration <= 0 or lyric_kind(text) not in {"lrc", "enhanced"}:
         return ""
     values = lrc_time_values(text)
     if not values:

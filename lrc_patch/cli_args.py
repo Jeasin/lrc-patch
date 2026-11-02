@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import re
 import shutil
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from .config import (
     DEFAULT_SOURCES,
 )
 from .errors import ToolError
+from .render import disp_width, style
 
 
 COMMAND_NAMES = {"scan", "plan", "apply", "verify", "rollback", "candidates"}
@@ -37,17 +39,15 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter):
 
 
 def _disp_width(text: str) -> int:
-    import unicodedata
-
-    return sum(2 if unicodedata.east_asian_width(ch) in "FW" else 1 for ch in text)
+    return disp_width(text)
 
 
 _EXAMPLES = [
-    ('lrcpatch "結束バンド"', "拖入目录 = 只读 plan"),
-    ('lrcpatch --lrc "Ado" "YOASOBI"', "选项在前；一次多个目录"),
+    ('lrcpatch "結束バンド"', "省略命令 = 只读 plan"),
+    ('lrcpatch scan "Aimer" --summary', "只看格式汇总"),
     ('lrcpatch candidates "Ado" --top 3', "看候选 ID"),
-    ('lrcpatch "Ado/某首.m4a" --pick netease:123', "人工指定后重新 plan"),
-    ('lrcpatch "Ado/某首.m4a" --pick netease:123 --apply', "选中并直接写入"),
+    ('lrcpatch plan "Ado/某首.m4a" --pick netease:123', "人工指定候选"),
+    ('lrcpatch plan "Ado/某首.m4a" --pick netease:123 --apply', "指定并直接写入"),
     ('lrcpatch apply "Ado"', "只写 ✓ 可写入"),
     ('lrcpatch verify "Ado"', "写入后复核"),
     ('lrcpatch rollback "Ado" --yes', "回滚"),
@@ -57,29 +57,147 @@ _EXAMPLES = [
 def _example_block() -> str:
     width = max(_disp_width(command) for command, _ in _EXAMPLES)
     return "\n".join(
-        "  " + command + " " * (width - _disp_width(command) + 2) + note
+        "  " + style(command, "36")
+        + " " * (width - _disp_width(command) + 2)
+        + style(note, "90")
         for command, note in _EXAMPLES
     )
 
 
-MAIN_EPILOG = f"""\
-用法
-  lrcpatch [命令] [选项] [路径 ...]
-  命令可省略（默认 plan，只读）。选项和路径顺序随意；路径可以一次拖入多个
-  文件或文件夹，目录递归；相对路径按音乐库根目录解析。
+def _opt(name: str, metavar: str = "") -> tuple[str, str]:
+    plain = f"{name} {metavar}".strip()
+    colored = style(name, "1;32")
+    if metavar:
+        colored += " " + style(metavar, "33")
+    return plain, colored
 
-命令
-  scan        只读扫描：格式汇总 + 逐文件明细，不联网
-  plan        查询候选并生成计划（默认命令），不写音频
-  candidates  列出候选 SOURCE:ID 和分数，供 --pick 使用
-  apply       写入 ready 计划，逐文件校验后原子替换
-  verify      复核已写入的文件：歌词、其他标签、封面、音频
-  rollback    移除本工具写入且之后未被改动的歌词
 
-示例
+def _table(rows: list[tuple[str, str, str]], indent: str = "    ") -> str:
+    width = max((disp_width(plain) for plain, _, _ in rows), default=0)
+    lines: list[str] = []
+    for plain, colored, note in rows:
+        line = indent + colored
+        if note:
+            line += " " * (width - disp_width(plain) + 2) + note
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _flag_block(rows: list[tuple[str, str]]) -> str:
+    width = max(len(name) for name, _ in rows)
+    lines: list[str] = []
+    for name, flags in rows:
+        chunks = flags.split("\n")
+        lines.append(
+            "  " + style(name.ljust(width), "1;36") + "  " + style(chunks[0], "32")
+        )
+        for chunk in chunks[1:]:
+            lines.append(" " * (2 + width + 2) + style(chunk, "32"))
+    return "\n".join(lines)
+
+
+def main_help() -> str:
+    """The top-level page: 命令 and 参数 are separate, and usage is command-first."""
+    usage = _table(
+        [
+            (
+                "lrcpatch 命令 [--参数 …] 路径 …",
+                style("lrcpatch", "1;36")
+                + " "
+                + style("命令", "1;35")
+                + " "
+                + style("[--参数 …]", "32")
+                + " "
+                + style("路径 …", "33"),
+                "",
+            ),
+            (
+                "lrcpatch 路径 …",
+                style("lrcpatch", "1;36") + " " + style("路径 …", "33"),
+                style("省略命令 = plan（只读）", "90"),
+            ),
+        ],
+        indent="  ",
+    )
+
+    commands = _table(
+        [
+            (name, style(name, "1;36"), note)
+            for name, note in (
+                ("scan", "只读扫描：格式汇总 + 逐文件明细，不联网"),
+                ("plan", "查询候选并生成计划（默认命令），不写音频"),
+                ("candidates", "列出候选 SOURCE:ID 与分数，供 --pick 使用"),
+                ("apply", "写入 ✓ 可写入，逐文件校验后原子替换"),
+                ("verify", "复核已写入的歌词、标签、封面、音频"),
+                ("rollback", "移除本工具写入且之后未被改动的歌词"),
+            )
+        ],
+        indent="  ",
+    )
+
+    common_rows: list[tuple[str, str, str]] = []
+    for name, metavar, note in (
+        ("--library", "DIR", "音乐库根目录（默认 ~/Music/JMusic）"),
+        ("--limit", "N", "最多处理 N 首"),
+        ("--tree-limit", "N", "明细行数（plan/apply 默认 200，scan 默认全部）"),
+        ("--state-dir", "DIR", "状态、缓存与报告目录"),
+        ("--no-color", "", "关闭颜色（也可 NO_COLOR=1）"),
+    ):
+        plain, colored = _opt(name, metavar)
+        common_rows.append((plain, colored, note))
+    common_rows.append(
+        (
+            "路径 …",
+            style("路径 …", "33"),
+            "文件或目录，可多个；目录递归；相对路径按音乐库解析",
+        )
+    )
+    common = _table(common_rows, indent="  ")
+
+    flags = _flag_block(
+        [
+            (
+                "plan",
+                "--pick SRC:ID  --pick-file FILE  --apply  --sources LIST  --workers N\n"
+                "--refresh  --retry-failed  --html [FILE]  --lrc  --duration-tolerance SEC",
+            ),
+            (
+                "candidates",
+                "--top N  --sources LIST  --workers N  --tsv  --all  --refresh",
+            ),
+            ("apply", "--workers N  --no-preflight  --lrc"),
+            ("scan", "--summary"),
+            ("rollback", "--yes"),
+        ]
+    )
+
+    header = (
+        style("lrcpatch", "1;36")
+        + style(f" {APP_VERSION}", "90")
+        + "   "
+        + style("批量歌词：匹配 → 写入 → 校验 → 回滚", "1")
+    )
+
+    return f"""{header}
+
+{style("用法", "1;36")}
+{usage}
+  {style("选项和路径顺序随意；命令可省略，默认 plan。", "90")}
+
+{style("命令", "1;36")}
+{commands}
+
+{style("通用参数", "1;36")}
+{common}
+
+{style("各命令参数", "1;36")}
+{flags}
+  {style("完整说明：lrcpatch 命令 -h（例如 lrcpatch plan -h）", "90")}
+
+{style("示例", "1;36")}
 {_example_block()}
 
-匹配与打分
+{style("匹配与打分", "1;36")}
   按标题、艺术家、专辑、时长打分，满分 100；≥85 自动写入，否则 ! 需确认。
 
   标题      完全相同 +55
@@ -108,11 +226,19 @@ MAIN_EPILOG = f"""\
   排序      先按不含时长的元数据分，再按含时长的分，再按时长差，最后偏好带 LRC 的
   待确认    分数不足 85，或时长差超过容差。用 candidates 看全部候选，再 --pick 指定。
 
-写入前检查
+{style("写入前检查", "1;36")}
   时长差 ≤ 容差；LRC 末行时间戳不超过音频时长 3s；LRC 覆盖 ≥55% 时长。
   后两条不符会判为 ! 时间轴可疑（常见于 TV size、剪辑版、整轨版）。
 
-状态
+{style("歌词格式", "1;36")}
+  {style("TXT", "36")}    纯文本，没有时间轴
+  {style("LRC", "32")}    逐行时间轴，最常见的格式
+  {style("LRC+", "1;32")}  逐字时间轴（Enhanced LRC，<mm:ss.xx> 标记）
+  {style("YRC", "1;34")}    QQ 音乐逐字格式 [起始,时长](起始,时长,0)
+  {style("TTML", "1;35")}   Apple Music 的 XML 歌词
+  YRC / TTML 这类高级格式只做识别与颜色区分，不做时间轴校验。
+
+{style("状态", "1;36")}
   ✓ 可写入      标题/艺术家/专辑/时长都过，apply 会写
   ✓ 已写入      已写入并通过逐项校验
   ! 需确认      分数不足 85 或时长差超容差，apply 不写
@@ -122,20 +248,18 @@ MAIN_EPILOG = f"""\
   · 已有歌词    不覆盖
   ♪ 纯音乐      源标记为 instrumental
 
-网络
-  默认只用 netease（约 0.9s 一次，并发不会突破最小间隔）。lrclib 近期持续
-  503/429，已改为可选：加 --sources netease,lrclib 才启用（它的 instrumental
-  标记仍能识别纯音乐）。
-  被限流（netease code 405/406、HTTP 429）时先放慢重试，仍失败就暂停该源约
-  180s，其余曲目立即失败而不是继续撞墙；稍后重跑同一条命令会自动重试。
+{style("网络与缓存", "1;36")}
+  每首曲目通常只有 1 次搜索 + 1 次取词。只有当第一条搜索里没有任何标题与
+  艺术家都对得上的候选时，才补发 1 次仅用标题的搜索；已经能确定结果就不再
+  追问。--top 只决定 candidates 显示几行，不影响请求数。
+  netease 约 0.9s 一次，并发不会突破最小间隔。被限流（code 405/406、HTTP 429）
+  时先放慢重试，仍失败就暂停该源约 180s，其余曲目立即失败而不是继续撞墙。
   服务过载（HTTP 500/502/503/504）走退避，两次耗尽后暂停 60s 起。
-  请求失败记为 ✗ 失败，不是「无匹配」，不写 30 天缓存，也不覆盖已有的 ✓ 计划。
-  plan 与 candidates 共用同一个 HTTP 缓存：candidates 查过的搜索，plan 不再请求；
-  plan 只额外取一次选中候选的歌词。想强制重查加 --refresh。
-  装了 curl_cffi 就默认用它的浏览器 TLS 指纹发请求（对 Cloudflare 更友好）；
-  想退回标准库加 --no-impersonate。
+  请求失败记为 ✗ 失败，不是「无匹配」，不写缓存，也不覆盖已有的 ✓ 计划。
+  plan 与 candidates 共用同一个 HTTP 缓存：candidates 查过的搜索，plan 不再
+  请求。想强制重查加 --refresh。装了 curl_cffi 就默认用浏览器 TLS 指纹。
 
-环境
+{style("环境", "1;36")}
   Python 3.9+；依赖 mutagen（写标签），可选 curl_cffi（浏览器指纹）。
   直接运行 lrcpatch 时 uv 会按文件头的 PEP 723 声明自动安装，无需手动 pip。
   没有 uv 也能跑：python3 lrcpatch 会切到已装依赖的解释器。
@@ -145,16 +269,17 @@ MAIN_EPILOG = f"""\
 PLAN_EPILOG = """\
 示例
   lrcpatch plan "結束バンド"
-  lrcpatch "Ado" "YOASOBI/(2023)THE BOOK 3" --workers 2
-  lrcpatch "米津玄師" --lrc --lrc-dir ~/.cache/lrc-patch/lrc
-  lrcpatch "結束バンド" --html
-  lrcpatch "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467
-  lrcpatch "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467 --apply
+  lrcpatch plan "Ado" "YOASOBI/(2023)THE BOOK 3" --workers 2
+  lrcpatch plan "米津玄師" --lrc --lrc-dir ~/.cache/lrc-patch/lrc
+  lrcpatch plan "結束バンド" --html
+  lrcpatch plan "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467
+  lrcpatch plan "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467 --apply
 
 说明
   plan 只读：不写音频，只更新状态数据库、CSV 和可选的 HTML 复核页。
   ≥85 分且时长在容差内才判 ✓ 可写入；其余是 ! 需确认，需人工 --pick。
   --apply 会在 plan 之后直接写本次的 ✓；! 需确认、✗ 失败/无匹配仍不会写入。
+  每首通常 1 次搜索 + 1 次取词；搜索已经能确定结果时不再补发标题搜索。
   打分规则见 lrcpatch -h 的「匹配与打分」。
   请求失败（✗）不是结论，下次 plan 会自动重试；也可 --retry-failed 重查其余失败类。
 """
@@ -212,17 +337,6 @@ def add_common(parser: argparse.ArgumentParser) -> None:
         help="状态、缓存与报告目录（默认 $XDG_STATE_HOME/lrc-patch）",
     )
     parser.add_argument(
-        "--wrap",
-        action="store_true",
-        help="长备注按窗口折行；默认不折，超宽直接横向溢出",
-    )
-    # Kept so old shell history keeps working; wrapping is already the default off.
-    parser.add_argument(
-        "--no-wrap",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
         "--no-color",
         action="store_true",
         help="关闭彩色输出（也可设 NO_COLOR=1）",
@@ -272,19 +386,64 @@ def add_network_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+_HELP_OPTION_RE = re.compile(r"^(\s{2,})(-{1,2}[A-Za-z][\w-]*)(.*)$")
+
+
+def colorize_help(text: str) -> str:
+    """Colour an argparse page after formatting, so alignment is untouched."""
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            lines.append(line)
+            continue
+        if not line.startswith(" ") and len(stripped) <= 12:
+            lines.append(style(stripped, "1;36"))
+            continue
+        match = _HELP_OPTION_RE.match(line)
+        if match:
+            indent, flag, rest = match.groups()
+            lines.append(indent + style(flag, "1;32") + rest)
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+class ColorHelpAction(argparse.Action):
+    """``-h`` prints the coloured page for the parser it belongs to."""
+
+    def __init__(
+        self,
+        option_strings: list[str],
+        dest: str = argparse.SUPPRESS,
+        default: str = argparse.SUPPRESS,
+        help: str = "显示帮助并退出",
+    ) -> None:
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            default=default,
+            nargs=0,
+            help=help,
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        print(colorize_help(parser.format_help()))
+        parser.exit()
+
+
 def add_help_option(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("-h", "--help", action="help", help="显示帮助并退出")
+    parser.add_argument("-h", "--help", action=ColorHelpAction, help="显示帮助并退出")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lrcpatch",
-        usage="lrcpatch [命令] [选项] [路径 ...]",
+        usage="lrcpatch 命令 [--参数 …] 路径 …",
         description=(
             f"lrcpatch {APP_VERSION} · 批量歌词：匹配 → 写入 → 校验 → 回滚"
             "（只改歌词字段）；不带命令时默认只读 plan。"
         ),
-        epilog=MAIN_EPILOG,
         formatter_class=HelpFormatter,
         add_help=False,
     )
@@ -299,6 +458,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan = sub.add_parser(
         "scan",
         prog="lrcpatch scan",
+        usage="lrcpatch scan [--参数 …] 路径 …",
         help="只读扫描：逐文件列出格式、时长、大小与歌词状态",
         description="只读扫描：统计格式与数量，并逐文件列出格式、时长、大小和歌词状态。",
         add_help=False,
@@ -310,7 +470,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  lrcpatch scan --limit 20\n\n"
             "说明\n"
             "  明细按专辑目录分组，一行一首：✓ 已有歌词 / · 待补，后面是格式、\n"
-            "  时长、大小、歌词类型与行数；标题、艺术家或专辑缺失会标出「缺 …」。\n"
+            "  时长、大小、歌词类型与行数；标题或艺术家缺失会标出「缺 …」。\n"
+            "  目录与文件名按 Finder 顺序排列（拼音、数字自然序）。\n"
             "  --summary 只看格式与数量汇总；--tree-limit N 限制明细行数（0 = 全部）。\n"
             "  只读；不打开状态数据库，可以和 plan/apply 同时运行。"
         ),
@@ -331,6 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan = sub.add_parser(
         "plan",
         prog="lrcpatch plan",
+        usage="lrcpatch plan [--参数 …] 路径 …",
         help="生成计划，不修改音频",
         description="匹配歌词，写入状态数据库和 CSV；不修改音频。",
         epilog=PLAN_EPILOG,
@@ -408,6 +570,7 @@ def build_parser() -> argparse.ArgumentParser:
     candidates = sub.add_parser(
         "candidates",
         prog="lrcpatch candidates",
+        usage="lrcpatch candidates [--参数 …] 路径 …",
         help="列出候选 ID，供 --pick 使用（只读）",
         description="逐首查询并列出候选（ID、分数、时长差），不修改音频和计划。",
         epilog=(
@@ -450,6 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_cmd = sub.add_parser(
         "apply",
         prog="lrcpatch apply",
+        usage="lrcpatch apply [--参数 …] 路径 …",
         help="执行 ready 计划并逐文件校验",
         description="把 ready 的歌词写入音频；先写临时副本，校验通过后替换原文件。",
         epilog=APPLY_EPILOG,
@@ -476,6 +640,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify = sub.add_parser(
         "verify",
         prog="lrcpatch verify",
+        usage="lrcpatch verify [--参数 …] 路径 …",
         help="校验已写入文件的歌词、标签、封面和音频",
         description="逐首比对写入时的歌词、其他标签、封面和音频数据。",
         epilog=VERIFY_EPILOG,
@@ -489,6 +654,7 @@ def build_parser() -> argparse.ArgumentParser:
     rollback = sub.add_parser(
         "rollback",
         prog="lrcpatch rollback",
+        usage="lrcpatch rollback [--参数 …] 路径 …",
         help="移除本工具写入且未改动的歌词",
         description="移除 journal 中由本工具写入、且之后未被改动过的歌词。",
         epilog=ROLLBACK_EPILOG,
@@ -561,11 +727,14 @@ def reject_unknown_options(options: list[str], specs: dict[str, int]) -> None:
             pass
         else:
             continue
+        if "wrap" in name or "warp" in name:
+            messages.append(
+                f"{name} 已移除：长备注现在总是按窗口折行（终端不能横向滚动）"
+            )
+            continue
         close = difflib.get_close_matches(name, sorted(known), n=1, cutoff=0.55)
         if close:
             hint = f"未知选项 {name}；你是不是想用 {close[0]}？"
-            if close[0] in {"--no-wrap", "--wrap"}:
-                hint += "\n提示：默认已经不换行，加 --wrap 才按窗口折行。"
         else:
             hint = f"未知选项 {name}"
         messages.append(hint)

@@ -56,17 +56,54 @@ from .render import (
     style,
     truncate_display,
     wrap_display,
-    wrap_enabled,
     write_plan_html,
     write_plan_report,
 )
+from .sorting import name_key, path_key, sort_paths
 from .sources import JsonClient, build_sources
 from .state import State
-from .text import lyric_hash, lyric_kind, match_note
+from .text import lyric_hash, lyric_kind, lyric_tag, match_note
 
 
 def summarize_plans(rows: list[sqlite3.Row]) -> Counter:
     return Counter(row["status"] for row in rows)
+
+
+KIND_LABELS = {"search": "搜索", "lyric": "取词", "request": "请求"}
+
+
+def network_line(client) -> str:
+    """One line: per-source request counts split into search and lyric fetch."""
+    kinds = client.breakdown()
+    network = [item for item in client.health() if item[1]]
+    if not network:
+        return ""
+    bits: list[str] = []
+    for name, requests, failed_requests, cooldown in network:
+        text = f"{name} {requests} 次"
+        detail = kinds.get(name, {})
+        if detail:
+            order = [key for key in ("search", "lyric") if key in detail]
+            order += [key for key in detail if key not in order]
+            text += (
+                "（"
+                + " · ".join(
+                    f"{KIND_LABELS.get(kind, kind)} {detail[kind]}" for kind in order
+                )
+                + "）"
+            )
+        if failed_requests:
+            text += f" 失败 {failed_requests}"
+        if cooldown:
+            text += f" 冷却 {cooldown}s"
+        bits.append(text)
+    hits = client.cache_hits()
+    if hits:
+        bits.append(f"缓存命中 {hits}")
+    transport = getattr(getattr(client, "transport", None), "name", "")
+    if transport:
+        bits.append(f"传输 {transport}")
+    return "  ·  ".join(bits)
 
 def scan_scope(args: argparse.Namespace, library: Path) -> str:
     """Readable description of what was scanned: relative paths, not $PWD joins."""
@@ -363,22 +400,9 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     health = client.health()
     hits = client.cache_hits()
     if pending:
-        network = [item for item in health if item[1]]
-        if network:
-            bits = []
-            for name, requests, failed_requests, cooldown in network:
-                text = f"{name} {requests} 次"
-                if failed_requests:
-                    text += f" 失败 {failed_requests}"
-                if cooldown:
-                    text += f" 冷却 {cooldown}s"
-                bits.append(text)
-            if hits:
-                bits.append(f"缓存命中 {hits}")
-            transport = getattr(getattr(client, "transport", None), "name", "")
-            if transport:
-                bits.append(f"传输 {transport}")
-            print_meta("请求", "  ·  ".join(bits))
+        line = network_line(client)
+        if line:
+            print_meta("请求", line)
         else:
             suffix_text = f"（命中 {hits} 次）" if hits else ""
             print_meta("网络", "全部命中本地缓存，未发起请求" + suffix_text)
@@ -543,9 +567,9 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
     groups: dict[Path, list[Track]] = {}
     for track in wanted:
         groups.setdefault(track.path.parent, []).append(track)
-    for folder in sorted(groups, key=lambda item: str(item)):
+    for folder in sort_paths(groups, library):
         print("  " + style("▸ ", "36") + style(short_path(folder, library), "1;36"))
-        items = sorted(groups[folder], key=lambda track: (track.path.name, str(track.path)))
+        items = sorted(groups[folder], key=lambda track: name_key(track.path.name))
         for index, track in enumerate(items):
             last_track = index == len(items) - 1
             print(
@@ -585,10 +609,10 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
                         symbol, code = "·", "90"
                     if candidate.instrumental:
                         kind = "纯音乐"
-                    elif candidate.synced or lyric_kind(candidate.lyrics) == "lrc":
-                        kind = "LRC"
                     elif candidate.lyrics:
-                        kind = "TXT"
+                        kind = lyric_tag(lyric_kind(candidate.lyrics))
+                    elif candidate.synced:
+                        kind = "LRC"
                     else:
                         kind = "待取词"
                     score_text = (
@@ -624,14 +648,11 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
                     + " "
                     + style(pad_display(ident, id_width), "36")
                 )
-                if wrap_enabled():
-                    note_col = disp_width(line) + 2
-                    chunks = wrap_display(rest, max(24, screen_width() - note_col))
-                    print(line + "  " + style(chunks[0], "90"))
-                    for chunk in chunks[1:]:
-                        print(" " * note_col + style(chunk, "90"))
-                else:
-                    print(line + "  " + style(rest, "90"))
+                note_col = disp_width(line) + 2
+                chunks = wrap_display(rest, max(24, screen_width() - note_col))
+                print(line + "  " + style(chunks[0], "90"))
+                for chunk in chunks[1:]:
+                    print(" " * note_col + style(chunk, "90"))
         print()
 
     print(
@@ -650,9 +671,13 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
             "暂停",
             "  ·  ".join(f"{name}: {reason}" for name, reason in paused.items()),
         )
-    hits = client.cache_hits()
-    if hits:
-        print_meta("缓存", f"命中 {hits} 次；plan 会直接复用这些搜索结果，不再请求")
+    line = network_line(client)
+    if line:
+        print_meta("请求", line)
+    elif client.cache_hits():
+        print_meta(
+            "网络", f"全部命中本地缓存（{client.cache_hits()} 次），未发起请求"
+        )
     print()
     return 0
 
@@ -669,7 +694,7 @@ def select_plan_rows(
         for row in state.list_plans("ready")
         if selection_matches(Path(row["path"]), library, album, selected)
     ]
-    rows.sort(key=lambda row: (Path(row["path"]).name, row["path"]))
+    rows.sort(key=lambda row: path_key(Path(row["path"]), library))
     return rows[:limit] if limit else rows
 
 

@@ -27,6 +27,7 @@ from typing import Any, Callable
 
 from .config import HTTP_UA
 from .errors import SourceError
+from .matching import score_candidate
 from .models import Candidate, FetchResult, Track
 from .state import State
 from .text import is_placeholder, sanitize_lyrics, sha256_text
@@ -155,6 +156,9 @@ class JsonClient:
         self._requests: dict[str, int] = {}
         self._failed_requests: dict[str, int] = {}
         self._cache_hits: dict[str, int] = {}
+        # search vs lyric requests, so the run can show that one track costs
+        # one search plus one lyric fetch - not one request per displayed row.
+        self._kinds: dict[tuple[str, str], int] = {}
 
     # -- pacing ---------------------------------------------------------
     def _reserve_slot(self, source: str, min_interval: float) -> None:
@@ -234,6 +238,14 @@ class JsonClient:
         with self._lock_guard:
             return sum(self._cache_hits.values())
 
+    def breakdown(self) -> dict[str, dict[str, int]]:
+        """Per source: how many real requests went to search vs lyric fetch."""
+        with self._lock_guard:
+            out: dict[str, dict[str, int]] = {}
+            for (source, kind), count in self._kinds.items():
+                out.setdefault(source, {})[kind] = count
+            return out
+
     @staticmethod
     def _backoff(attempt: int, retry_after: float | None = None) -> float:
         delay = min(20.0, 1.5 * (2 ** (attempt - 1)))
@@ -265,9 +277,11 @@ class JsonClient:
         url: str,
         min_interval: float,
         cache_predicate: Callable[[Any], bool | float] | None = None,
+        *,
+        kind: str = "request",
     ) -> tuple[int, Any | None]:
         return self.request(
-            source, url, min_interval, cache_predicate=cache_predicate
+            source, url, min_interval, cache_predicate=cache_predicate, kind=kind
         )
 
     def request(
@@ -280,6 +294,7 @@ class JsonClient:
         body: dict[str, Any] | None = None,
         cache_predicate: Callable[[Any], bool | float] | None = None,
         cache_extra: str = "",
+        kind: str = "request",
     ) -> tuple[int, Any | None]:
         key_source = url + (f"\n{cache_extra}" if cache_extra else "")
         cache_key = sha256_text(key_source)
@@ -295,6 +310,7 @@ class JsonClient:
         self._check_cooldown(source)
         with self._lock_guard:
             self._requests[source] = self._requests.get(source, 0) + 1
+            self._kinds[(source, kind)] = self._kinds.get((source, kind), 0) + 1
 
         last_error = ""
         rate_limited = False
@@ -410,6 +426,15 @@ def netease_cache_ttl(payload: Any) -> float:
     return 30 * 86400 if songs else 86400
 
 
+def _best_metadata(track: Track, candidates: list[Candidate]) -> int:
+    """Best title+artist+album score in a batch, ignoring duration."""
+    best = 0
+    for candidate in candidates:
+        score, _ = score_candidate(track, candidate, 999.0)
+        best = max(best, score)
+    return best
+
+
 class NeteaseSource:
     """Search is POST /api/search/get; the old GET endpoint is deprecated.
 
@@ -424,7 +449,15 @@ class NeteaseSource:
     def __init__(self, client: JsonClient):
         self.client = client
 
-    def search(self, track: Track) -> list[Candidate]:
+    def search(self, track: Track, exhaustive: bool = False) -> list[Candidate]:
+        """One search request per track in the normal case.
+
+        The first query is "title artist".  A title-only fallback costs a
+        second request and is only sent when that batch had nothing matching
+        both fields; a 100-point hit (or anything ≥85, which is enough to
+        plan) stops right there.  ``--top N`` only limits the rows printed, so
+        it never multiplies requests.
+        """
         base = "https://music.163.com/api/search/get"
         queries = [f"{track.title} {track.artist}".strip()]
         if track.artist:
@@ -442,6 +475,7 @@ class NeteaseSource:
                     body=payload,
                     cache_predicate=netease_cache_ttl,
                     cache_extra=query,
+                    kind="search",
                 )
             except SourceError:
                 if candidates:
@@ -471,7 +505,9 @@ class NeteaseSource:
                         duration=float(song.get("duration") or 0) / 1000.0,
                     )
                 )
-            if candidates:
+            # Stop as soon as the first batch can be planned; a pick wants the
+            # second query too (the chosen ID may only be in that page).
+            if candidates and not exhaustive and _best_metadata(track, candidates) >= 85:
                 break
         return candidates
 
@@ -482,7 +518,9 @@ class NeteaseSource:
                 {"id": candidate.source_id, "lv": 1, "kv": 1, "tv": -1}
             )
         )
-        code, data = self.client.get(self.name, url, self.min_interval)
+        code, data = self.client.get(
+            self.name, url, self.min_interval, kind="lyric"
+        )
         if code != 200 or not data:
             return FetchResult(note=f"歌词接口 HTTP {code}")
         raw = (data.get("lrc") or {}).get("lyric") or ""
@@ -500,7 +538,7 @@ class LrclibSource:
     def __init__(self, client: JsonClient):
         self.client = client
 
-    def search(self, track: Track) -> list[Candidate]:
+    def search(self, track: Track, exhaustive: bool = False) -> list[Candidate]:
         params = {"track_name": track.title}
         if track.artist:
             params["artist_name"] = track.artist
@@ -516,6 +554,7 @@ class LrclibSource:
                 if not isinstance(payload, list)
                 else (30 * 86400 if payload else 86400)
             ),
+            kind="search",
         )
         if code == 404:
             return []

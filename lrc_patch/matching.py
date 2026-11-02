@@ -14,6 +14,7 @@ from .text import (
     is_placeholder,
     lrc_timestamp_issue,
     lyric_kind,
+    lyric_tag,
     match_note,
     norm_loose,
     sanitize_lyrics,
@@ -213,7 +214,9 @@ def plan_with_pick(
     candidate: Candidate | None = None
     search_note = ""
     try:
-        results = source.search(track)
+        # The picked ID may live in the second (title-only) result page, so ask
+        # for the exhaustive search when the user has named an exact candidate.
+        results = source.search(track, exhaustive=True)
     except Exception as exc:
         results = []
         search_note = f"搜索失败 {type(exc).__name__}: {exc}"
@@ -351,7 +354,7 @@ def plan_one(
             notes.append(f"{source.name}: 仅纯文本，已按 --no-plain 跳过")
             continue
         note = match_note(track, candidate)
-        reason = f"{kind.upper()} / {candidate.artist_text}"
+        reason = f"{lyric_tag(kind)} / {candidate.artist_text}"
         if note:
             reason += f" · {note}"
         return plan_from_lyrics(

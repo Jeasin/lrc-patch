@@ -18,7 +18,8 @@ from pathlib import Path
 
 from .config import APP_VERSION
 from .models import Track, TreeEntry
-from .text import lyrics_line_count, lyric_kind, write_text_atomic
+from .sorting import name_key, sort_paths
+from .text import lyric_kind, lyric_line_count, lyric_tag, write_text_atomic
 
 
 def default_report_path(state_dir: Path, prefix: str) -> Path:
@@ -99,8 +100,10 @@ def write_plan_html(rows: list[sqlite3.Row], path: Path, library: Path) -> None:
     ))
 
     sections = []
-    for album in sorted(albums):
-        items = sorted(albums[album], key=lambda row: (Path(row["path"]).name, row["path"]))
+    for album in sorted(albums, key=name_key):
+        items = sorted(
+            albums[album], key=lambda row: name_key(Path(row["path"]).name)
+        )
         album_counts = Counter(row["status"] for row in items)
         summary = " · ".join(
             f"{HTML_STATUS.get(status, (status, ''))[0]} {count}"
@@ -253,25 +256,15 @@ query.addEventListener('input', apply);
     write_text_atomic(path, document)
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+# "LRC 42行" / "LRC 6 行": the count is right-aligned per album group.
+_NOTE_LINES_RE = re.compile(r"(LRC\+?|YRC|TTML|TXT) (\d+)( ?行)")
 
 _COLOR_ENABLED = (
     sys.stdout.isatty()
     and not os.environ.get("NO_COLOR")
     and os.environ.get("TERM", "") != "dumb"
 )
-# Notes never wrap by default: a folded remark is easy to mistake for the next
-# track's child. ``--wrap`` opts back into window folding.
-_WRAP_ENABLED = False
 
-
-def set_wrap(enabled: bool) -> None:
-    """--wrap: fold long notes at the window edge (default: let them overflow)."""
-    global _WRAP_ENABLED
-    _WRAP_ENABLED = bool(enabled)
-
-
-def wrap_enabled() -> bool:
-    return _WRAP_ENABLED
 
 def set_color(enabled: bool) -> None:
     global _COLOR_ENABLED
@@ -430,6 +423,25 @@ NOTE_STYLE = {
     "pending": "36",
 }
 
+def align_note_numbers(notes: list[str]) -> list[str]:
+    """Right-align ``LRC 6行`` under ``LRC 23行`` within one album group."""
+    widths: dict[str, int] = {}
+    for note in notes:
+        for match in _NOTE_LINES_RE.finditer(note):
+            tag = match.group(1)
+            widths[tag] = max(widths.get(tag, 0), len(match.group(2)))
+    if not widths:
+        return notes
+    aligned: list[str] = []
+    for note in notes:
+        def replace(match: re.Match) -> str:
+            tag, number, suffix = match.group(1), match.group(2), match.group(3)
+            return f"{tag} {number.rjust(widths[tag])}{suffix}"
+
+        aligned.append(_NOTE_LINES_RE.sub(replace, note))
+    return aligned
+
+
 def print_tree(
     entries: list[TreeEntry],
     library: Path,
@@ -454,9 +466,9 @@ def print_tree(
     plan = [
         (
             folder,
-            sorted(groups[folder], key=lambda item: (item.path.name, str(item.path))),
+            sorted(groups[folder], key=lambda item: name_key(item.path.name)),
         )
-        for folder in sorted(groups, key=lambda item: str(item))
+        for folder in sort_paths(groups, library)
     ]
     name_cap = max(28, min(64, screen_width() - 34))
     shown = 0
@@ -485,6 +497,7 @@ def print_tree(
 
         names = [truncate_display(item.path.name, name_cap) for item in visible]
         name_width = max((disp_width(name) for name in names), default=0)
+        notes = align_note_numbers([item.note for item in visible])
         for index, item in enumerate(visible):
             branch = "    └─ " if index == len(visible) - 1 else "    ├─ "
             symbol, code, _ = status_style(item.status)
@@ -492,14 +505,10 @@ def print_tree(
             prefix = style(branch, "90") + style(symbol, code) + " "
             note_col = disp_width(prefix) + name_width + 2
             line = prefix + name_cell
-            if item.note:
+            note = notes[index]
+            if note:
                 note_code = NOTE_STYLE.get(item.status, "90")
-                if _WRAP_ENABLED:
-                    chunks = wrap_display(
-                        item.note, max(40, screen_width() - note_col)
-                    )
-                else:
-                    chunks = [item.note]
+                chunks = wrap_display(note, max(40, screen_width() - note_col))
                 line += "  " + style(chunks[0], note_code)
                 print(line.rstrip())
                 for chunk in chunks[1:]:
@@ -537,22 +546,37 @@ def format_size(size: int) -> str:
     return f"{value:.1f} GB"
 
 
-def lyric_summary(text: str) -> str:
+LYRIC_COLORS = {
+    "plain": "36",
+    "lrc": "32",
+    "enhanced": "1;32",
+    "yrc": "1;34",
+    "ttml": "1;35",
+}
+
+
+def lyric_summary(text: str, number_width: int = 0) -> tuple[str, str]:
+    """(kind, label) for the scan column; the kind decides the colour.
+
+    ``number_width`` right-aligns the line count inside a group, so ``LRC 6 行``
+    and ``LRC 23 行`` keep the 行 column aligned instead of drifting.
+    """
     if not (text or "").strip():
-        return "无歌词"
-    kind = lyric_kind(text).upper()
-    lines = lyrics_line_count(text)
-    return f"{kind} {lines} 行" if lines else kind
+        return "", "无歌词"
+    kind = lyric_kind(text)
+    tag = lyric_tag(kind)
+    lines = lyric_line_count(text, kind)
+    if not lines:
+        return kind, tag
+    return kind, f"{tag} {str(lines).rjust(number_width)} 行"
 
 
 def tag_gaps(track: Track) -> str:
+    """Missing title/artist.  Album is intentionally ignored: singles in this
+    library never carry one, so flagging it only produced noise."""
     missing = [
         name
-        for name, value in (
-            ("标题", track.title),
-            ("艺术家", track.artist),
-            ("专辑", track.album),
-        )
+        for name, value in (("标题", track.title), ("艺术家", track.artist))
         if not (value or "").strip()
     ]
     return "缺 " + "、".join(missing) if missing else ""
@@ -571,8 +595,9 @@ def print_scan_list(tracks: list[Track], library: Path, limit: int = 0) -> None:
     """Per-file scan detail, one row per track, grouped by album folder.
 
     Columns are fixed across the whole listing rather than per folder, so
-    format/duration/size/lyrics line up all the way down the page, and missing
-    title/artist/album tags surface in the last column.
+    format/duration/size/lyrics line up all the way down the page.  Folder and
+    file order follows Finder, and the lyric line count is right-aligned inside
+    each album, so ``LRC  6 行`` never drifts away from ``LRC 23 行``.
     """
     if not tracks:
         print("  " + style("没有可列出的音频文件。", "90"))
@@ -582,26 +607,38 @@ def print_scan_list(tracks: list[Track], library: Path, limit: int = 0) -> None:
     groups: dict[Path, list[Track]] = {}
     for track in tracks:
         groups.setdefault(track.path.parent, []).append(track)
-    folders = sorted(groups, key=lambda item: str(item))
+    folders = sort_paths(groups, library)
 
     name_cap = max(28, min(56, screen_width() - 52))
     names = {id(track): truncate_display(track.path.name, name_cap) for track in tracks}
     name_width = max(disp_width(name) for name in names.values())
 
-    cells = {
-        id(track): (
-            track.fmt.upper(),
-            format_duration(track.duration),
-            format_size(track.size),
-            lyric_summary(track.existing_lyrics),
-            tag_gaps(track),
-        )
-        for track in tracks
-    }
-    fmt_width = max(3, max(len(row[0]) for row in cells.values()))
-    dur_width = max(5, max(len(row[1]) for row in cells.values()))
-    size_width = max(8, max(len(row[2]) for row in cells.values()))
-    lyric_width = max(6, max(disp_width(row[3]) for row in cells.values()))
+    kind_of: dict[int, str] = {}
+    count_of: dict[int, int] = {}
+    tag_of: dict[int, str] = {}
+    for track in tracks:
+        kind, _ = lyric_summary(track.existing_lyrics, 0)
+        kind_of[id(track)] = kind
+        tag_of[id(track)] = lyric_tag(kind) if kind else "无歌词"
+        count_of[id(track)] = lyric_line_count(track.existing_lyrics, kind) if kind else 0
+
+    digits_all = max((len(str(value)) for value in count_of.values()), default=0)
+    lyric_width = max(
+        6,
+        max(
+            disp_width(f"{tag_of[id(track)]} {str(count_of[id(track)]).rjust(digits_all)} 行")
+            if kind_of[id(track)]
+            else disp_width("无歌词")
+            for track in tracks
+        ),
+    )
+    formats = {id(track): track.fmt.upper() for track in tracks}
+    durations = {id(track): format_duration(track.duration) for track in tracks}
+    sizes = {id(track): format_size(track.size) for track in tracks}
+    gaps = {id(track): tag_gaps(track) for track in tracks}
+    fmt_width = max(3, max(len(value) for value in formats.values()))
+    dur_width = max(5, max(len(value) for value in durations.values()))
+    size_width = max(8, max(len(value) for value in sizes.values()))
 
     with_lyrics = sum(1 for track in tracks if track.has_lyrics)
     print(
@@ -617,7 +654,7 @@ def print_scan_list(tracks: list[Track], library: Path, limit: int = 0) -> None:
     for folder in folders:
         if limit and shown >= limit:
             break
-        items = groups[folder]
+        items = sorted(groups[folder], key=lambda track: name_key(track.path.name))
         room = len(items) if not limit else max(0, limit - shown)
         visible = items[:room]
         here = sum(1 for track in items if track.has_lyrics)
@@ -630,29 +667,34 @@ def print_scan_list(tracks: list[Track], library: Path, limit: int = 0) -> None:
         )
         print(header)
 
+        # Align the line count against the widest one in this album only.
+        group_digits = max((len(str(count_of[id(track)])) for track in items), default=0)
         for index, track in enumerate(visible):
             branch = "    └─ " if index == len(visible) - 1 else "    ├─ "
             symbol, code = ("✓", "1;32") if track.has_lyrics else ("·", "90")
-            fmt, duration, size, lyric, gaps = cells[id(track)]
+            kind = kind_of[id(track)]
+            if kind:
+                lyric = f"{tag_of[id(track)]} {str(count_of[id(track)]).rjust(group_digits)} 行"
+                tone = LYRIC_COLORS.get(kind, "32")
+            else:
+                lyric = "无歌词"
+                tone = "90"
             line = (
                 style(branch, "90")
                 + style(symbol, code)
                 + " "
                 + pad_display(names[id(track)], name_width)
                 + "  "
-                + style(fmt.ljust(fmt_width), "90")
+                + style(formats[id(track)].ljust(fmt_width), "90")
                 + "  "
-                + style(duration.rjust(dur_width), "90")
+                + style(durations[id(track)].rjust(dur_width), "90")
                 + "  "
-                + style(size.rjust(size_width), "90")
+                + style(sizes[id(track)].rjust(size_width), "90")
                 + "  "
-                + style(
-                    pad_display(lyric, lyric_width),
-                    "32" if track.has_lyrics else "90",
-                )
+                + style(pad_display(lyric, lyric_width), tone)
             )
-            if gaps:
-                line += "  " + style(gaps, "33")
+            if gaps[id(track)]:
+                line += "  " + style(gaps[id(track)], "33")
             print(line.rstrip())
         print()
         shown += len(visible)
@@ -752,9 +794,10 @@ def plan_note(row: sqlite3.Row) -> str:
         diff = row["duration_diff"]
         if diff is not None and diff < 900:
             bits.append(f"Δ{diff:.1f}s")
-        kind = str(row["lyric_kind"] or "").upper()
+        kind = str(row["lyric_kind"] or "")
         if kind:
-            bits.append(f"{kind} {row['lyric_lines']}行" if row["lyric_lines"] else kind)
+            tag = lyric_tag(kind)
+            bits.append(f"{tag} {row['lyric_lines']} 行" if row["lyric_lines"] else tag)
         reason = str(row["reason"] or "")
         if " · " in reason:
             note = reason.split(" · ", 1)[1].strip()
@@ -805,7 +848,7 @@ def print_intro() -> None:
     print(
         "  "
         + style("lrcpatch", "1;36")
-        + style(f"  {APP_VERSION}", "90")
+        + style(f" {APP_VERSION}", "90")
         + "   批量歌词：匹配 → 写入 → 校验 → 回滚"
     )
     print("  " + rule())
@@ -814,8 +857,8 @@ def print_intro() -> None:
     print()
     print("  " + style("常用", "1"))
     rows = [
-        ('lrcpatch "結束バンド"', "拖入目录 = 只读 plan"),
-        ('lrcpatch "Ado" --html', "生成计划与 HTML 复核页"),
+        ('lrcpatch plan "結束バンド"', "拖入目录 = 只读 plan"),
+        ('lrcpatch plan "Ado" --html', "生成计划与 HTML 复核页"),
         ('lrcpatch candidates "Ado"', "查看候选 ID（配合 --pick）"),
         ('lrcpatch apply "Ado"', "只写入 ✓ ready 的曲目"),
         ('lrcpatch verify "Ado"', "校验歌词与其他标签"),
