@@ -1,0 +1,270 @@
+"""Fast regressions that do not touch a real library or the network."""
+from __future__ import annotations
+
+import io
+import tempfile
+import unittest
+import urllib.error
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
+
+from lrc_patch import render, sources
+from lrc_patch.cli_args import build_parser, normalize_argv, option_specs
+from lrc_patch.errors import SourceError
+from lrc_patch.matching import keep_previous_plan, plan_one, score_candidate
+from lrc_patch.models import Candidate, Track, TreeEntry
+from lrc_patch.state import State
+from lrc_patch.text import lrc_timestamp_issue, sha256_text
+
+
+def make_track(**overrides) -> Track:
+    values = {
+        "path": Path("/library/Artist/Album/01 track.m4a"),
+        "relpath": "Artist/Album/01 track.m4a",
+        "fmt": "m4a",
+        "title": "Track",
+        "artist": "Artist",
+        "album": "Album",
+        "albumartist": "Artist",
+        "duration": 200.0,
+        "existing_lyrics": "",
+        "size": 1,
+        "mtime_ns": 1,
+    }
+    values.update(overrides)
+    return Track(**values)
+
+
+class EmptySource:
+    name = "empty"
+
+    def search(self, track: Track) -> list[Candidate]:
+        return []
+
+
+class FailingSource:
+    name = "failing"
+
+    def search(self, track: Track) -> list[Candidate]:
+        raise SourceError("failing", "failing 连续 3 次失败：HTTP 503（服务繁忙）")
+
+
+class NormalizeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.specs = option_specs(build_parser())
+
+    def test_options_before_paths(self) -> None:
+        command, options, paths = normalize_argv(
+            ["--workers", "2", "plan", "A", "B"], self.specs
+        )
+        self.assertEqual(command, "plan")
+        self.assertEqual(options, ["--workers", "2"])
+        self.assertEqual(paths, ["A", "B"])
+
+    def test_options_between_paths(self) -> None:
+        command, options, paths = normalize_argv(
+            ["A", "--workers", "2", "B"], self.specs
+        )
+        self.assertIsNone(command)
+        self.assertEqual(options, ["--workers", "2"])
+        self.assertEqual(paths, ["A", "B"])
+
+    def test_option_value_is_not_a_path(self) -> None:
+        command, options, paths = normalize_argv(
+            ["--pick", "netease:1", "--limit", "5", "A"], self.specs
+        )
+        self.assertIsNone(command)
+        self.assertEqual(options, ["--pick", "netease:1", "--limit", "5"])
+        self.assertEqual(paths, ["A"])
+
+    def test_deprecated_path_flag(self) -> None:
+        command, options, paths = normalize_argv(
+            ["--path", "A", "B"], self.specs
+        )
+        self.assertIsNone(command)
+        self.assertEqual(options, [])
+        self.assertEqual(paths, ["A", "B"])
+
+    def test_html_optional_filename(self) -> None:
+        _, options, paths = normalize_argv(
+            ["A", "--html", "review.html"], self.specs
+        )
+        self.assertEqual(options, ["--html", "review.html"])
+        self.assertEqual(paths, ["A"])
+
+    def test_html_without_filename_keeps_next_path(self) -> None:
+        _, options, paths = normalize_argv(["A", "--html", "B"], self.specs)
+        self.assertEqual(options, ["--html"])
+        self.assertEqual(paths, ["A", "B"])
+
+    def test_double_dash_stops_option_parsing(self) -> None:
+        _, options, paths = normalize_argv(
+            ["A", "--", "--workers", "B"], self.specs
+        )
+        self.assertEqual(options, [])
+        self.assertEqual(paths, ["A", "--workers", "B"])
+
+
+class PlanClassificationTests(unittest.TestCase):
+    def test_provider_failure_is_error_not_no_match(self) -> None:
+        result = plan_one(make_track(), [FailingSource(), EmptySource()], True)
+        self.assertEqual(result.status, "error")
+        self.assertIn("请求失败", result.reason)
+
+    def test_empty_answers_are_no_match(self) -> None:
+        result = plan_one(make_track(), [EmptySource()], True)
+        self.assertEqual(result.status, "no_match")
+
+    def test_existing_lyrics_short_circuits(self) -> None:
+        track = make_track(existing_lyrics="[00:01.00]hello")
+        result = plan_one(track, [FailingSource()], True)
+        self.assertEqual(result.status, "skip_existing")
+
+    def test_failure_does_not_replace_a_ready_plan(self) -> None:
+        ready = {"status": "ready", "fingerprint": "fp"}
+        result = plan_one(make_track(), [FailingSource()], True)
+        self.assertTrue(keep_previous_plan(ready, "fp", result))
+        self.assertFalse(keep_previous_plan(ready, "changed", result))
+        self.assertFalse(keep_previous_plan({"status": "error"}, "fp", result))
+
+
+class MatchingTests(unittest.TestCase):
+    def test_duration_gate(self) -> None:
+        track = make_track(duration=200.0)
+        good = Candidate("s", "1", "Track", ["Artist"], "Album", 200.5)
+        far = Candidate("s", "2", "Track", ["Artist"], "Album", 203.0)
+        self.assertEqual(score_candidate(track, good), (100, 0.5))
+        self.assertEqual(score_candidate(track, far)[0], 0)
+
+    def test_timestamp_checks(self) -> None:
+        good = "[00:10.00]a\n[03:20.00]b"
+        self.assertFalse(lrc_timestamp_issue(good, 200.0))
+        self.assertIn("超过", lrc_timestamp_issue("[00:10.00]a\n[05:00.00]b", 200.0))
+        self.assertIn("TV size", lrc_timestamp_issue("[00:10.00]a\n[00:30.00]b", 200.0))
+
+
+class TreeAlignmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        render.set_color(False)
+        render.set_wrap(True)
+        self._width = render.screen_width
+        render.screen_width = lambda: 100
+
+    def tearDown(self) -> None:
+        render.screen_width = self._width
+        render.set_wrap(True)
+
+    def _render(self, entries: list[TreeEntry]) -> list[str]:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            render.print_tree(entries, Path("/library"), 200)
+        return [render.strip_ansi(line) for line in buffer.getvalue().splitlines()]
+
+    def test_notes_start_at_same_column_and_wrap_below_it(self) -> None:
+        long_note = "请求失败：" + "非常长的原因，" * 20
+        entries = [
+            TreeEntry(Path("/library/A/01 short.m4a"), "ready", "短备注"),
+            TreeEntry(Path("/library/A/02 a much longer name.m4a"), "error", long_note),
+        ]
+        lines = self._render(entries)
+        first = next(line for line in lines if "短备注" in line)
+        second = next(line for line in lines if "请求失败" in line)
+        column = first.index("短备注")
+        self.assertEqual(column, second.index("请求失败"))
+        note_lines = lines[lines.index(second) + 1 :]
+        wrapped = [line for line in note_lines if line.strip() and line.startswith(" ")]
+        self.assertTrue(wrapped)
+        for line in wrapped:
+            self.assertEqual(len(line) - len(line.lstrip()), column)
+
+    def test_no_wrap_keeps_note_on_one_line(self) -> None:
+        render.set_wrap(False)
+        long_note = "错误：" + "x" * 300
+        lines = self._render(
+            [TreeEntry(Path("/library/A/01 track.m4a"), "error", long_note)]
+        )
+        matching = [line for line in lines if "错误：" in line]
+        self.assertEqual(len(matching), 1)
+        self.assertGreater(len(matching[0]), 200)
+
+
+class JsonClientTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.state = State(Path(self.tempdir.name) / "state.sqlite3")
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_retries_then_raises_and_does_not_cache(self) -> None:
+        calls: list[str] = []
+
+        class Response:
+            def __init__(self, payload: bytes):
+                self.payload = payload
+
+            def read(self) -> bytes:
+                return self.payload
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+        def fail(request, timeout=30):
+            calls.append(request.full_url)
+            raise urllib.error.HTTPError(request.full_url, 503, "busy", {}, None)
+
+        url = "https://lrclib.net/api/search?track_name=x"
+        with mock.patch.object(sources.urllib.request, "urlopen", fail), mock.patch.object(
+            sources.time, "sleep", lambda _seconds: None
+        ):
+            client = sources.JsonClient(self.state)
+            with self.assertRaises(SourceError):
+                client.get("lrclib", url, 0.0)
+
+        self.assertEqual(len(calls), sources.JsonClient.MAX_ATTEMPTS)
+        self.assertIsNone(self.state.cached_http(sha256_text(url)))
+        health = client.health()
+        self.assertEqual(health[0][0], "lrclib")
+        self.assertEqual(health[0][1:3], (1, 1))
+        self.assertEqual(health[0][3], 0)
+
+        # A second exhausted request opens the per-source cooldown.
+        with mock.patch.object(sources.urllib.request, "urlopen", fail), mock.patch.object(
+            sources.time, "sleep", lambda _seconds: None
+        ):
+            with self.assertRaises(SourceError):
+                client.get("lrclib", url, 0.0)
+        self.assertGreaterEqual(client.health()[0][3], 58)
+        self.assertEqual(len(calls), sources.JsonClient.MAX_ATTEMPTS * 2)
+
+    def test_success_is_cached(self) -> None:
+        class Response:
+            def read(self) -> bytes:
+                return b'{"code": 200, "result": {"songs": [{"id": 1}]}}'
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+        url = "https://music.163.com/api/search/get/web?s=x"
+        with mock.patch.object(
+            sources.urllib.request, "urlopen", lambda request, timeout=30: Response()
+        ):
+            client = sources.JsonClient(self.state)
+            code, data = client.get(
+                "netease", url, 0.0, lambda payload: bool(payload["result"]["songs"])
+            )
+        self.assertEqual(code, 200)
+        self.assertEqual(data["result"]["songs"][0]["id"], 1)
+        self.assertIsNotNone(self.state.cached_http(sha256_text(url)))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

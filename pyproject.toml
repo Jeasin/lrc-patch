@@ -1,0 +1,16 @@
+[project]
+name = "lrc-patch"
+version = "2.0"
+description = "Batch lyrics planning and embedding for a local music library"
+requires-python = ">=3.9"
+dependencies = ["mutagen>=1.47"]
+
+[project.scripts]
+lyrics = "lrc_patch.cli:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lrc_patch"]
