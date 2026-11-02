@@ -25,7 +25,10 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter):
 
     def __init__(self, prog: str, **kwargs: object):
         try:
-            width = min(max(84, shutil.get_terminal_size((100, 24)).columns), 104)
+            # Follow the window instead of guessing: only the very narrow case
+            # needs a floor, and an over-wide terminal is capped so the two
+            # columns do not drift apart.
+            width = min(max(72, shutil.get_terminal_size((100, 24)).columns), 104)
         except OSError:
             width = 100
         super().__init__(prog, width=width, max_help_position=32, **kwargs)
@@ -86,16 +89,12 @@ def _table(rows: list[tuple[str, str, str]], indent: str = "    ") -> str:
 
 
 def _flag_block(rows: list[tuple[str, str]]) -> str:
+    """One line per command: the terminal wraps, the page does not."""
     width = max(len(name) for name, _ in rows)
-    lines: list[str] = []
-    for name, flags in rows:
-        chunks = flags.split("\n")
-        lines.append(
-            "  " + style(name.ljust(width), "1;36") + "  " + style(chunks[0], "32")
-        )
-        for chunk in chunks[1:]:
-            lines.append(" " * (2 + width + 2) + style(chunk, "32"))
-    return "\n".join(lines)
+    return "\n".join(
+        "  " + style(name.ljust(width), "1;36") + "  " + style(flags, "32")
+        for name, flags in rows
+    )
 
 
 def main_help() -> str:
@@ -161,9 +160,7 @@ def main_help() -> str:
         [
             (
                 "plan",
-                "--pick SRC:ID  --pick-file FILE  --apply  --src LIST  --workers N\n"
-                "--refresh  --retry-failed  --html [FILE]  --lrc  --duration-tolerance SEC\n"
-                "--a2  --eslrc  --yrc  --qrc  --ttml",
+                "--pick SRC:ID  --pick-file FILE  --apply  --src LIST  --workers N  --refresh  --retry-failed  --html [FILE]  --lrc  --duration-tolerance SEC  --a2/--eslrc/--yrc/--qrc/--ttml",
             ),
             (
                 "candidates",
@@ -171,8 +168,7 @@ def main_help() -> str:
             ),
             (
                 "apply",
-                "--pick SRC:ID  --pick-file FILE  --src LIST  --workers N\n"
-                "--no-preflight  --lrc  --refresh",
+                "--pick SRC:ID  --pick-file FILE  --src LIST  --workers N  --no-preflight  --lrc  --refresh",
             ),
             ("scan", "--summary"),
             ("rollback", "--yes"),
@@ -181,6 +177,33 @@ def main_help() -> str:
                 "--dry-run  --days N  --http  --reports  --lrc  --picks  --plans  --journal  --all",
             ),
         ]
+    )
+
+    formats = _table(
+        [
+            ("TXT", style("TXT", "36"), "纯文本，没有时间轴"),
+            ("LRC", style("LRC", "32"), "逐行时间轴，最常见的格式"),
+            ("A2", style("A2", "1;32"), "LRC A2 逐字（尖括号 <mm:ss.xx> 标记）"),
+            ("ESLRC", style("ESLRC", "1;33"), "ESLyric / SPL 逐字（行内方括号 [mm:ss.xx]）"),
+            ("YRC", style("YRC", "1;34"), "网易云逐字 [起始,时长](起始,时长,0)"),
+            ("QRC", style("QRC", "1;36"), "QQ 音乐逐字 [起始,时长]文本(起始,时长)"),
+            ("TTML", style("TTML", "1;35"), "Apple Music 的 XML 歌词"),
+        ],
+        indent="  ",
+    )
+
+    states = _table(
+        [
+            ("✓ 可写入", style("✓", "32") + " 可写入", "标题/艺术家/专辑/时长都过，apply 会写"),
+            ("✓ 已写入", style("✓", "32") + " 已写入", "已写入并通过逐项校验"),
+            ("! 需确认", style("!", "33") + " 需确认", "分数不足 85 或时长差超容差，apply 不写"),
+            ("! 时间轴可疑", style("!", "33") + " 时间轴可疑", "LRC 末尾时间戳与音频时长不符，apply 不写"),
+            ("✗ 无匹配", style("✗", "31") + " 无匹配", "启用的源都正常回答，确实没有这首歌"),
+            ("✗ 失败", style("✗", "31") + " 失败", "请求没成功（限流/超时/服务过载），下次运行自动重试"),
+            ("· 已有歌词", style("·", "90") + " 已有歌词", "不覆盖"),
+            ("♪ 纯音乐", style("♪", "36") + " 纯音乐", "源标记为 instrumental"),
+        ],
+        indent="  ",
     )
 
     header = (
@@ -229,11 +252,9 @@ def main_help() -> str:
   专辑      完全相同 +15；同一专辑的另一个版本（Deluxe / Tour / Single / EP…）+12
             合集的一面（"insane dream / us" 对上 "us"）+12；包含关系 +8
 
-  时长      超过容差（默认 2s）直接淘汰；容差内不加减分，只用来排序，
-            并在写入后用 LRC 末行时间戳再核一次。
+  时长      超过容差（默认 2s）直接淘汰；容差内不加减分，只用来排序，写入后再用 LRC 末行时间戳核一次。
 
-  专辑只做佐证，不压倒标题：版本变体的标题（+42）必须专辑也对得上才够 85。
-  反过来，Deluxe 版专辑只比完全相同的专辑少 3 分，不会因为版本名不同而丢候选。
+  专辑只做佐证，不压倒标题：版本变体的标题（+42）必须专辑也对得上才够 85；反过来 Deluxe 版专辑只比完全相同的专辑少 3 分，不会因为版本名不同而丢候选。
 
   常见组合
     100分   标题 + 歌手 + 专辑全中（含 feat. 名字已在歌手里）
@@ -244,53 +265,33 @@ def main_help() -> str:
      85分   标题 + 歌手全中，专辑不符
      75分   合作者不同（feat. 版本）：一律 ! 需确认
 
-  排序      先按不含时长的元数据分，再按含时长的分，再按时长差，最后偏好带 LRC 的
-  待确认    分数不足 85，或时长差超过容差。用 candidates 看全部候选，再 --pick 指定。
+  排序      先按不含时长的元数据分，再按含时长的分，再按时长差，最后偏好带 LRC 的。
+  待确认    分数不足 85，或时长差超过容差；用 candidates 看全部候选，再 --pick 指定。
             ! 行会写清每个源给了多少分，以及最佳候选的 ID，可直接拿去 --pick：
             ! 08 印地安老斑鸠.m4a  netease 72 · qq 72；最佳 qq:244115386 印地安老斑鸠 (Live) / 周杰伦 / 208s
 
 {style("写入前检查", "1;36")}
-  时长差 ≤ 容差；LRC 末行时间戳不超过音频时长 3s；LRC 覆盖 ≥55% 时长。
-  后两条不符会判为 ! 时间轴可疑（常见于 TV size、剪辑版、整轨版）。
+  时长差 ≤ 容差；LRC 末行时间戳不超过音频时长 3s；LRC 覆盖 ≥55% 时长。后两条不符会判为 ! 时间轴可疑（常见于 TV size、剪辑版、整轨版）。
 
 {style("歌词格式", "1;36")}
-  {style("TXT", "36")}    纯文本，没有时间轴
-  {style("LRC", "32")}    逐行时间轴，最常见的格式
-  {style("A2", "1;32")}   LRC A2 逐字（尖括号 <mm:ss.xx> 标记）
-  {style("ESLRC", "1;33")} ESLyric / SPL 逐字（行内方括号 [mm:ss.xx]）
-  {style("YRC", "1;34")}   网易云逐字 [起始,时长](起始,时长,0)
-  {style("QRC", "1;36")}   QQ 音乐逐字 [起始,时长]文本(起始,时长)
-  {style("TTML", "1;35")}  Apple Music 的 XML 歌词
+{formats}
   A2 / ESLRC 与普通 LRC 共用行时间轴校验；YRC / QRC / TTML 只识别不校验。
-  默认拿逐行 LRC；加 --a2 / --eslrc / --ttml 会把源逐字转成对应公有格式，
-  --yrc 只取网易原生、--qrc 只取 QQ 原生（私有格式不跨源转换）。导出 .lrc
-  时按格式用原生后缀：.alrc / .eslrc / .yrc / .qrc / .ttml，逐行用 .lrc。
+  默认拿逐行 LRC；加 --a2 / --eslrc / --ttml 会把源逐字转成对应公有格式，--yrc 只取网易原生、--qrc 只取 QQ 原生（私有格式不跨源转换）。
+  导出后缀按格式走：.alrc / .eslrc / .yrc / .qrc / .ttml，逐行用 .lrc。
 
 {style("状态", "1;36")}
-  ✓ 可写入      标题/艺术家/专辑/时长都过，apply 会写
-  ✓ 已写入      已写入并通过逐项校验
-  ! 需确认      分数不足 85 或时长差超容差，apply 不写
-  ! 时间轴可疑  LRC 末尾时间戳与音频时长不符，apply 不写
-  ✗ 无匹配      启用的源都正常回答，确实没有这首歌
-  ✗ 失败        请求没成功（限流/超时/服务过载），下次运行自动重试
-  · 已有歌词    不覆盖
-  ♪ 纯音乐      源标记为 instrumental
+{states}
 
 {style("网络与缓存", "1;36")}
-  每首曲目通常只有 1 次搜索 + 1 次取词。只有当第一条搜索里没有任何标题与
-  艺术家都对得上的候选时，才补发 1 次仅用标题的搜索；已经能确定结果就不再
-  追问。--top 只决定 candidates 显示几行，不影响请求数。
-  netease 约 0.9s 一次，并发不会突破最小间隔。被限流（code 405/406、HTTP 429）
-  时先放慢重试，仍失败就暂停该源约 180s，其余曲目立即失败而不是继续撞墙。
+  每首曲目通常只有 1 次搜索 + 1 次取词：只有当第一条搜索里没有任何标题与艺术家都对得上的候选时，才补发 1 次仅用标题的搜索；已经能确定结果就不再追问。--top 只决定 candidates 显示几行，不影响请求数。
+  netease 约 0.9s 一次，并发不会突破最小间隔；被限流（code 405/406、HTTP 429）时先放慢重试，仍失败就暂停该源约 180s，其余曲目立即失败而不是继续撞墙。
   服务过载（HTTP 500/502/503/504）走退避，两次耗尽后暂停 60s 起。
   请求失败记为 ✗ 失败，不是「无匹配」，不写缓存，也不覆盖已有的 ✓ 计划。
-  plan 与 candidates 共用同一个 HTTP 缓存：candidates 查过的搜索，plan 不再
-  请求。想强制重查加 --refresh。装了 curl_cffi 就默认用浏览器 TLS 指纹。
+  plan 与 candidates 共用同一个 HTTP 缓存：candidates 查过的搜索，plan 不再请求。想强制重查加 --refresh；装了 curl_cffi 就默认用浏览器 TLS 指纹。
 
 {style("环境", "1;36")}
   Python 3.9+；依赖 mutagen（写标签），可选 curl_cffi（浏览器指纹）。
-  直接运行 lrcpatch 时 uv 会按文件头的 PEP 723 声明自动安装，无需手动 pip。
-  没有 uv 也能跑：python3 lrcpatch 会切到已装依赖的解释器。
+  直接运行 lrcpatch 时 uv 会按文件头的 PEP 723 声明自动安装，无需手动 pip；没有 uv 也能跑，python3 lrcpatch 会切到已装依赖的解释器。
   状态、HTTP 缓存与报告在 ~/.local/state/lrc-patch，不要删除，否则丢失断点与回滚记录。
 """
 
@@ -307,8 +308,7 @@ PLAN_EPILOG = """\
 说明
   plan 只读：不写音频，只更新状态数据库、CSV 和可选的 HTML 复核页。
   ≥85 分且时长在容差内才判 ✓ 可写入；其余是 ! 需确认，需人工 --pick。
-  一个 --pick 可连写多个 SOURCE:ID；程序先查每个 ID 的标题/歌手/时长，
-  再按分数配对到范围内缺歌词的曲目，并把配对结果打印出来。
+  一个 --pick 可连写多个 SOURCE:ID；程序先查每个 ID 的标题/歌手/时长，再按分数配对到范围内缺歌词的曲目，并把配对结果打印出来。
   --apply 会在 plan 之后直接写本次的 ✓；! 需确认、✗ 失败/无匹配仍不会写入。
   每首通常 1 次搜索 + 1 次取词；搜索已经能确定结果时不再补发标题搜索。
   打分规则见 lrcpatch -h 的「匹配与打分」。
@@ -322,10 +322,9 @@ APPLY_EPILOG = """\
   lrcpatch apply --workers 2 "Ado"
 
 说明
-  只写状态为 ready 的曲目；已有歌词、需确认、无匹配、请求失败都不会写入，
-  并在输出里列出跳过数量与原因。
-  带 --pick / --pick-file 时先按人工指定重新 plan（指定的候选天然越过
-  85 分门槛，但仍检查时间轴），再写入，不需要先单独跑一次 plan。
+  只写状态为 ready 的曲目；已有歌词、需确认、无匹配、请求失败都不会写入，并在输出里列出跳过数量与原因。
+  范围是整个音乐库或你给出的路径；状态库是所有音乐库共用的，但属于其他 --library 的计划不会被写入。
+  带 --pick / --pick-file 时先按人工指定重新 plan（指定的候选天然越过 85 分门槛，但仍检查时间轴），再写入，不需要先单独跑一次 plan。
   先写临时副本，回读校验歌词/其他标签/封面/音频后再原子替换；失败则原文件不动。
   开始前会检查目标目录可写且空间足够；确实需要跳过时加 --no-preflight。
 """
@@ -359,11 +358,9 @@ CLEAN_EPILOG = """\
   lrcpatch clean --all                连同计划状态与回滚记录一起清
 
 说明
-  清理对象分三处：状态库（HTTP 缓存 / 计划 / 回滚记录）、
-  reports/（CSV 与 HTML 复核页）、cache/lrc（--lrc 导出的镜像）。
+  清理对象分三处：状态库（HTTP 缓存 / 计划 / 回滚记录）、reports/（CSV 与 HTML 复核页）、cache/lrc（--lrc 导出的镜像）。
   默认只清可再生的内容：已过期缓存、超过 --days 的报告、导出与 pick 模板。
-  计划状态用于断点续跑，回滚记录用于 rollback，因此只在明确指定
-  --plans / --journal 或 --all 时才删除；删了就要重新查询、且无法回滚。
+  计划状态用于断点续跑，回滚记录用于 rollback，因此只在明确指定 --plans / --journal 或 --all 时才删除；删了就要重新查询、且无法回滚。
   删除记录后会执行 VACUUM，空间按实际收缩后的数据库大小报告。
 """
 
@@ -547,8 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
             '  lrcpatch scan --summary "結束バンド"\n'
             "  lrcpatch scan --limit 20\n\n"
             "说明\n"
-            "  明细按专辑目录分组，一行一首：✓ 已有歌词 / · 待补，后面是格式、\n"
-            "  时长、大小、歌词类型与行数；标题或艺术家缺失会标出「缺 …」。\n"
+            "  明细按专辑目录分组，一行一首：✓ 已有歌词 / · 待补，后面是格式、时长、大小、歌词类型与行数；标题或艺术家缺失会标出「缺 …」。\n"
             "  目录与文件名按 Finder 顺序排列（拼音、数字自然序）。\n"
             "  --summary 只看格式与数量汇总；--tree-limit N 限制明细行数（0 = 全部）。\n"
             "  只读；不打开状态数据库，可以和 plan/apply 同时运行。"
@@ -656,11 +652,8 @@ def build_parser() -> argparse.ArgumentParser:
             '  lrcpatch candidates --top 3 "結束バンド"\n'
             '  lrcpatch candidates --template "Aimer"\n'
             '  lrcpatch candidates --tsv "Ado" > picks.tsv\n\n'
-            "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 格式 /\n"
-            "标题 / 歌手 / 专辑。分数是标题+歌手+专辑的总分（满分 100），\n"
-            "时长差单独一列，超过容差显示红色，不再逐条解释原因。\n\n"
-            "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，\n"
-            "需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
+            "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 格式 / 标题 / 歌手 / 专辑。分数是标题+歌手+专辑的总分（满分 100），时长差单独一列，超过容差显示红色，不再逐条解释原因。\n\n"
+            "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
         ),
         formatter_class=HelpFormatter,
         add_help=False,

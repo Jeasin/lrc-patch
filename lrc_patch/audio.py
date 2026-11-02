@@ -336,6 +336,14 @@ def apply_one(
     library: Path,
 ) -> dict[str, Any]:
     path = Path(row["path"])
+    try:
+        path.relative_to(library)
+    except ValueError:
+        # A plan made under a different --library: refuse loudly instead of
+        # letting read_track() raise a bare ValueError.
+        raise ToolError(
+            f"计划里的曲目不在当前音乐库内：{path}\n当前音乐库：{library}"
+        ) from None
     before = read_track(path, library)
     if before.fingerprint() != row["fingerprint"]:
         raise ToolError("计划生成后文件已变化，请重新 plan")

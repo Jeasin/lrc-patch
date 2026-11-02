@@ -119,7 +119,7 @@ def main() -> int:
                 args.report = None
                 args.no_preflight = False
                 args.progress_every = 10
-                return commands.cmd_apply(args, state, state_dir)
+            return commands.cmd_apply(args, state, state_dir)
         if args.command == "verify":
             return commands.cmd_verify(args, state)
         if args.command == "rollback":

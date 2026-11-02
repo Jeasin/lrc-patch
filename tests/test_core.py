@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -1247,6 +1248,64 @@ class CleanTests(unittest.TestCase):
             remaining, _ = state.purge_http_cache(expired_only=False)
             self.assertEqual(remaining, 1)
             self.assertEqual(state.count_http_cache(expired_only=False), 0)
+
+
+class CliDispatchTests(unittest.TestCase):
+    """`apply` must always reach the writer — 2.8 once let it fall into the help."""
+
+    def _run(self, argv: list[str], plan_code: int = 0) -> tuple[int, str, mock.Mock, mock.Mock]:
+        from lrc_patch import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = io.StringIO()
+            full = ["lrcpatch", "--state-dir", tmp, *argv]
+            with mock.patch.object(sys, "argv", full), redirect_stdout(out):
+                with mock.patch.object(commands, "cmd_apply", return_value=0) as apply_mock:
+                    with mock.patch.object(
+                        commands, "cmd_plan", return_value=plan_code
+                    ) as plan_mock:
+                        code = cli.main()
+        return code, out.getvalue(), apply_mock, plan_mock
+
+    def test_apply_without_pick_reaches_writer(self) -> None:
+        code, text, apply_mock, plan_mock = self._run(["apply", "/tmp"])
+        self.assertEqual(code, 0)
+        self.assertTrue(apply_mock.called)
+        self.assertFalse(plan_mock.called)
+        self.assertNotIn("用法", text)
+
+    def test_apply_with_pick_plans_then_writes(self) -> None:
+        code, text, apply_mock, plan_mock = self._run(["apply", "--pick", "qq:1", "/tmp"])
+        self.assertEqual(code, 0)
+        self.assertTrue(plan_mock.called)
+        self.assertTrue(apply_mock.called)
+        self.assertNotIn("用法", text)
+
+    def test_plan_failure_stops_before_writing(self) -> None:
+        code, _text, apply_mock, plan_mock = self._run(
+            ["apply", "--pick", "qq:1", "/tmp"], plan_code=1
+        )
+        self.assertEqual(code, 1)
+        self.assertTrue(plan_mock.called)
+        self.assertFalse(apply_mock.called)
+
+
+class LibraryScopeTests(unittest.TestCase):
+    """One state file serves every --library, so selection must respect it."""
+
+    def test_plans_from_another_library_do_not_leak(self) -> None:
+        from lrc_patch.paths import resolve_selection, selection_matches
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lib_a = Path(tmp) / "A"
+            lib_b = Path(tmp) / "B"
+            lib_a.mkdir()
+            lib_b.mkdir()
+            self.assertTrue(selection_matches(lib_a / "a.m4a", lib_a, None, []))
+            self.assertFalse(selection_matches(lib_b / "a.m4a", lib_a, None, []))
+            selected = resolve_selection(lib_a, [str(lib_a)])
+            self.assertTrue(selection_matches(lib_a / "a.m4a", lib_a, None, selected))
+            self.assertFalse(selection_matches(lib_b / "a.m4a", lib_a, None, selected))
 
 
 if __name__ == "__main__":

@@ -58,9 +58,13 @@ def selection_matches(
 ) -> bool:
     if not album_matches(path, library, album):
         return False
-    if not selected:
-        return True
     resolved = canonical_path(path.resolve())
+    if not selected:
+        # No path means "the whole library", not "every plan in the database":
+        # the state file is shared, so plans made under another --library must
+        # never leak into apply/verify/rollback.
+        library_key = canonical_path(library.resolve())
+        return resolved == library_key or library_key in resolved.parents
     return any(resolved == item or item in resolved.parents for item in selected)
 
 def iter_selected_files(library: Path, selected: list[Path]) -> Iterable[Path]:
