@@ -11,6 +11,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .audio import (
@@ -40,6 +41,8 @@ from .render import (
     ProgressLine,
     default_report_path,
     disp_width,
+    format_diff,
+    format_duration,
     pad_display,
     plan_html_path,
     plan_note,
@@ -55,14 +58,13 @@ from .render import (
     status_style,
     style,
     truncate_display,
-    wrap_display,
     write_plan_html,
     write_plan_report,
 )
 from .sorting import name_key, path_key, sort_paths
 from .sources import JsonClient, build_sources
 from .state import State
-from .text import lyric_hash, lyric_kind, lyric_tag, match_note
+from .text import lyric_hash, lyric_kind, lyric_tag, match_notes
 
 
 def summarize_plans(rows: list[sqlite3.Row]) -> Counter:
@@ -361,7 +363,7 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                 + style(symbol, code)
                 + " "
                 + Path(path).name
-                + style(f"  {label} · {row['reason']}", "90")
+                + style(f"  {label}；{row['reason']}", "90")
             )
     if kept_good:
         print_meta(
@@ -468,7 +470,228 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     return 0
 
 
-def cmd_candidates(args: argparse.Namespace, state: State) -> int:
+TITLE_CAP = 40
+ARTIST_CAP = 24
+ALBUM_CAP = 22
+SCORE_WIDTH = 4
+
+
+@dataclass
+class CandRow:
+    """One candidate, already split into table columns."""
+
+    symbol: str
+    code: str
+    ident: str
+    score: str
+    diff: str
+    kind: str
+    title: str
+    artist: str
+    album: str
+    notes: list[str] = field(default_factory=list)
+    metadata_score: int = 0
+    over_tolerance: bool = False
+    score_value: int = 0
+    diff_value: float = 0.0
+    error: bool = False
+
+    @property
+    def pick(self) -> str:
+        return self.ident
+
+
+def candidate_rows(track: Track, results: list, args: argparse.Namespace) -> list[CandRow]:
+    """Score and format every candidate for one track."""
+    rows: list[CandRow] = []
+    for name, candidates, error, skipped in results:
+        if skipped:
+            continue
+        if error is not None:
+            rows.append(
+                CandRow(
+                    "✗",
+                    "1;31",
+                    name,
+                    "",
+                    "",
+                    "",
+                    f"搜索失败 {type(error).__name__}: {error}",
+                    "",
+                    "",
+                    error=True,
+                )
+            )
+            continue
+        ranked = []
+        for candidate in candidates:
+            score, diff = score_candidate(track, candidate, args.duration_tolerance)
+            # Rank by metadata first: a correct title/artist with a long
+            # duration gap should outrank a cover that happens to be closer.
+            metadata_score, _ = score_candidate(track, candidate, 999.0)
+            ranked.append((metadata_score, score, diff, candidate))
+        ranked.sort(key=lambda item: (-item[0], -item[1], item[2], -item[3].synced))
+        for metadata_score, score, diff, candidate in ranked[: args.top]:
+            if candidate.instrumental:
+                # Adopting it yields ♪ 纯音乐, not a lyric: do not mark ✓.
+                symbol, code = "♪", "36"
+            elif score >= 85:
+                symbol, code = "✓", "1;32"
+            elif metadata_score >= 85:
+                symbol, code = "!", "1;33"
+            else:
+                symbol, code = "·", "90"
+            if candidate.instrumental:
+                kind = "纯音乐"
+            elif candidate.lyrics:
+                kind = lyric_tag(lyric_kind(candidate.lyrics))
+            elif candidate.synced:
+                kind = "LRC"
+            else:
+                kind = "待取词"
+            notes = match_notes(track, candidate, args.duration_tolerance)
+            if metadata_score < 85:
+                notes.insert(0, "标题或歌手与文件不一致")
+            rows.append(
+                CandRow(
+                    symbol=symbol,
+                    code=code,
+                    ident=f"{candidate.source}:{candidate.source_id}",
+                    score=str(score) if score else "-",
+                    diff=format_diff(candidate.duration - track.duration, signed=True)
+                    if diff < 900
+                    else "Δ?",
+                    kind=kind,
+                    title=candidate.title,
+                    artist=candidate.artist_text,
+                    album=candidate.album,
+                    notes=notes,
+                    metadata_score=metadata_score,
+                    over_tolerance=bool(metadata_score) and not score,
+                    score_value=score,
+                    diff_value=candidate.duration - track.duration,
+                )
+            )
+    return rows
+
+
+def _column_widths(rows: list[CandRow]) -> tuple[int, int, int, int, int]:
+    """ID, duration gap, format, title, artist — album-wide, so rows align."""
+    return (
+        max((disp_width(row.ident) for row in rows), default=0),
+        max(6, max((disp_width(row.diff) for row in rows), default=0)),
+        max(4, max((disp_width(row.kind) for row in rows), default=0)),
+        min(TITLE_CAP, max((disp_width(row.title) for row in rows), default=0)),
+        min(ARTIST_CAP, max((disp_width(row.artist) for row in rows), default=0)),
+    )
+
+
+def candidate_table_head(widths: tuple[int, int, int, int, int]) -> str:
+    w_id, w_diff, w_kind, w_title, w_artist = widths
+    cells = [
+        pad_display("候选 ID", w_id),
+        pad_display("分数", SCORE_WIDTH),
+        pad_display("时长差", w_diff),
+        pad_display("格式", w_kind),
+        pad_display("标题", w_title),
+        pad_display("歌手", w_artist),
+        "专辑",
+    ]
+    return " " * 13 + style("  ".join(cells), "90")
+
+
+def candidate_line(
+    row: CandRow, widths: tuple[int, int, int, int, int], prefix: str, branch: str
+) -> str:
+    w_id, w_diff, w_kind, w_title, w_artist = widths
+    title = truncate_display(row.title, w_title) if w_title else ""
+    artist = truncate_display(row.artist, w_artist) if w_artist else ""
+    diff_code = "31" if row.over_tolerance else "90"
+    cells = [
+        style(pad_display(row.ident, w_id), "36"),
+        style(row.score.rjust(SCORE_WIDTH), "90"),
+        style(pad_display(row.diff, w_diff), diff_code),
+        style(pad_display(row.kind, w_kind), "90"),
+        pad_display(title, w_title),
+        style(pad_display(artist, w_artist), "90"),
+        style(truncate_display(row.album, ALBUM_CAP) if row.album else "", "90"),
+    ]
+    return (
+        style(prefix, "90")
+        + style(branch, "90")
+        + style(row.symbol, row.code)
+        + " "
+        + "  ".join(cells).strip()
+    )
+
+
+def candidate_note_lines(row: CandRow, prefix: str, last: bool) -> list[str]:
+    """Explanations hang under their own candidate, not under the next one."""
+    rail = "   " if last else "│  "
+    lines = []
+    for index, note in enumerate(row.notes):
+        glyph = "└" if index == len(row.notes) - 1 else "├"
+        lines.append(style(prefix + rail + f"{glyph} {note}", "90"))
+    return lines
+
+
+def write_pick_template(
+    path: Path, wanted: list[Track], rows_by_track: dict[str, list[CandRow]]
+) -> Path:
+    """Write an editable pick-file skeleton for a whole album.
+
+    Auto-matched tracks are ready to use; anything that needs a human choice
+    is commented out together with its alternatives, so uncommenting one line
+    is the whole decision.
+    """
+    stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"# lrcpatch 候选模板  {stamp}",
+        "# 格式：曲目路径<TAB>SOURCE:ID。去掉行首的 # 即生效；可改 ID，也可整行删掉。",
+        "# 用法：lrcpatch plan <同一范围> --pick-file 本文件",
+        "",
+    ]
+    pending = 0
+    for track in wanted:
+        rows = rows_by_track.get(str(track.path), [])
+        best = rows[0] if rows else None
+        if best and best.symbol == "✓":
+            lines.append(f"{track.relpath}\t{best.pick}")
+            lines.append(f"#   ✓ 自动匹配 {best.metadata_score} 分 {best.diff}  {best.title}")
+        else:
+            pending += 1
+            lines.append(f"# {track.relpath}")
+            lines.append(f"#   未自动确定：{'；'.join(best.notes) if best else '无候选'}")
+            for row in rows:
+                lines.append(
+                    f"#     {row.symbol} {row.ident}  {row.metadata_score} 分 {row.diff}  "
+                    f"{row.title} — {row.artist} / {row.album}"
+                )
+            if best:
+                lines.append(f"# {track.relpath}\t{best.pick}")
+        lines.append("")
+    lines.append(f"# 共 {len(wanted)} 首，其中 {pending} 首需要人工确认。")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def template_target(args: argparse.Namespace, state_dir: Path) -> Path:
+    """Where --template writes: the given FILE, or state_dir/picks/<scope>.tsv."""
+    value = getattr(args, "template", None)
+    if isinstance(value, Path):
+        return value.expanduser()
+    if isinstance(value, str) and value:
+        return Path(value).expanduser()
+    scope = Path((args.path or [args.album or "library"])[0])
+    if scope.suffix.lower() in {".m4a", ".mp3", ".dsf"}:
+        scope = scope.parent
+    name = scope.name or "library"
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return state_dir / "picks" / f"{name}-{stamp}.tsv"
+
+
+def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     """Read-only candidate listing: the IDs needed by --pick / --pick-file."""
     library = args.library.expanduser().resolve()
     live = ProgressLine()
@@ -538,24 +761,25 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
                 live.update(f"查询 {done}/{len(wanted)}  ·  {rate:.1f} 首/秒")
     live.close()
 
+    rows_by_track: dict[str, list[CandRow]] = {
+        str(track.path): candidate_rows(track, results[str(track.path)], args)
+        for track in wanted
+    }
+
     if args.tsv:
         for track in wanted:
-            for _name, candidates, _error, skipped in results[str(track.path)]:
-                if skipped or candidates is None:
+            for row in rows_by_track[str(track.path)]:
+                if row.error:
                     continue
-                ranked = []
-                for candidate in candidates:
-                    score, diff = score_candidate(track, candidate, args.duration_tolerance)
-                    metadata_score, _ = score_candidate(track, candidate, 999.0)
-                    ranked.append((metadata_score, score, diff, candidate))
-                ranked.sort(
-                    key=lambda item: (-item[0], -item[1], item[2], -item[3].synced)
+                print(
+                    f"{track.relpath}\t{row.ident}\t{row.score_value}"
+                    f"\t{abs(row.diff_value):.1f}\t{row.title}"
                 )
-                for _, score, diff, candidate in ranked[: args.top]:
-                    print(
-                        f"{track.relpath}\t{candidate.source}:{candidate.source_id}"
-                        f"\t{score}\t{diff:.1f}\t{candidate.title}"
-                    )
+        if getattr(args, "template", None):
+            path = write_pick_template(
+                template_target(args, state_dir), wanted, rows_by_track
+            )
+            print(f"# 模板：{path}", file=sys.stderr)
         if paused:
             print(
                 "暂停的源："
@@ -567,92 +791,35 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
     groups: dict[Path, list[Track]] = {}
     for track in wanted:
         groups.setdefault(track.path.parent, []).append(track)
+    rows_by_track: dict[str, list[CandRow]] = {
+        str(track.path): candidate_rows(track, results[str(track.path)], args)
+        for track in wanted
+    }
     for folder in sort_paths(groups, library):
         print("  " + style("▸ ", "36") + style(short_path(folder, library), "1;36"))
         items = sorted(groups[folder], key=lambda track: name_key(track.path.name))
+        album_rows = [row for track in items for row in rows_by_track[str(track.path)]]
+        widths = _column_widths(album_rows)
+        if album_rows:
+            print(candidate_table_head(widths))
         for index, track in enumerate(items):
             last_track = index == len(items) - 1
             print(
                 style("     └─ " if last_track else "     ├─ ", "90")
                 + style(track.path.name, "1")
-                + style(f"  {track.duration:.0f}s", "90")
+                + style(f"  {format_duration(track.duration)}", "90")
             )
             prefix = "        " if last_track else "     │  "
-            rows: list[tuple[str, str, str, str]] = []
-            for name, candidates, error, skipped in results[str(track.path)]:
-                if skipped:
-                    continue
-                if error is not None:
-                    rows.append(
-                        ("✗", "1;31", name, f"搜索失败 {type(error).__name__}: {error}")
-                    )
-                    continue
-                ranked = []
-                for candidate in candidates:
-                    score, diff = score_candidate(track, candidate, args.duration_tolerance)
-                    # Rank by metadata first: a correct title/artist with a long
-                    # duration gap should outrank a cover that happens to be closer.
-                    metadata_score, _ = score_candidate(track, candidate, 999.0)
-                    ranked.append((metadata_score, score, diff, candidate))
-                ranked.sort(
-                    key=lambda item: (-item[0], -item[1], item[2], -item[3].synced)
-                )
-                for metadata_score, score, diff, candidate in ranked[: args.top]:
-                    if candidate.instrumental:
-                        # Adopting it yields ♪ 纯音乐, not a lyric: do not mark ✓.
-                        symbol, code = "♪", "36"
-                    elif score >= 85:
-                        symbol, code = "✓", "1;32"
-                    elif metadata_score >= 85:
-                        symbol, code = "!", "1;33"
-                    else:
-                        symbol, code = "·", "90"
-                    if candidate.instrumental:
-                        kind = "纯音乐"
-                    elif candidate.lyrics:
-                        kind = lyric_tag(lyric_kind(candidate.lyrics))
-                    elif candidate.synced:
-                        kind = "LRC"
-                    else:
-                        kind = "待取词"
-                    score_text = (
-                        f"{score:>3}分"
-                        if score
-                        else ("超容差" if metadata_score else "不匹配")
-                    )
-                    diff_text = f"Δ{diff:.1f}s" if diff < 900 else "Δ?"
-                    rest = (
-                        f"{score_text} {diff_text} {pad_display(kind, 6)}"
-                        f"  {candidate.title} — {candidate.artist_text} / {candidate.album}"
-                    )
-                    note = match_note(track, candidate)
-                    if note:
-                        rest += f"  ·  {note}"
-                    rows.append(
-                        (
-                            symbol,
-                            code,
-                            f"{candidate.source}:{candidate.source_id}",
-                            rest,
-                        )
-                    )
+            rows = rows_by_track[str(track.path)]
             if not rows:
                 print(style(prefix, "90") + style("└─ ", "90") + style("无候选", "90"))
-            id_width = max((disp_width(ident) for _, _, ident, _ in rows), default=0)
-            for row_index, (symbol, code, ident, rest) in enumerate(rows):
-                branch = "└─ " if row_index == len(rows) - 1 else "├─ "
-                line = (
-                    style(prefix, "90")
-                    + style(branch, "90")
-                    + style(symbol, code)
-                    + " "
-                    + style(pad_display(ident, id_width), "36")
-                )
-                note_col = disp_width(line) + 2
-                chunks = wrap_display(rest, max(24, screen_width() - note_col))
-                print(line + "  " + style(chunks[0], "90"))
-                for chunk in chunks[1:]:
-                    print(" " * note_col + style(chunk, "90"))
+                continue
+            for row_index, row in enumerate(rows):
+                last_row = row_index == len(rows) - 1
+                branch = "└─ " if last_row else "├─ "
+                print(candidate_line(row, widths, prefix, branch))
+                for line in candidate_note_lines(row, prefix, last_row):
+                    print(line)
         print()
 
     print(
@@ -664,6 +831,21 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
         + style("--pick-file", "36")
         + "。"
     )
+    if getattr(args, "template", None):
+        template_path = write_pick_template(
+            template_target(args, state_dir), wanted, rows_by_track
+        )
+        print_meta("模板", str(template_path))
+        scope_args = " ".join(shlex.quote(item) for item in (args.path or []))
+        print_meta(
+            "下一步",
+            "编辑模板后运行 "
+            + style(
+                f"lrcpatch plan{f' {scope_args}' if scope_args else ''} "
+                f"--pick-file {shlex.quote(str(template_path))}",
+                "36",
+            ),
+        )
     if errors:
         print_meta("标签", style(f"读取失败 {len(errors)} 首（详见 scan）", "33"))
     if paused:

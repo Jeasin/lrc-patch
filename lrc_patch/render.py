@@ -306,36 +306,6 @@ def truncate_display(text: str, limit: int) -> str:
         width += step
     return "".join(out) + "…"
 
-def wrap_display(text: str, limit: int) -> list[str]:
-    """Wrap plain text by terminal columns, preferring spaces and slashes."""
-    if limit <= 2:
-        return [text]
-    lines: list[str] = []
-    remaining = text
-    while remaining:
-        if disp_width(remaining) <= limit:
-            lines.append(remaining)
-            break
-        width = 0
-        cut = 0
-        for index, char in enumerate(remaining):
-            step = 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
-            if width + step > limit:
-                break
-            width += step
-            cut = index + 1
-        window = remaining[:cut]
-        for separator in (" ", "-", "/", "\\", "；", "，", "。", "、"):
-            position = window.rfind(separator)
-            if position >= limit // 2:
-                cut = position + 1
-                break
-        if cut <= 0:
-            cut = 1
-        lines.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip()
-    return lines or [""]
-
 def screen_width() -> int:
     try:
         return max(64, shutil.get_terminal_size((100, 24)).columns)
@@ -450,8 +420,9 @@ def print_tree(
 ) -> None:
     """Album-grouped tree with file names and notes in fixed columns.
 
-    Every note starts at the same column, and wrapped lines indent to that
-    column, so a long reason never looks like a child of the next track.
+    Every note starts at the same column.  Notes are printed on one line and
+    never wrapped: the terminal cannot scroll sideways, but the window can be
+    widened, and a self-chosen width beats a judgement call made here.
     """
     if limit == 0:
         print("  " + style("明细已按 --tree-limit 0 关闭。", "90"))
@@ -470,7 +441,6 @@ def print_tree(
         )
         for folder in sort_paths(groups, library)
     ]
-    name_cap = max(28, min(64, screen_width() - 34))
     shown = 0
     for folder, items in plan:
         room = len(items) if not limit else limit - shown
@@ -495,7 +465,7 @@ def print_tree(
             header += "  " + "  ".join(chips)
         print(header)
 
-        names = [truncate_display(item.path.name, name_cap) for item in visible]
+        names = [item.path.name for item in visible]
         name_width = max((disp_width(name) for name in names), default=0)
         notes = align_note_numbers([item.note for item in visible])
         for index, item in enumerate(visible):
@@ -503,18 +473,12 @@ def print_tree(
             symbol, code, _ = status_style(item.status)
             name_cell = pad_display(names[index], name_width)
             prefix = style(branch, "90") + style(symbol, code) + " "
-            note_col = disp_width(prefix) + name_width + 2
             line = prefix + name_cell
             note = notes[index]
             if note:
                 note_code = NOTE_STYLE.get(item.status, "90")
-                chunks = wrap_display(note, max(40, screen_width() - note_col))
-                line += "  " + style(chunks[0], note_code)
-                print(line.rstrip())
-                for chunk in chunks[1:]:
-                    print(" " * note_col + style(chunk, note_code))
-            else:
-                print(line.rstrip())
+                line += "  " + style(note, note_code)
+            print(line.rstrip())
             shown += 1
         print()
     omitted = len(entries) - shown
@@ -527,6 +491,20 @@ def print_tree(
             )
         )
         print()
+
+
+def format_diff(seconds: float, signed: bool = False) -> str:
+    """Duration gap: ``Δ1.3s``, or ``Δ+1.3s`` when the sign matters.
+
+    A positive sign means the local file is longer than the provider's copy,
+    which is what tells a different master apart from parser rounding.
+    """
+    value = float(seconds or 0.0)
+    if abs(value) < 0.05:
+        value = 0.0  # avoid "-0.0s" from a rounding artefact
+    if signed:
+        return f"Δ{value:+.1f}s"
+    return f"Δ{abs(value):.1f}s"
 
 
 def format_duration(seconds: float) -> str:
@@ -784,6 +762,7 @@ class ProgressLine:
                 self._visible = False
 
 def plan_note(row: sqlite3.Row) -> str:
+    """One line: 源 分数 时长差 格式行数 歌手；差异说明."""
     status = row["status"]
     if status in {"ready", "applied"}:
         bits: list[str] = []
@@ -793,22 +772,47 @@ def plan_note(row: sqlite3.Row) -> str:
             bits.append(f"{row['score']}分")
         diff = row["duration_diff"]
         if diff is not None and diff < 900:
-            bits.append(f"Δ{diff:.1f}s")
+            bits.append(format_diff(diff))
         kind = str(row["lyric_kind"] or "")
         if kind:
             tag = lyric_tag(kind)
             bits.append(f"{tag} {row['lyric_lines']} 行" if row["lyric_lines"] else tag)
-        reason = str(row["reason"] or "")
-        if " · " in reason:
-            note = reason.split(" · ", 1)[1].strip()
-            if note:
-                bits.append(note)
-        return " · ".join(bits) or "匹配通过"
+        artist, notes = _reason_parts(str(row["reason"] or ""))
+        if artist:
+            bits.append(artist)
+        line = "  ".join(part for part in bits if part)
+        if notes:
+            line = f"{line}；{notes}" if line else notes
+        return line or "匹配通过"
     if status == "skip_existing":
         return "已有歌词，未覆盖"
     if status == "instrumental":
         return "匹配为纯音乐"
     return str(row["reason"] or status_style(status)[2])
+
+
+_LEGACY_REASON_RE = re.compile(r"^(?:TXT|LRC\+?|YRC|TTML)\s*/\s*(.+)$")
+
+
+def _reason_parts(reason: str) -> tuple[str, str]:
+    """Split a stored reason into (artist, explanation).
+
+    Ready rows store ``歌手；差异说明`` since 2.5.  Older rows used
+    ``LRC / 歌手 · 说明``; those are still understood so an upgrade does not
+    render the lyric tag as if it were an artist.
+    """
+    artist, sep, notes = reason.partition("；")
+    if sep:
+        return artist.strip(), notes.strip()
+    if reason.startswith("人工指定"):
+        # A hand-picked candidate has no artist field; keep the whole label
+        # in the explanation slot instead of faking an artist.
+        return "", reason.strip()
+    head, dot, tail = reason.partition(" · ")
+    legacy = _LEGACY_REASON_RE.match(head.strip())
+    if legacy:
+        return legacy.group(1).strip(), tail.strip() if dot else ""
+    return head.strip(), tail.strip() if dot else ""
 
 def print_summary(
     counter: Counter, label: str = "汇总", order: list[str] | None = None

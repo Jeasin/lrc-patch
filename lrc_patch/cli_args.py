@@ -46,6 +46,8 @@ _EXAMPLES = [
     ('lrcpatch "結束バンド"', "省略命令 = 只读 plan"),
     ('lrcpatch scan "Aimer" --summary', "只看格式汇总"),
     ('lrcpatch candidates "Ado" --top 3', "看候选 ID"),
+    ('lrcpatch candidates "Aimer" --template', "整张专辑的 pick 模板"),
+    ('lrcpatch plan "Aimer" --pick-file picks.tsv', "按模板批量指定"),
     ('lrcpatch plan "Ado/某首.m4a" --pick netease:123', "人工指定候选"),
     ('lrcpatch plan "Ado/某首.m4a" --pick netease:123 --apply', "指定并直接写入"),
     ('lrcpatch apply "Ado"', "只写 ✓ 可写入"),
@@ -163,7 +165,7 @@ def main_help() -> str:
             ),
             (
                 "candidates",
-                "--top N  --sources LIST  --workers N  --tsv  --all  --refresh",
+                "--top N  --sources LIST  --workers N  --template [FILE]  --tsv  --all  --refresh",
             ),
             ("apply", "--workers N  --no-preflight  --lrc"),
             ("scan", "--summary"),
@@ -198,29 +200,37 @@ def main_help() -> str:
 {_example_block()}
 
 {style("匹配与打分", "1;36")}
-  按标题、艺术家、专辑、时长打分，满分 100；≥85 自动写入，否则 ! 需确认。
+  按标题、歌手、专辑、时长打分，满分 100；≥85 自动写入，否则 ! 需确认。
 
   标题      完全相同 +55
+            标题里的 feat. / with 名字已在歌手里 +55（同一个录音，不是两个版本）
+            Netease 附的译名或假名读音 +50（Hz(ヘルツ)、标题 - English Title）
             仅版本后缀不同 +42（Live / Remaster / Da Capo Version / TV Size …）
-            仅合作者不同 +30（feat. / duet）
             其它附加后缀 +35
+            合作者不同 +30（feat. 版本）
             标题主体不同、纯音乐相反、语言版本相反 → 淘汰（0 分）
 
-  艺术家    完全相同 +30；包含关系（"A feat. B" ⊃ "A"）+20；无关 → 淘汰
-  专辑      完全相同 +15；同一专辑的另一个版本（Deluxe / Tour / Remaster…）+12；
-            包含关系 +8；缺失或不同不加分
-  时长      差值超过容差（默认 2s）直接淘汰，不参与打分
+  歌手      标签里的名字全部对得上 +30
+            少了一部分合作者 +26（"Aimer" 对上 "Aimer / 阿部真央"）
+            只是名字片段相同 +18；完全无关 → 淘汰
+            ; ／ ， 、 & feat. 都算并列分隔；AC/DC 这种不加空格的斜杠不拆
+
+  专辑      完全相同 +15；同一专辑的另一个版本（Deluxe / Tour / Single / EP…）+12
+            合集的一面（"insane dream / us" 对上 "us"）+12；包含关系 +8
+
+  时长      超过容差（默认 2s）直接淘汰；容差内不加减分，只用来排序，
+            并在写入后用 LRC 末行时间戳再核一次。
 
   专辑只做佐证，不压倒标题：版本变体的标题（+42）必须专辑也对得上才够 85。
   反过来，Deluxe 版专辑只比完全相同的专辑少 3 分，不会因为版本名不同而丢候选。
 
   常见组合
-    100分   标题 + 艺术家 + 专辑全中
+    100分   标题 + 歌手 + 专辑全中（含 feat. 名字已在歌手里）
      97分   专辑只是 Deluxe / Tour 等版本
+     93分   标题附译名或读音
      93分   专辑名互为包含
      87分   标题是版本变体，专辑对得上（Beautiful World → Da Capo Version）
-     85分   标题 + 艺术家全中，没有专辑信息（刚过阈值）
-     84分   标题是版本变体但专辑只是版本相近：不足 85，落到 ! 需确认
+     85分   标题 + 歌手全中，专辑不符
      75分   合作者不同（feat. 版本）：一律 ! 需确认
 
   排序      先按不含时长的元数据分，再按含时长的分，再按时长差，最后偏好带 LRC 的
@@ -576,9 +586,12 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "示例\n"
             '  lrcpatch candidates "結束バンド" --top 3\n'
+            '  lrcpatch candidates "Aimer" --template\n'
             '  lrcpatch candidates "Ado" --tsv > picks.tsv\n\n'
-            "输出中的 SOURCE:ID 可以直接给 plan --pick，或整理成 --pick-file。\n"
-            "分数与排序规则见 lrcpatch -h 的「匹配与打分」。"
+            "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 格式 /\n"
+            "标题 / 歌手 / 专辑，差异写在候选下面那一行，不再挤进同一行。\n\n"
+            "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，\n"
+            "需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
         ),
         formatter_class=HelpFormatter,
         add_help=False,
@@ -598,6 +611,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     candidates.add_argument("--all", action="store_true", help="连已有歌词的曲目一起列出")
     candidates.add_argument("--tsv", action="store_true", help="输出制表符分隔，便于做 pick-file")
+    candidates.add_argument(
+        "--template",
+        nargs="?",
+        const=True,
+        metavar="FILE",
+        help="同时生成 pick-file 模板：自动匹配项已填好，需确认项注释列出候选",
+    )
     candidates.add_argument("--refresh", action="store_true", help="忽略 HTTP 缓存并重查")
     candidates.add_argument(
         "--workers", type=int, metavar="N", default=4, help="查询并发 1..10（默认 4）"
@@ -707,6 +727,13 @@ def looks_like_html(value: str) -> bool:
     return not value.startswith("-") and value.lower().endswith((".html", ".htm"))
 
 
+def looks_like_pick_file(value: str) -> bool:
+    """``--template`` takes an optional file; a bare track path is not one."""
+    return not value.startswith("-") and value.lower().endswith(
+        (".tsv", ".txt", ".pick", ".csv")
+    )
+
+
 def reject_unknown_options(options: list[str], specs: dict[str, int]) -> None:
     """Turn argparse's bare "unrecognized arguments" into a usable hint.
 
@@ -729,7 +756,7 @@ def reject_unknown_options(options: list[str], specs: dict[str, int]) -> None:
             continue
         if "wrap" in name or "warp" in name:
             messages.append(
-                f"{name} 已移除：长备注现在总是按窗口折行（终端不能横向滚动）"
+                f"{name} 已移除：备注固定单行输出，不再折行（把窗口拉宽即可）"
             )
             continue
         close = difflib.get_close_matches(name, sorted(known), n=1, cutoff=0.55)
@@ -778,6 +805,13 @@ def normalize_argv(
                 continue
             if name == "--html":
                 if index + 1 < len(argv) and looks_like_html(argv[index + 1]):
+                    options.append(argv[index + 1])
+                    index += 2
+                else:
+                    index += 1
+                continue
+            if name == "--template":
+                if index + 1 < len(argv) and looks_like_pick_file(argv[index + 1]):
                     options.append(argv[index + 1])
                     index += 2
                 else:

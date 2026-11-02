@@ -92,7 +92,7 @@ def main() -> int:
                 return commands.cmd_apply(args, state, state_dir)
             return code
         if args.command == "candidates":
-            return commands.cmd_candidates(args, state)
+            return commands.cmd_candidates(args, state, state_dir)
         if args.command == "apply":
             return commands.cmd_apply(args, state, state_dir)
         if args.command == "verify":

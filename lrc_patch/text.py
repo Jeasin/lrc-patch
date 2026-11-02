@@ -64,10 +64,54 @@ def norm_text(text: str) -> str:
 def norm_loose(text: str) -> str:
     return re.sub(r"[\W_]+", "", norm_text(text), flags=re.UNICODE)
 
+_ARTIST_SEP_RE = re.compile(r"[;；,，、&]")
+_ARTIST_FEAT_RE = re.compile(r"\bfeat\.?|\bft\.?|\bfeaturing\b", re.IGNORECASE)
+_ARTIST_SLASH_RE = re.compile(r"[/／]")
+_CJK_CHARS = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+
+
+def _split_slash(chunk: str) -> list[str]:
+    """Split ``A / B`` and ``甲/乙`` but keep ``AC/DC`` in one piece."""
+    if not _ARTIST_SLASH_RE.search(chunk):
+        return [chunk]
+    if re.search(r"\s[/／]\s", chunk):
+        return _ARTIST_SLASH_RE.split(chunk)
+    if re.search(rf"[{_CJK_CHARS}][/／]|[/／][{_CJK_CHARS}]", chunk):
+        return _ARTIST_SLASH_RE.split(chunk)
+    return [chunk]
+
+
 def artist_parts(text: str) -> list[str]:
-    raw = norm_text(text)
-    parts = re.split(r"[,/&、;]|\bfeat\.?\b|\bft\.?\b|\bx\b", raw)
-    return [p for p in (norm_loose(x) for x in parts) if p]
+    """Split an artist tag into loose names.
+
+    Netease lists collaborators separately, hand-edited tags usually pack them
+    into one frame (``Aimer; 阿部真央``, ``Aimer / chelly``, ``A & B``,
+    ``A feat. B``).  Comparing the parts instead of the raw string keeps those
+    spellings equivalent.
+    """
+    raw = unicodedata.normalize("NFKC", text or "")
+    raw = _ARTIST_FEAT_RE.sub(";", raw)
+    parts: list[str] = []
+    for chunk in _ARTIST_SEP_RE.split(raw):
+        for piece in _split_slash(chunk):
+            loose = norm_loose(piece)
+            if loose:
+                parts.append(loose)
+    return parts
+
+
+def artist_matches(file_artists: list[str], cand_artists: list[str]) -> tuple[int, str]:
+    """30 every file artist is listed / 26 some / 18 prefix match / 0 none."""
+    if not file_artists or not cand_artists:
+        return 0, ""
+    missing = [name for name in file_artists if name not in cand_artists]
+    if not missing:
+        return 30, ""
+    if len(missing) < len(file_artists):
+        return 26, "歌手列表少了一部分合作者"
+    if any(a in b or b in a for a in file_artists for b in cand_artists):
+        return 18, "歌手名只是部分相同"
+    return 0, ""
 
 
 # -- title / album comparison -------------------------------------------
@@ -94,7 +138,7 @@ _VERSION_TOKENS = {
     "deluxe", "edition", "soundtrack", "rerecorded", "tv",
 }
 _INSTRUMENTAL_TOKENS = {"instrumental", "inst", "karaoke"}
-_FEAT_TOKENS = {"feat", "ft", "featuring", "duet"}
+_FEAT_TOKENS = {"feat", "ft", "featuring", "duet", "with"}
 _LANGUAGE_TOKENS = {
     "english", "japanese", "chinese", "korean", "jpn", "eng", "chi", "kor",
     "mandarin", "cantonese",
@@ -103,7 +147,7 @@ _EDITION_TOKENS = {
     "edition", "deluxe", "remaster", "remastered", "special", "expanded",
     "tour", "bonus", "anniversary", "explicit", "digital", "international",
     "japan", "japanese", "christmas", "holiday", "mono", "stereo", "reissue",
-    "collector", "limited", "complete",
+    "collector", "limited", "complete", "single", "ep",
 }
 _CJK_VERSION = (
     "バージョン", "リマスター", "ライブ", "アコースティック", "インスト",
@@ -116,6 +160,39 @@ _CJK_EDITION = ("版", "盤", "盘")
 
 def _latin_tokens(text: str) -> set[str]:
     return set(re.findall(r"[a-z]+", unicodedata.normalize("NFKC", text or "").casefold()))
+
+
+_SCRIPT_RES = {
+    "han": re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"),
+    "kana": re.compile(r"[\u3040-\u30ff]"),
+    "latin": re.compile(r"[A-Za-z]"),
+}
+
+
+def scripts(text: str) -> set[str]:
+    """Which writing systems a string uses (han / kana / latin)."""
+    return {name for name, pattern in _SCRIPT_RES.items() if pattern.search(text or "")}
+
+
+def looks_translated(base: str, decoration: str) -> str:
+    """Return 读音 / 译名 when the decoration is a second script, else "".
+
+    Netease ships ``Hz(ヘルツ)`` (kana reading of a Latin title) and
+    ``太陽が昇らない世界 - A World Where the Sun Never Rises`` (a translated
+    title after a dash).  Both are the same recording, so they must not read
+    as a different song or a version variant.
+    """
+    base_scripts, deco_scripts = scripts(base), scripts(decoration)
+    if not base_scripts or not deco_scripts:
+        return ""
+    if "kana" in deco_scripts and "kana" not in base_scripts:
+        return "读音"
+    if deco_scripts & base_scripts:
+        return ""
+    if "latin" in deco_scripts:
+        words = re.findall(r"[A-Za-z][A-Za-z'’-]*", decoration)
+        return "译名" if len(words) >= 2 else ""
+    return "译名"
 
 
 def _has_version(text: str) -> bool:
@@ -150,20 +227,48 @@ def _languages(text: str) -> set[str]:
 def split_title(text: str) -> tuple[str, str]:
     """Return (base, decorations) for ``Beautiful World (Da Capo Version)``."""
     raw = unicodedata.normalize("NFKC", text or "")
-    decorations = _TITLE_BRACKET_RE.findall(raw)
-    base = _TITLE_BRACKET_RE.sub(" ", raw)
+    decorations = [
+        part.strip() for part in _TITLE_BRACKET_RE.findall(raw) if part.strip()
+    ]
+    base = _TITLE_BRACKET_RE.sub(" ", raw).strip()
     match = _TITLE_DASH_RE.search(base)
-    if match and (_has_version(match.group(1)) or _has_feat(match.group(1))):
-        decorations.append(match.group(1))
-        base = base[: match.start()]
-    return norm_loose(base), " ".join(part.strip() for part in decorations if part.strip())
+    if match:
+        head, tail = base[: match.start()].strip(), match.group(1).strip()
+        if _has_version(tail) or _has_feat(tail) or looks_translated(head, tail):
+            decorations.append(tail)
+            base = head
+    return norm_loose(base), " ".join(decorations)
 
 
-def title_points(file_title: str, candidate_title: str) -> tuple[int, str]:
+def feat_names(text: str) -> list[str]:
+    """Names after a feat/with marker inside a title decoration."""
+    raw = unicodedata.normalize("NFKC", text or "")
+    raw = re.sub(r"[\(\)\[\]（）【】]", " ", raw)
+    match = re.search(
+        r"(?:feat\.?|ft\.?|featuring|with|duet)\b(.*)$", raw, re.IGNORECASE
+    )
+    if not match:
+        return []
+    tail = re.split(r"[;,、&]", match.group(1))
+    return [part for part in (norm_loose(item) for item in tail) if part]
+
+
+def _name_known(name: str, known: set[str]) -> bool:
+    if not known:
+        return False
+    if name in known:
+        return True
+    return any(name in item or item in name for item in known if len(item) >= 3)
+
+
+def title_points(
+    file_title: str, candidate_title: str, artists: set[str] | None = None
+) -> tuple[int, str]:
     """Points for the title alone, plus a human note when it is not exact.
 
-    55 exact / 42 version suffix / 35 other suffix / 30 featuring differs /
-    0 incompatible (different base, instrumental or language variant).
+    55 exact, or a collaborator the artist tag already lists / 50 translated
+    title or reading / 42 version suffix / 35 other decoration / 30 featuring
+    differs / 0 incompatible (different base, instrumental or language).
     """
     file_base, file_dec = split_title(file_title)
     cand_base, cand_dec = split_title(candidate_title)
@@ -179,13 +284,31 @@ def title_points(file_title: str, candidate_title: str) -> tuple[int, str]:
     file_lang, cand_lang = _languages(file_dec), _languages(cand_dec)
     if file_lang and cand_lang and file_lang != cand_lang:
         return 0, "语言版本不同"
-    if _has_feat(file_dec) != _has_feat(cand_dec):
-        return 30, "合作者不同"
+    if _has_version(file_dec) or _has_version(cand_dec):
+        detail = cand_dec or file_dec
+        return 42, f"标题版本变体「{detail}」" if detail else "标题版本变体"
+
+    known = artists or set()
+    file_feat, cand_feat = feat_names(file_dec), feat_names(cand_dec)
+    if file_feat or cand_feat:
+        names = file_feat + cand_feat
+        if all(_name_known(name, known) for name in names):
+            # The artist tag already names the collaborator: same recording,
+            # only the title spelling differs.
+            return 55, ""
+        if set(file_feat) != set(cand_feat):
+            return 30, f"合作者不同（{cand_dec or file_dec}）"
+        return 55, ""
 
     detail = cand_dec or file_dec
-    if _has_version(file_dec) or _has_version(cand_dec):
-        return 42, f"标题版本变体（{detail}）" if detail else "标题版本变体"
-    return 35, f"标题附加信息（{detail}）" if detail else "标题附加信息"
+    if detail:
+        translated = looks_translated(cand_base, detail) or looks_translated(
+            file_base, detail
+        )
+        if translated:
+            return 50, f"标题附{translated}「{detail}」"
+        return 35, f"标题附注「{detail}」"
+    return 35, "标题附加信息"
 
 
 def _is_edition(text: str) -> bool:
@@ -209,8 +332,16 @@ def strip_edition(text: str) -> str:
     return value
 
 
+def _album_parts(album: str) -> list[str]:
+    """Netease names two-sided singles ``insane dream / us``."""
+    raw = unicodedata.normalize("NFKC", album or "")
+    if not re.search(r"\s[/／]\s", raw):
+        return []
+    return [part.strip() for part in re.split(r"\s[/／]\s", raw) if part.strip()]
+
+
 def album_points(file_album: str, candidate_album: str) -> tuple[int, str]:
-    """15 exact / 12 same album in another edition / 8 containment / 0 none."""
+    """15 exact / 12 another edition or one side of a split single / 8 similar."""
     file_norm = norm_loose(file_album)
     cand_norm = norm_loose(candidate_album)
     if not file_norm or not cand_norm:
@@ -220,17 +351,38 @@ def album_points(file_album: str, candidate_album: str) -> tuple[int, str]:
     file_base = strip_edition(file_album)
     cand_base = strip_edition(candidate_album)
     if file_base and cand_base and norm_text(file_base) == norm_text(cand_base):
-        return 12, "专辑版本不同"
-    if file_norm in cand_norm or cand_norm in file_norm:
+        return 12, f"专辑版本不同「{candidate_album}」"
+    for part in _album_parts(candidate_album):
+        if norm_text(strip_edition(part)) == norm_text(file_base):
+            return 12, f"专辑是合集「{candidate_album}」的一面"
+    for part in _album_parts(file_album):
+        if norm_text(strip_edition(part)) == norm_text(cand_base):
+            return 12, f"专辑是合集「{file_album}」的一面"
+    if min(len(file_norm), len(cand_norm)) >= 4 and (
+        file_norm in cand_norm or cand_norm in file_norm
+    ):
         return 8, "专辑名相近"
     return 0, ""
 
 
-def match_note(track: "Any", candidate: "Any") -> str:
-    """Short explanation of every non-exact field, for review output."""
-    _, title_note = title_points(track.title, candidate.title)
+def match_notes(track: "Any", candidate: "Any", tolerance: float = 0.0) -> list[str]:
+    """Every non-exact field, each as a short standalone sentence."""
+    known: set[str] = set()
+    for name in getattr(candidate, "artists", []) or []:
+        known.update(artist_parts(name))
+    _, title_note = title_points(track.title, candidate.title, known)
     _, album_note = album_points(track.album, candidate.album)
-    return " · ".join(note for note in (title_note, album_note) if note)
+    notes = [note for note in (title_note, album_note) if note]
+    if tolerance and candidate.duration:
+        diff = abs(track.duration - candidate.duration)
+        if diff > tolerance:
+            notes.append(f"时长差 {diff:.1f}s，超过容差 {tolerance:.1f}s")
+    return notes
+
+
+def match_note(track: "Any", candidate: "Any", tolerance: float = 0.0) -> str:
+    """One line of every non-exact field, for review output."""
+    return "；".join(match_notes(track, candidate, tolerance))
 
 def sanitize_lyrics(text: str) -> str:
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")

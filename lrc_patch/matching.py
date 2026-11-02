@@ -10,11 +10,11 @@ from .models import Candidate, FetchResult, PlanResult, Track
 from .paths import canonical_path
 from .text import (
     album_points,
+    artist_matches,
     artist_parts,
     is_placeholder,
     lrc_timestamp_issue,
     lyric_kind,
-    lyric_tag,
     match_note,
     norm_loose,
     sanitize_lyrics,
@@ -91,26 +91,20 @@ def score_candidate(
     if diff > tolerance:
         return 0, diff
 
-    title_score, _ = title_points(track.title, candidate.title)
-    if not title_score:
-        return 0, diff
-    score = title_score
-
     file_artists = artist_parts(track.artist)
     cand_artists = [p for a in candidate.artists for p in artist_parts(a)]
-    if file_artists and cand_artists:
-        if any(a == b for a in file_artists for b in cand_artists):
-            score += 30
-        elif any(a in b or b in a for a in file_artists for b in cand_artists):
-            score += 20
-        else:
-            return 0, diff
-    else:
+    # A feat./with name only counts as "already known" when the *candidate*
+    # lists that collaborator; otherwise it is a different recording.
+    title_score, _ = title_points(track.title, candidate.title, set(cand_artists))
+    if not title_score:
+        return 0, diff
+
+    artist_score, _ = artist_matches(file_artists, cand_artists)
+    if not artist_score:
         return 0, diff
 
     album_score, _ = album_points(track.album, candidate.album)
-    score += album_score
-    return score, diff
+    return title_score + artist_score + album_score, diff
 
 def choose_candidate(
     track: Track,
@@ -353,10 +347,10 @@ def plan_one(
         if kind == "plain" and not allow_plain:
             notes.append(f"{source.name}: 仅纯文本，已按 --no-plain 跳过")
             continue
-        note = match_note(track, candidate)
-        reason = f"{lyric_tag(kind)} / {candidate.artist_text}"
+        note = match_note(track, candidate, tolerance)
+        reason = candidate.artist_text
         if note:
-            reason += f" · {note}"
+            reason = f"{reason}；{note}" if reason else note
         return plan_from_lyrics(
             track,
             candidate,

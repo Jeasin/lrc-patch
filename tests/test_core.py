@@ -9,7 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from lrc_patch import render, sorting, sources
+from lrc_patch import commands, render, sorting, sources
 from lrc_patch.cli_args import (
     build_parser,
     normalize_argv,
@@ -21,12 +21,15 @@ from lrc_patch.matching import keep_previous_plan, plan_one, score_candidate
 from lrc_patch.models import Candidate, Track, TreeEntry
 from lrc_patch.state import State
 from lrc_patch.text import (
+    album_points,
+    artist_parts,
     lrc_timestamp_issue,
     lyric_kind,
     lyric_tag,
     match_note,
     sha256_text,
     strip_edition,
+    title_points,
 )
 
 
@@ -248,6 +251,152 @@ class VersionScoringTests(unittest.TestCase):
         self.assertEqual(strip_edition("1989 (Deluxe Edition)"), "1989")
 
 
+class ArtistParsingTests(unittest.TestCase):
+    """Every separator a hand-edited artist tag may use splits the same way."""
+
+    def test_common_separators_are_equivalent(self) -> None:
+        expected = ["aimer", "阿部真央"]
+        for value in (
+            "Aimer; 阿部真央",
+            "Aimer；阿部真央",
+            "Aimer／阿部真央",
+            "Aimer / 阿部真央",
+            "Aimer、阿部真央",
+            "Aimer & 阿部真央",
+            "Aimer feat. 阿部真央",
+            "Aimer ft 阿部真央",
+        ):
+            self.assertEqual(artist_parts(value), expected, value)
+
+    def test_latin_slash_stays_whole(self) -> None:
+        self.assertEqual(artist_parts("AC/DC"), ["acdc"])
+
+    def test_collaborator_in_artist_list_is_the_same_recording(self) -> None:
+        track = make_track(
+            title="for ロンリー (with 阿部真央)",
+            artist="Aimer; 阿部真央",
+            album="daydream",
+            duration=292.0,
+        )
+        candidate = Candidate(
+            "netease", "1", "for ロンリー", ["Aimer", "阿部真央"], "daydream", 292.1
+        )
+        self.assertEqual(score_candidate(track, candidate)[0], 100)
+
+    def test_collaborator_missing_from_artist_list_is_a_different_take(self) -> None:
+        track = make_track(
+            title="ninelie (with chelly)",
+            artist="Aimer; chelly",
+            album="daydream",
+            duration=262.0,
+        )
+        candidate = Candidate("netease", "1", "ninelie", ["Aimer"], "daydream", 262.1)
+        self.assertLess(score_candidate(track, candidate)[0], 85)
+
+
+class TitleDecorationTests(unittest.TestCase):
+    def _score(self, file_title: str, cand_title: str, artist: str = "Aimer") -> int:
+        track = make_track(title=file_title, artist=artist, album="daydream", duration=289.0)
+        candidate = Candidate("netease", "1", cand_title, [artist], "daydream", 289.1)
+        return score_candidate(track, candidate)[0]
+
+    def test_kana_reading_is_not_a_version(self) -> None:
+        self.assertEqual(self._score("Hz", "Hz(ヘルツ)"), 95)
+        self.assertIn("读音", title_points("Hz", "Hz(ヘルツ)")[1])
+
+    def test_dash_translation_is_not_a_different_song(self) -> None:
+        file_title = "太陽が昇らない世界"
+        cand_title = "太陽が昇らない世界 - A World Where the Sun Never Rises"
+        self.assertEqual(self._score(file_title, cand_title), 95)
+        self.assertIn("译名", title_points(file_title, cand_title)[1])
+
+    def test_cover_tag_is_not_translation(self) -> None:
+        self.assertEqual(self._score("closer", "Closer——（cover:Aimer）"), 80)
+        self.assertIn("附注", title_points("closer", "Closer——（cover:Aimer）")[1])
+
+    def test_album_split_single_matches_its_side(self) -> None:
+        self.assertEqual(album_points("us", "insane dream / us")[0], 12)
+        self.assertEqual(album_points("daydream", "insane dream / us")[0], 0)
+
+
+class PickTemplateTests(unittest.TestCase):
+    """`candidates --template` hands back an editable pick-file."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.track = make_track()
+
+    def _row(self, **overrides) -> "commands.CandRow":
+        values = {
+            "symbol": "✓",
+            "code": "1;32",
+            "ident": "netease:1",
+            "score": "100",
+            "diff": "Δ+0.1s",
+            "kind": "待取词",
+            "title": "Track",
+            "artist": "Artist",
+            "album": "Album",
+        }
+        values.update(overrides)
+        return commands.CandRow(**values)
+
+    def test_auto_matched_rows_are_ready_to_use(self) -> None:
+        path = commands.write_pick_template(
+            self.dir / "picks.tsv", [self.track], {str(self.track.path): [self._row()]}
+        )
+        lines = path.read_text(encoding="utf-8").splitlines()
+        active = [
+            line for line in lines if line.strip() and not line.startswith("#")
+        ]
+        self.assertEqual(active, ["Artist/Album/01 track.m4a\tnetease:1"])
+
+    def test_uncertain_rows_are_commented_with_alternatives(self) -> None:
+        rows = [
+            self._row(
+                symbol="!",
+                ident="netease:2",
+                score="-",
+                diff="Δ+9.0s",
+                metadata_score=95,
+                notes=["时长差 9.0s，超过容差 2.0s"],
+            ),
+            self._row(symbol="·", ident="netease:3", score="72"),
+        ]
+        path = commands.write_pick_template(
+            self.dir / "picks.tsv", [self.track], {str(self.track.path): rows}
+        )
+        text = path.read_text(encoding="utf-8")
+        active = [
+            line
+            for line in text.splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        self.assertEqual(active, [])
+        self.assertIn("# Artist/Album/01 track.m4a", text)
+        self.assertIn("netease:2", text)
+        self.assertIn("netease:3", text)
+
+
+class PlanNoteFormatTests(unittest.TestCase):
+    def test_new_reason_splits_artist_and_notes(self) -> None:
+        self.assertEqual(
+            render._reason_parts("Aimer；标题附读音「ヘルツ」"),
+            ("Aimer", "标题附读音「ヘルツ」"),
+        )
+
+    def test_legacy_reason_does_not_leak_the_lyric_tag(self) -> None:
+        self.assertEqual(render._reason_parts("LRC / Aimer"), ("Aimer", ""))
+        self.assertEqual(
+            render._reason_parts("LRC / Aimer · 标题附加信息（Live）"),
+            ("Aimer", "标题附加信息（Live）"),
+        )
+
+    def test_picked_row_keeps_the_label_as_explanation(self) -> None:
+        label = "人工指定 netease:1（时长已核验 Δ0.1s）"
+        self.assertEqual(render._reason_parts(label), ("", label))
+
+
 class TreeAlignmentTests(unittest.TestCase):
     def setUp(self) -> None:
         render.set_color(False)
@@ -263,7 +412,7 @@ class TreeAlignmentTests(unittest.TestCase):
             render.print_tree(entries, Path("/library"), 200)
         return [render.strip_ansi(line) for line in buffer.getvalue().splitlines()]
 
-    def test_notes_start_at_same_column_and_wrap_below_it(self) -> None:
+    def test_notes_start_at_same_column_and_stay_on_one_line(self) -> None:
         long_note = "请求失败：" + "非常长的原因，" * 20
         entries = [
             TreeEntry(Path("/library/A/01 short.m4a"), "ready", "短备注"),
@@ -274,21 +423,19 @@ class TreeAlignmentTests(unittest.TestCase):
         second = next(line for line in lines if "请求失败" in line)
         column = first.index("短备注")
         self.assertEqual(column, second.index("请求失败"))
-        note_lines = lines[lines.index(second) + 1 :]
-        wrapped = [line for line in note_lines if line.strip() and line.startswith(" ")]
-        self.assertTrue(wrapped)
-        for line in wrapped:
-            self.assertEqual(len(line) - len(line.lstrip()), column)
+        # The note is not wrapped: the whole reason is on that row and no
+        # indented continuation follows it.
+        self.assertTrue(second.rstrip().endswith("非常长的原因，"))
+        self.assertEqual(len(second.rstrip()), column + len(long_note))
 
-    def test_long_notes_always_wrap(self) -> None:
+    def test_long_notes_are_never_wrapped(self) -> None:
         long_note = "错误：" + "x" * 300
         lines = self._render(
             [TreeEntry(Path("/library/A/01 track.m4a"), "error", long_note)]
         )
         matching = [line for line in lines if "错误：" in line]
         self.assertEqual(len(matching), 1)
-        self.assertLess(len(matching[0]), 120)
-        self.assertGreater(len(lines), 2)
+        self.assertEqual(len(matching[0].rstrip()), matching[0].index("错误：") + len(long_note))
 
     def test_line_counts_align_within_an_album(self) -> None:
         entries = [
