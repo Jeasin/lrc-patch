@@ -121,6 +121,22 @@ class State:
                 );
                 """
             )
+            # 1.6 and earlier stored provider failures as no_match. Reclassify
+            # them once so the 2.x retry policy actually picks them up instead
+            # of reusing a stale "no match" forever.
+            conn.execute(
+                """
+                UPDATE plans SET status='error'
+                WHERE status='no_match' AND (
+                    reason LIKE '%连续请求失败%'
+                    OR reason LIKE '%ToolError%'
+                    OR reason LIKE '%HTTP 503%'
+                    OR reason LIKE '%HTTP 406%'
+                    OR reason LIKE '%code 406%'
+                    OR reason LIKE '%Connection reset%'
+                )
+                """
+            )
 
     def cached_http(self, key: str) -> Any | None:
         with self.connection() as conn:

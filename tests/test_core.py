@@ -190,6 +190,31 @@ class TreeAlignmentTests(unittest.TestCase):
         self.assertGreater(len(matching[0]), 200)
 
 
+class StateMigrationTests(unittest.TestCase):
+    def test_legacy_network_no_match_becomes_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            State(path)
+            with State(path).connection() as conn:
+                conn.executemany(
+                    "INSERT INTO plans(path,fingerprint,planned_at,status,reason) "
+                    "VALUES(?,?,?,?,?)",
+                    [
+                        (
+                            "/legacy.m4a",
+                            "fp",
+                            "now",
+                            "no_match",
+                            "netease: ToolError: netease 连续请求失败: 返回 code 406",
+                        ),
+                        ("/genuine.m4a", "fp", "now", "no_match", "netease: 无搜索结果"),
+                    ],
+                )
+            state = State(path)
+            self.assertEqual(state.get_plan("/legacy.m4a")["status"], "error")
+            self.assertEqual(state.get_plan("/genuine.m4a")["status"], "no_match")
+
+
 class JsonClientTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
