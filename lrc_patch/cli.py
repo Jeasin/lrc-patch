@@ -13,10 +13,18 @@ from .cli_args import (
     option_specs,
     reject_unknown_options,
 )
-from .config import APP_VERSION, SOURCE_NAMES, default_state_dir
+from .config import APP_VERSION, SOURCE_NAMES, default_state_dir, load_config
 from .errors import ToolError
 from .render import print_intro, set_color
 from .state import State, state_lock
+
+
+def _help_config():
+    """The help page should still open if the config file is broken."""
+    try:
+        return load_config()
+    except ToolError:
+        return None
 
 
 def main() -> int:
@@ -26,15 +34,15 @@ def main() -> int:
     except (AttributeError, ValueError):
         pass
 
-    parser = build_parser()
     argv = sys.argv[1:]
     if not argv:
-        print_intro()
+        config = _help_config()
+        print_intro(config.library if config else None)
         return 0
     if "--no-color" in argv:
         set_color(False)
     if argv[0] in {"help", "?"}:
-        print(main_help())
+        print(main_help(_help_config()))
         return 0
     if "--version" in argv:
         print(APP_VERSION)
@@ -42,9 +50,11 @@ def main() -> int:
 
     has_command = any(token in COMMAND_NAMES for token in argv)
     if ("-h" in argv or "--help" in argv) and not has_command:
-        print(main_help())
+        print(main_help(_help_config()))
         return 0
 
+    config = load_config()
+    parser = build_parser(config)
     specs = option_specs(parser)
     command, options, paths = normalize_argv(argv, specs)
     reject_unknown_options(options, specs)
@@ -56,7 +66,7 @@ def main() -> int:
     if getattr(args, "no_color", False):
         set_color(False)
     args.path = list(getattr(args, "paths", []) or [])
-    state_dir = (args.state_dir or default_state_dir()).resolve()
+    state_dir = (getattr(args, "state_dir", None) or default_state_dir()).resolve()
     args.src = [
         item.strip() for item in getattr(args, "src", "").split(",") if item.strip()
     ]
@@ -92,6 +102,8 @@ def main() -> int:
     # while another plan/apply holds the lock.
     if args.command == "scan":
         return commands.cmd_scan(args, state_dir)
+    if args.command == "config":
+        return commands.cmd_config(args)
 
     with state_lock(state_dir):
         state = State(state_dir / "lyrics.sqlite3")
@@ -127,7 +139,7 @@ def main() -> int:
         if args.command == "clean":
             return cmd_clean(args, state, state_dir)
 
-    print(main_help())
+    print(main_help(config))
     return 2
 
 def run() -> int:

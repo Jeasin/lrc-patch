@@ -19,6 +19,7 @@ from lrc_patch.cli_args import (
     option_specs,
     reject_unknown_options,
 )
+from lrc_patch.config import Config, load_config, write_config_template
 from lrc_patch.errors import SourceError, ToolError
 from lrc_patch.matching import assign_picks, keep_previous_plan, plan_one, score_candidate
 from lrc_patch.models import Candidate, Track, TreeEntry
@@ -101,6 +102,78 @@ class DefaultsTests(unittest.TestCase):
         )
         self.assertTrue(args.apply)
         self.assertEqual(args.paths, ["A"])
+
+
+class ConfigTests(unittest.TestCase):
+    def test_missing_file_means_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(Path(tmp) / "config.toml")
+        self.assertFalse(config.exists)
+        self.assertIsNone(config.library)
+        self.assertEqual(config.src, ())
+        self.assertIsNone(config.workers)
+
+    def test_reads_strings_arrays_and_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                "# 注释\n"
+                'library = "~/Music/Test"  # 行尾注释\n'
+                'src = ["qq", "netease"]\n'
+                "workers = 2\n",
+                encoding="utf-8",
+            )
+            config = load_config(path)
+        self.assertTrue(config.exists)
+        self.assertEqual(config.library, Path.home() / "Music" / "Test")
+        self.assertEqual(config.src, ("qq", "netease"))
+        self.assertEqual(config.workers, 2)
+
+    def test_unknown_key_is_named_with_its_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text('library = "/x"\ncolour = "blue"\n', encoding="utf-8")
+            with self.assertRaises(ToolError) as ctx:
+                load_config(path)
+        self.assertIn("未知配置项 colour", str(ctx.exception))
+        self.assertIn(":2", str(ctx.exception))
+
+    def test_bad_values_get_a_readable_error(self) -> None:
+        cases = [
+            ("workers = 0\n", "1..10"),
+            ("workers = \"four\"\n", "整数"),
+            ("src = [\"spotify\"]\n", "未知歌词源"),
+            ("library = 3\n", "非空字符串"),
+        ]
+        for text, expected in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "config.toml"
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(ToolError) as ctx:
+                    load_config(path)
+            self.assertIn(expected, str(ctx.exception))
+
+    def test_parser_defaults_follow_the_config(self) -> None:
+        config = Config(
+            Path("/config.toml"),
+            True,
+            library=Path("/music/lib"),
+            src=("qq",),
+            workers=2,
+        )
+        args = build_parser(config).parse_args(["plan"])
+        self.assertEqual(args.library, Path("/music/lib"))
+        self.assertEqual(args.src, "qq")
+        self.assertEqual(args.workers, 2)
+
+    def test_init_writes_a_template_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested" / "config.toml"
+            self.assertTrue(write_config_template(path))
+            self.assertIn("library", path.read_text(encoding="utf-8"))
+            path.write_text("workers = 3\n", encoding="utf-8")
+            self.assertFalse(write_config_template(path))
+            self.assertEqual(path.read_text(encoding="utf-8"), "workers = 3\n")
 
 
 class NormalizeTests(unittest.TestCase):
@@ -450,6 +523,66 @@ class TreeAlignmentTests(unittest.TestCase):
         columns = {line.index("行") for line in lines if "LRC" in line}
         self.assertEqual(len(columns), 1)
 
+    def test_plan_cells_share_one_column_each(self) -> None:
+        rows = [
+            {
+                "status": "ready",
+                "source": "netease",
+                "score": 7,
+                "duration_diff": 10.3,
+                "lyric_kind": "lrc",
+                "lyric_lines": 6,
+                "reason": "周杰伦",
+            },
+            {
+                "status": "ready",
+                "source": "qq",
+                "score": 100,
+                "duration_diff": 0.3,
+                "lyric_kind": "lrc",
+                "lyric_lines": 101,
+                "reason": "周杰伦",
+            },
+        ]
+        entries = []
+        for index, row in enumerate(rows):
+            cells, note = render.plan_fields(row)
+            entries.append(
+                TreeEntry(Path(f"/library/A/0{index + 1} song.m4a"), "ready", note, cells)
+            )
+        lines = self._render(entries)
+        for marker in ("分", "LRC", "行", "周杰伦"):
+            columns = {line.index(marker) for line in lines if marker in line}
+            self.assertEqual(len(columns), 1, f"{marker} 没有对齐：{columns}")
+        # A wider gap keeps its seconds column (and decimal point) aligned, so
+        # "Δ0.3s" gets the extra leading space rather than pushing "s" right.
+        ends = {
+            line.index("s", line.index("Δ")) for line in lines if "Δ" in line
+        }
+        self.assertEqual(len(ends), 1, f"时长差没有对齐：{ends}")
+        # Same start column for the source cell, so "qq" sits under "netease".
+        starts = {
+            line.index("qq") if "qq" in line else line.index("netease")
+            for line in lines
+            if "qq" in line or "netease" in line
+        }
+        self.assertEqual(len(starts), 1)
+
+    def test_explanation_rows_stay_a_single_note(self) -> None:
+        cells, note = render.plan_fields(
+            {
+                "status": "suspect",
+                "source": "qq",
+                "score": 100,
+                "duration_diff": 0.2,
+                "lyric_kind": "lrc",
+                "lyric_lines": 20,
+                "reason": "LRC 末尾 04:20 超过音频 03:10",
+            }
+        )
+        self.assertEqual(cells, ())
+        self.assertEqual(note, "qq 100分；LRC 末尾 04:20 超过音频 03:10")
+
 
 class StateMigrationTests(unittest.TestCase):
     def test_legacy_network_no_match_becomes_error(self) -> None:
@@ -699,6 +832,28 @@ class ScanListTests(unittest.TestCase):
         ]
         self.assertEqual(len(rows), 2)
         self.assertEqual(len({row.index("行") for row in rows}), 1)
+
+    def test_scan_shows_a_cached_plan_next_to_missing_lyrics(self) -> None:
+        track = self._track("/lib/A/(2020)Album", "01 A.m4a")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            render.print_scan_list(
+                [track], Path("/lib"), 0, {str(track.path): ("qq", 100, "ready")}
+            )
+        out = render.strip_ansi(buffer.getvalue())
+        self.assertIn("无歌词", out)
+        self.assertIn("qq:100", out)
+
+    def test_scan_does_not_show_a_plan_over_existing_lyrics(self) -> None:
+        track = self._track(
+            "/lib/A/(2020)Album", "01 A.m4a", lyrics="[00:01.00]x"
+        )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            render.print_scan_list(
+                [track], Path("/lib"), 0, {str(track.path): ("qq", 100, "ready")}
+            )
+        self.assertNotIn("qq:100", render.strip_ansi(buffer.getvalue()))
 
     def test_scan_uses_finder_folder_order(self) -> None:
         tracks = [

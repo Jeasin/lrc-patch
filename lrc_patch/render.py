@@ -256,8 +256,8 @@ query.addEventListener('input', apply);
     write_text_atomic(path, document)
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
-# "LRC 42行" / "LRC 6 行": the count is right-aligned per album group.
-_NOTE_LINES_RE = re.compile(r"(LRC\+?|YRC|TTML|TXT) (\d+)( ?行)")
+# "LRC 42行" / "A2  6 行": the count is right-aligned per album group.
+_NOTE_LINES_RE = re.compile(r"(LRC\+?|A2|ESLRC|YRC|QRC|TTML|TXT) (\d+)( ?行)")
 
 _COLOR_ENABLED = (
     sys.stdout.isatty()
@@ -290,8 +290,9 @@ def disp_width(text: str) -> int:
         width += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
     return width
 
-def pad_display(text: str, width: int) -> str:
-    return text + " " * max(0, width - disp_width(text))
+def pad_display(text: str, width: int, align: str = "left") -> str:
+    gap = " " * max(0, width - disp_width(text))
+    return gap + text if align == "right" else text + gap
 
 def truncate_display(text: str, limit: int) -> str:
     if limit <= 1 or disp_width(text) <= limit:
@@ -325,6 +326,18 @@ def print_header(title: str, subtitle: str = "") -> None:
 
 def print_meta(label: str, value: str) -> None:
     print("  " + style(label, "90") + "  " + value)
+
+
+def print_meta_table(rows: list[tuple[str, str]]) -> None:
+    """Several ``label  value`` lines with the labels right-aligned together."""
+    width = max((disp_width(label) for label, _ in rows), default=0)
+    for label, value in rows:
+        print(
+            "  "
+            + style(label, "90")
+            + " " * (width - disp_width(label) + 2)
+            + value
+        )
 
 def selection_label(args: argparse.Namespace) -> str:
     if getattr(args, "path", None):
@@ -412,6 +425,55 @@ def align_note_numbers(notes: list[str]) -> list[str]:
     return aligned
 
 
+# Cells that read as a number are right-aligned, so ``7分`` sits under ``100分``
+# and ``Δ10.3s`` does not push its ``s`` past the shorter rows.
+_CELL_NUMBER_RE = re.compile(r"^(?:\d+分|Δ[+-]?\d+(?:\.\d+)?s)$")
+
+
+def align_cell_columns(rows: list[list[str]]) -> None:
+    """Align per-column content in place, across one album group.
+
+    Text columns only need the width pass in :func:`format_cells`; lyric cells
+    also want their line count right-aligned (``LRC  6 行`` under ``LRC 66 行``),
+    which is what :func:`align_note_numbers` already does per tag.
+    """
+    if not rows:
+        return
+    count = max(len(cells) for cells in rows)
+    for index in range(count):
+        column = [cells[index] if index < len(cells) else "" for cells in rows]
+        aligned = align_note_numbers(column)
+        for cells, value in zip(rows, aligned):
+            if index < len(cells):
+                cells[index] = value
+
+
+def cell_widths(rows: list[list[str]]) -> list[int]:
+    if not rows:
+        return []
+    count = max(len(cells) for cells in rows)
+    return [
+        max((disp_width(cells[index]) for cells in rows if index < len(cells)), default=0)
+        for index in range(count)
+    ]
+
+
+def format_cells(cells: list[str], widths: list[int]) -> str:
+    """Render cells as padded columns; empty trailing cells are dropped."""
+    last = -1
+    for index, cell in enumerate(cells):
+        if cell:
+            last = index
+    if last < 0:
+        return ""
+    parts: list[str] = []
+    for index in range(last + 1):
+        cell = cells[index]
+        align = "right" if _CELL_NUMBER_RE.match(cell) else "left"
+        parts.append(pad_display(cell, widths[index], align))
+    return "  ".join(parts).rstrip()
+
+
 def print_tree(
     entries: list[TreeEntry],
     library: Path,
@@ -468,16 +530,22 @@ def print_tree(
         names = [item.path.name for item in visible]
         name_width = max((disp_width(name) for name in names), default=0)
         notes = align_note_numbers([item.note for item in visible])
+        cell_rows = [list(item.cells) for item in visible]
+        align_cell_columns(cell_rows)
+        widths = cell_widths(cell_rows)
         for index, item in enumerate(visible):
             branch = "    └─ " if index == len(visible) - 1 else "    ├─ "
             symbol, code, _ = status_style(item.status)
             name_cell = pad_display(names[index], name_width)
             prefix = style(branch, "90") + style(symbol, code) + " "
             line = prefix + name_cell
+            note_code = NOTE_STYLE.get(item.status, "90")
             note = notes[index]
+            rendered = format_cells(cell_rows[index], widths) if item.cells else ""
+            if rendered:
+                line += "  " + style(rendered, note_code)
             if note:
-                note_code = NOTE_STYLE.get(item.status, "90")
-                line += "  " + style(note, note_code)
+                line += ("；" if rendered else "  ") + style(note, note_code)
             print(line.rstrip())
             shown += 1
         print()
@@ -571,13 +639,26 @@ def _lyric_counts(with_lyrics: int, missing: int) -> str:
     return "  " + "  ".join(parts) if parts else ""
 
 
-def print_scan_list(tracks: list[Track], library: Path, limit: int = 0) -> None:
+CACHE_TONE = {"ready": "32", "ambiguous": "33", "suspect": "35"}
+
+
+def print_scan_list(
+    tracks: list[Track],
+    library: Path,
+    limit: int = 0,
+    cached: dict[str, tuple[str, int, str]] | None = None,
+) -> None:
     """Per-file scan detail, one row per track, grouped by album folder.
 
     Columns are fixed across the whole listing rather than per folder, so
     format/duration/size/lyrics line up all the way down the page.  Folder and
     file order follows Finder, and the lyric line count is right-aligned inside
     each album, so ``LRC  6 行`` never drifts away from ``LRC 23 行``.
+
+    ``cached`` maps a track path to ``(source, score, status)`` from the plan
+    database: a track that already has a usable plan shows ``qq:100`` in its
+    own column, which is the difference between "no lyrics yet" and "no lyrics
+    yet, but apply will fix it".
     """
     if not tracks:
         print("  " + style("没有可列出的音频文件。", "90"))
@@ -619,6 +700,25 @@ def print_scan_list(tracks: list[Track], library: Path, limit: int = 0) -> None:
     fmt_width = max(3, max(len(value) for value in formats.values()))
     dur_width = max(5, max(len(value) for value in durations.values()))
     size_width = max(8, max(len(value) for value in sizes.values()))
+
+    # A plan that is ready (or only needs a glance) is worth showing next to
+    # "无歌词": it answers "do I have to query again?" without opening the HTML.
+    cache_labels: dict[int, str] = {}
+    cache_tones: dict[int, str] = {}
+    for track in tracks:
+        info = (cached or {}).get(str(track.path))
+        label = ""
+        if info and not track.has_lyrics:
+            source, score, status = info
+            if source and status in CACHE_TONE:
+                # "qq:100" is an invitation to apply; a cached but unready
+                # verdict gets a question mark so the two never read alike.
+                # A gated score of 0 is not worth printing.
+                label = f"{source}:{score}" if score else source
+                label += "" if status == "ready" else "?"
+                cache_tones[id(track)] = CACHE_TONE[status]
+        cache_labels[id(track)] = label
+    cache_width = max((disp_width(label) for label in cache_labels.values()), default=0)
 
     with_lyrics = sum(1 for track in tracks if track.has_lyrics)
     print(
@@ -673,6 +773,11 @@ def print_scan_list(tracks: list[Track], library: Path, limit: int = 0) -> None:
                 + "  "
                 + style(pad_display(lyric, lyric_width), tone)
             )
+            if cache_width:
+                line += "  " + style(
+                    pad_display(cache_labels[id(track)], cache_width),
+                    cache_tones.get(id(track), "90"),
+                )
             if gaps[id(track)]:
                 line += "  " + style(gaps[id(track)], "33")
             print(line.rstrip())
@@ -763,33 +868,34 @@ class ProgressLine:
                 self._stream.flush()
                 self._visible = False
 
-def plan_note(row: sqlite3.Row) -> str:
-    """One line: 源 分数 时长差 格式行数 歌手；差异说明."""
+def plan_fields(row: sqlite3.Row) -> tuple[tuple[str, ...], str]:
+    """``(cells, trailing note)`` for one plan row.
+
+    Ready rows become five columns — source / score / duration gap / lyric /
+    artist — which :func:`print_tree` aligns per album.  Rows that carry an
+    explanation instead (ambiguous, suspect, failure) stay a single note: their
+    "source score" head is a list of attempts, not one value, so a fixed
+    column would only push the explanation to the right.
+    """
     status = row["status"]
     if status in {"ready", "applied"}:
-        bits: list[str] = []
-        if row["source"]:
-            bits.append(str(row["source"]))
-        if row["score"]:
-            bits.append(f"{row['score']}分")
         diff = row["duration_diff"]
-        if diff is not None and diff < 900:
-            bits.append(format_diff(diff))
         kind = str(row["lyric_kind"] or "")
-        if kind:
-            tag = lyric_tag(kind)
-            bits.append(f"{tag} {row['lyric_lines']} 行" if row["lyric_lines"] else tag)
+        tag = lyric_tag(kind) if kind else ""
+        lines = row["lyric_lines"] or 0
         artist, notes = _reason_parts(str(row["reason"] or ""))
-        if artist:
-            bits.append(artist)
-        line = "  ".join(part for part in bits if part)
-        if notes:
-            line = f"{line}；{notes}" if line else notes
-        return line or "匹配通过"
+        cells = (
+            str(row["source"] or ""),
+            f"{row['score']}分" if row["score"] else "",
+            format_diff(diff) if diff is not None and diff < 900 else "",
+            f"{tag} {lines} 行" if tag and lines else tag,
+            artist,
+        )
+        return cells, notes or ("匹配通过" if not any(cells) else "")
     if status == "skip_existing":
-        return "已有歌词，未覆盖"
+        return (), "已有歌词，未覆盖"
     if status == "instrumental":
-        return "匹配为纯音乐"
+        return (), "匹配为纯音乐"
     if status == "suspect":
         # Say which provider supplied the lyric that failed the sanity check;
         # otherwise a suspect row looks like it came from nowhere.
@@ -798,8 +904,8 @@ def plan_note(row: sqlite3.Row) -> str:
             bits.append(f"{row['score']}分")
         head = " ".join(bits)
         reason = str(row["reason"] or "")
-        return f"{head}；{reason}" if head and reason else head or reason
-    return str(row["reason"] or status_style(status)[2])
+        return (), f"{head}；{reason}" if head and reason else head or reason
+    return (), str(row["reason"] or status_style(status)[2])
 
 
 _LEGACY_REASON_RE = re.compile(r"^(?:TXT|LRC\+?|A2|ESLRC|YRC|QRC|TTML)\s*/\s*(.+)$")
@@ -858,7 +964,8 @@ def print_summary(
         return
     print("  " + style(label, "90") + "  " + "   ".join(parts))
 
-def print_intro() -> None:
+def print_intro(library: Path | None = None) -> None:
+    shown = short_path(library) if library else "~/Music/JMusic"
     print()
     print(
         "  "
@@ -868,7 +975,7 @@ def print_intro() -> None:
     )
     print("  " + rule())
     print("  只改歌词字段；其他标签、封面与音频数据不动。默认先 plan，不写文件。")
-    print("  默认音乐库 ~/Music/JMusic；路径相对它解析，也可以直接拖入目录。")
+    print(f"  默认音乐库 {shown}；路径相对它解析，也可以直接拖入目录。")
     print()
     print("  " + style("常用", "1"))
     rows = [
@@ -878,6 +985,7 @@ def print_intro() -> None:
         ('lrcpatch apply "Ado"', "只写入 ✓ ready 的曲目"),
         ('lrcpatch verify "Ado"', "校验歌词与其他标签"),
         ('lrcpatch rollback --yes "Ado"', "回滚本工具写入的歌词"),
+        ("lrcpatch config", "查看默认值 / 生成配置文件"),
     ]
     width = max(disp_width(command) for command, _ in rows)
     for command, note in rows:
@@ -890,7 +998,16 @@ def print_intro() -> None:
         + "  "
         + "  ".join(
             style(name, "36")
-            for name in ("scan", "plan", "candidates", "apply", "verify", "rollback")
+            for name in (
+                "scan",
+                "plan",
+                "candidates",
+                "apply",
+                "verify",
+                "rollback",
+                "clean",
+                "config",
+            )
         )
     )
     print(

@@ -54,6 +54,30 @@ def state_lock(state_dir: Path, timeout: float = 3.0) -> Iterable[None]:
         finally:
             handle.close()
 
+def read_plan_cache(path: Path) -> dict[str, sqlite3.Row]:
+    """Read plan rows without taking the run lock or creating the database.
+
+    ``scan`` is advertised as safe to run while a plan/apply is writing, so it
+    opens the file read-only and silently gives up on any lock contention: a
+    missing annotation is harmless, a blocked scan is not.
+    """
+    if not path.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)
+    except sqlite3.Error:
+        return {}
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT path,status,source,score,fingerprint FROM plans"
+        ).fetchall()
+        return {row["path"]: row for row in rows}
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+
 class State:
     def __init__(self, path: Path):
         self.path = path

@@ -12,12 +12,22 @@ from .config import (
     DEFAULT_DURATION_TOLERANCE,
     DEFAULT_LIBRARY,
     DEFAULT_SOURCES,
+    Config,
 )
 from .errors import ToolError
 from .render import disp_width, style
 
 
-COMMAND_NAMES = {"scan", "plan", "apply", "verify", "rollback", "candidates", "clean"}
+COMMAND_NAMES = {
+    "scan",
+    "plan",
+    "apply",
+    "verify",
+    "rollback",
+    "candidates",
+    "clean",
+    "config",
+}
 
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter):
@@ -89,16 +99,38 @@ def _table(rows: list[tuple[str, str, str]], indent: str = "    ") -> str:
 
 
 def _flag_block(rows: list[tuple[str, str]]) -> str:
-    """One line per command: the terminal wraps, the page does not."""
+    """One line per group of flags: the terminal wraps, the page does not.
+
+    A command may carry several lines (``plan`` groups its flags by purpose);
+    continuation lines stay indented under the first line's flag column.
+    """
     width = max(len(name) for name, _ in rows)
-    return "\n".join(
-        "  " + style(name.ljust(width), "1;36") + "  " + style(flags, "32")
-        for name, flags in rows
-    )
+    lines: list[str] = []
+    for name, flags in rows:
+        for index, chunk in enumerate(flags.split("\n")):
+            if index == 0:
+                lines.append(
+                    "  "
+                    + style(name.ljust(width), "1;36")
+                    + "  "
+                    + style(chunk, "32")
+                )
+            else:
+                lines.append(" " * (2 + width + 2) + style(chunk, "32"))
+    return "\n".join(lines)
 
 
-def main_help() -> str:
+def _tilde(path: Path) -> str:
+    try:
+        relative = path.expanduser().resolve().relative_to(Path.home())
+    except (ValueError, OSError):
+        return str(path)
+    return "~/" + str(relative)
+
+
+def main_help(config: Config | None = None) -> str:
     """The top-level page: 命令 and 参数 are separate, and usage is command-first."""
+    library = config.library if config and config.library else DEFAULT_LIBRARY
     usage = _table(
         [
             (
@@ -132,6 +164,7 @@ def main_help() -> str:
                 ("verify", "复核已写入的歌词、标签、封面、音频"),
                 ("rollback", "移除本工具写入且之后未被改动的歌词"),
                 ("clean", "清理过期缓存、旧报告与旧导出（安全清理）"),
+                ("config", "查看生效的默认值；--init 生成配置文件"),
             )
         ],
         indent="  ",
@@ -139,7 +172,7 @@ def main_help() -> str:
 
     common_rows: list[tuple[str, str, str]] = []
     for name, metavar, note in (
-        ("--library", "DIR", "音乐库根目录（默认 ~/Music/JMusic）"),
+        ("--library", "DIR", f"音乐库根目录（默认 {_tilde(library)}，可写进配置）"),
         ("--limit", "N", "最多处理 N 首"),
         ("--tree-limit", "N", "明细行数（plan/apply 默认 200，scan 默认全部）"),
         ("--state-dir", "DIR", "状态、缓存与报告目录"),
@@ -160,7 +193,10 @@ def main_help() -> str:
         [
             (
                 "plan",
-                "--pick SRC:ID  --pick-file FILE  --apply  --src LIST  --workers N  --refresh  --retry-failed  --html [FILE]  --lrc  --duration-tolerance SEC  --a2/--eslrc/--yrc/--qrc/--ttml",
+                "--pick SRC:ID  --pick-file FILE  --apply  --html [FILE]  --lrc\n"
+                "--src LIST  --workers N  --refresh  --retry-failed\n"
+                "--duration-tolerance SEC  --no-timestamp-check\n"
+                "--a2  --eslrc  --yrc  --qrc  --ttml",
             ),
             (
                 "candidates",
@@ -168,7 +204,8 @@ def main_help() -> str:
             ),
             (
                 "apply",
-                "--pick SRC:ID  --pick-file FILE  --src LIST  --workers N  --no-preflight  --lrc  --refresh",
+                "--pick SRC:ID  --pick-file FILE  --lrc\n"
+                "--src LIST  --workers N  --refresh  --no-preflight",
             ),
             ("scan", "--summary"),
             ("rollback", "--yes"),
@@ -176,6 +213,7 @@ def main_help() -> str:
                 "clean",
                 "--dry-run  --days N  --http  --reports  --lrc  --picks  --plans  --journal  --all",
             ),
+            ("config", "--init"),
         ]
     )
 
@@ -228,6 +266,7 @@ def main_help() -> str:
 {style("各命令参数", "1;36")}
 {flags}
   {style("完整说明：lrcpatch 命令 -h（例如 lrcpatch plan -h）", "90")}
+  {style("plan 的几行依次是 指定与写入 / 查询 / 歌词格式。", "90")}
 
 {style("示例", "1;36")}
 {_example_block()}
@@ -293,6 +332,11 @@ def main_help() -> str:
   Python 3.9+；依赖 mutagen（写标签），可选 curl_cffi（浏览器指纹）。
   直接运行 lrcpatch 时 uv 会按文件头的 PEP 723 声明自动安装，无需手动 pip；没有 uv 也能跑，python3 lrcpatch 会切到已装依赖的解释器。
   状态、HTTP 缓存与报告在 ~/.local/state/lrc-patch，不要删除，否则丢失断点与回滚记录。
+
+{style("配置", "1;36")}
+  默认值写在 ~/.config/lrc-patch/config.toml（可用 LRCPATCH_CONFIG 指向别的文件）：library / src / workers。
+  命令行参数优先于配置文件；lrcpatch config 查看当前生效值与来源，lrcpatch config --init 生成带注释的模板。
+  --library 只决定相对路径的锚点和「整个库」的范围，数据库里存的是绝对路径；换一个库跑 --library DIR 不会串到别的库的计划。
 """
 
 PLAN_EPILOG = """\
@@ -365,13 +409,15 @@ CLEAN_EPILOG = """\
 """
 
 
-def add_common(parser: argparse.ArgumentParser) -> None:
+def add_common(
+    parser: argparse.ArgumentParser, library: Path = DEFAULT_LIBRARY
+) -> None:
     parser.add_argument(
         "--library",
         type=Path,
-        default=DEFAULT_LIBRARY,
+        default=library,
         metavar="DIR",
-        help=f"音乐库根目录（默认 {DEFAULT_LIBRARY}）",
+        help=f"音乐库根目录（默认 {_tilde(library)}；配置文件里也能设）",
     )
     parser.add_argument(
         "--album",
@@ -461,6 +507,17 @@ def add_network_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_source_option(
+    parser: argparse.ArgumentParser, sources: tuple[str, ...]
+) -> None:
+    parser.add_argument(
+        "--src",
+        metavar="LIST",
+        default=",".join(sources),
+        help=f"歌词源，逗号分隔（默认 {','.join(sources)}；配置文件可改）",
+    )
+
+
 _HELP_OPTION_RE = re.compile(r"^(\s{2,})(-{1,2}[A-Za-z][\w-]*)(.*)$")
 
 
@@ -511,7 +568,13 @@ def add_help_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-h", "--help", action=ColorHelpAction, help="显示帮助并退出")
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
+    """Build the parser; ``config`` only changes the defaults, never the flags."""
+    library_default = (
+        config.library if config and config.library else DEFAULT_LIBRARY
+    )
+    source_default = config.src if config and config.src else DEFAULT_SOURCES
+    workers_default = config.workers if config and config.workers else 4
     parser = argparse.ArgumentParser(
         prog="lrcpatch",
         usage="lrcpatch 命令 [--参数 …] 路径 …",
@@ -545,13 +608,14 @@ def build_parser() -> argparse.ArgumentParser:
             "  lrcpatch scan --limit 20\n\n"
             "说明\n"
             "  明细按专辑目录分组，一行一首：✓ 已有歌词 / · 待补，后面是格式、时长、大小、歌词类型与行数；标题或艺术家缺失会标出「缺 …」。\n"
+            "  待补的曲目若已有匹配好的计划，会多出一列 qq:100（源:分数），说明可以直接 apply，不用再查询；qq? 表示缓存里是需确认的结果，apply 还不会写。\n"
             "  目录与文件名按 Finder 顺序排列（拼音、数字自然序）。\n"
             "  --summary 只看格式与数量汇总；--tree-limit N 限制明细行数（0 = 全部）。\n"
-            "  只读；不打开状态数据库，可以和 plan/apply 同时运行。"
+            "  只读；以只读方式看一眼计划库（不改状态），可以和 plan/apply 同时运行。"
         ),
     )
     add_help_option(scan)
-    add_common(scan)
+    add_common(scan, library_default)
     add_tree_option(
         scan,
         default=0,
@@ -574,18 +638,17 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     add_help_option(plan)
-    add_common(plan)
+    add_common(plan, library_default)
     add_tree_option(plan)
     add_lrc_options(plan)
     add_network_options(plan)
+    add_source_option(plan, source_default)
     plan.add_argument(
-        "--src",
-        metavar="LIST",
-        default=",".join(DEFAULT_SOURCES),
-        help="歌词源，逗号分隔（默认 netease,qq 自动 fallback；lrclib 近期常不可用）",
-    )
-    plan.add_argument(
-        "--workers", type=int, metavar="N", default=4, help="查询并发 1..10（默认 4）"
+        "--workers",
+        type=int,
+        metavar="N",
+        default=workers_default,
+        help=f"查询并发 1..10（默认 {workers_default}）",
     )
     plan.add_argument("--no-plain", action="store_true", help="只接受带时间轴的 LRC")
     plan.add_argument("--refresh", action="store_true", help="忽略 HTTP 缓存并重查")
@@ -659,15 +722,10 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     add_help_option(candidates)
-    add_common(candidates)
+    add_common(candidates, library_default)
     add_tree_option(candidates)
     add_network_options(candidates)
-    candidates.add_argument(
-        "--src",
-        metavar="LIST",
-        default=",".join(DEFAULT_SOURCES),
-        help="歌词源，逗号分隔（默认 netease,qq 自动 fallback；lrclib 近期常不可用）",
-    )
+    add_source_option(candidates, source_default)
     candidates.add_argument(
         "--top", type=int, metavar="N", default=3, help="每源最多显示 N 条"
     )
@@ -682,7 +740,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     candidates.add_argument("--refresh", action="store_true", help="忽略 HTTP 缓存并重查")
     candidates.add_argument(
-        "--workers", type=int, metavar="N", default=4, help="查询并发 1..10（默认 4）"
+        "--workers",
+        type=int,
+        metavar="N",
+        default=workers_default,
+        help=f"查询并发 1..10（默认 {workers_default}）",
     )
     candidates.add_argument(
         "--duration-tolerance",
@@ -703,16 +765,11 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     add_help_option(apply_cmd)
-    add_common(apply_cmd)
+    add_common(apply_cmd, library_default)
     add_tree_option(apply_cmd)
     add_lrc_options(apply_cmd)
     add_network_options(apply_cmd)
-    apply_cmd.add_argument(
-        "--src",
-        metavar="LIST",
-        default=",".join(DEFAULT_SOURCES),
-        help="配合 --pick 时用于查词的源（默认 netease,qq）",
-    )
+    add_source_option(apply_cmd, source_default)
     apply_cmd.add_argument(
         "--pick",
         action="append",
@@ -747,7 +804,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="不检查 LRC 末尾时间轴与音频时长是否相符",
     )
     apply_cmd.add_argument(
-        "--workers", type=int, metavar="N", default=4, help="写入并发 1..10（默认 4）"
+        "--workers",
+        type=int,
+        metavar="N",
+        default=workers_default,
+        help=f"写入并发 1..10（默认 {workers_default}）",
     )
     apply_cmd.add_argument("--report", type=Path, metavar="FILE", help="CSV 报告路径")
     apply_cmd.add_argument(
@@ -770,7 +831,7 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     add_help_option(verify)
-    add_common(verify)
+    add_common(verify, library_default)
     add_tree_option(verify)
 
     rollback = sub.add_parser(
@@ -784,7 +845,7 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     add_help_option(rollback)
-    add_common(rollback)
+    add_common(rollback, library_default)
     add_tree_option(rollback)
     rollback.add_argument(
         "--yes", action="store_true", help="确认执行移除（不加只预览）"
@@ -842,8 +903,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true", help="清全部，包括计划状态与回滚记录"
     )
 
+    config_cmd = sub.add_parser(
+        "config",
+        prog="lrcpatch config",
+        usage="lrcpatch config [--参数 …]",
+        help="查看生效的默认值；--init 生成配置文件",
+        description="显示配置文件位置，以及音乐库、歌词源与并发的生效值与来源。",
+        epilog=(
+            "示例\n"
+            "  lrcpatch config            查看当前生效值\n"
+            "  lrcpatch config --init     生成带注释的配置文件（已存在则不覆盖）\n\n"
+            "说明\n"
+            "  配置文件默认是 ~/.config/lrc-patch/config.toml（$XDG_CONFIG_HOME），"
+            "可用环境变量 LRCPATCH_CONFIG 指向别的文件。\n"
+            "  这里只提供默认值：命令行参数（--library / --src / --workers）永远优先。"
+        ),
+        formatter_class=HelpFormatter,
+        add_help=False,
+    )
+    add_help_option(config_cmd)
+    config_cmd.add_argument(
+        "--init",
+        action="store_true",
+        help="写入带注释的配置模板；文件已存在时不覆盖",
+    )
+    config_cmd.add_argument(
+        "--no-color",
+        action="store_true",
+        help="关闭彩色输出（也可设 NO_COLOR=1）",
+    )
+
     # Keep the generated help consistent with the hand-written sections.
-    for item in (parser, scan, plan, candidates, apply_cmd, verify, rollback, clean):
+    for item in (
+        parser,
+        scan,
+        plan,
+        candidates,
+        apply_cmd,
+        verify,
+        rollback,
+        clean,
+        config_cmd,
+    ):
         item._optionals.title = "选项"  # noqa: SLF001
         item._positionals.title = "路径"  # noqa: SLF001
 

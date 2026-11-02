@@ -30,7 +30,14 @@ from .audio import (
     read_track,
     stage_copy,
 )
-from .config import DEFAULT_DURATION_TOLERANCE, default_lrc_dir
+from .config import (
+    DEFAULT_DURATION_TOLERANCE,
+    DEFAULT_LIBRARY,
+    DEFAULT_SOURCES,
+    default_lrc_dir,
+    load_config,
+    write_config_template,
+)
 from .errors import ToolError, VerificationError
 from .matching import (
     assign_picks,
@@ -49,10 +56,11 @@ from .render import (
     format_diff,
     format_duration,
     pad_display,
+    plan_fields,
     plan_html_path,
-    plan_note,
     print_header,
     print_meta,
+    print_meta_table,
     print_scan_list,
     print_summary,
     print_tree,
@@ -68,7 +76,7 @@ from .render import (
 )
 from .sorting import name_key, path_key, sort_paths
 from .sources import JsonClient, build_sources
-from .state import State
+from .state import State, read_plan_cache
 from .text import lyric_hash, lyric_kind, lyric_tag, match_notes
 
 
@@ -134,6 +142,27 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
     live.close()
     formats = Counter(track.fmt for track in tracks)
     existing = Counter(track.fmt for track in tracks if track.has_lyrics)
+
+    # Only plans that still describe this exact file count; a changed file
+    # means the cached verdict is stale even if the row is still there.
+    cached: dict[str, tuple[str, int, str]] = {}
+    ready_cached = 0
+    review_cached = 0
+    plan_rows = read_plan_cache(state_dir / "lyrics.sqlite3")
+    for track in tracks:
+        row = plan_rows.get(str(track.path))
+        if not row or row["fingerprint"] != track.fingerprint():
+            continue
+        cached[str(track.path)] = (
+            str(row["source"] or ""),
+            int(row["score"] or 0),
+            str(row["status"]),
+        )
+        if row["status"] == "ready" and not track.has_lyrics:
+            ready_cached += 1
+        if row["status"] in {"ambiguous", "suspect"} and not track.has_lyrics:
+            review_cached += 1
+
     print_header(
         "scan",
         f"{truncate_display(scan_scope(args, library), max(20, screen_width() - 30))}"
@@ -155,7 +184,9 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
     print()
 
     if not getattr(args, "summary", False):
-        print_scan_list(tracks, library, getattr(args, "tree_limit", 0) or 0)
+        print_scan_list(
+            tracks, library, getattr(args, "tree_limit", 0) or 0, cached
+        )
 
     have_total = sum(existing.values())
     print_meta(
@@ -166,6 +197,13 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
             "90",
         ),
     )
+    if ready_cached or review_cached:
+        parts = []
+        if ready_cached:
+            parts.append(f"{ready_cached} 首已匹配" + style("，可直接 apply", "90"))
+        if review_cached:
+            parts.append(f"{review_cached} 首需确认" + style("（带 ?）", "90"))
+        print_meta("计划", "   ".join(parts))
     if errors:
         print("  " + style("▸ ", "36") + style("标签读取失败", "1;31"))
         for index, (path, error) in enumerate(errors[:20]):
@@ -182,6 +220,60 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
     else:
         print_meta("标签", style("全部读取成功", "32"))
     return 1 if errors else 0
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Show the effective defaults and where they come from."""
+    config = load_config()
+    print_header("config", short_path(config.path))
+    if getattr(args, "init", False):
+        created = write_config_template(config.path)
+        print_meta(
+            "模板",
+            ("已写入 " if created else "已存在，未覆盖 ")
+            + short_path(config.path),
+        )
+        print()
+        if not created:
+            return 0
+        config = load_config()
+    library = config.library or DEFAULT_LIBRARY
+    sources = config.src or DEFAULT_SOURCES
+    workers = config.workers or 4
+    rows = [
+        ("音乐库", short_path(library), "配置文件" if config.library else "默认"),
+        ("歌词源", ",".join(sources), "配置文件" if config.src else "默认"),
+        ("并发", str(workers), "配置文件" if config.workers else "默认"),
+    ]
+    value_width = max(disp_width(value) for _, value, _ in rows)
+    label_width = max(
+        disp_width(text) for text in ("文件", "音乐库", "歌词源", "并发", "说明")
+    )
+    print(
+        "  "
+        + style(pad_display("文件", label_width), "90")
+        + "  "
+        + short_path(config.path)
+        + style(
+            "   已读取" if config.exists else "   不存在，使用内置默认值",
+            "90",
+        )
+    )
+    print_meta_table(
+        [
+            (label, pad_display(value, value_width) + "  " + style(origin, "90"))
+            for label, value, origin in rows
+        ]
+    )
+    print()
+    print(
+        "  "
+        + style(pad_display("说明", label_width), "90")
+        + "  命令行参数（--library / --src / --workers）优先；"
+        + style("lrcpatch config --init", "36")
+        + " 生成配置文件。"
+    )
+    print()
+    return 0
 
 def collect_picks(
     args: argparse.Namespace,
@@ -377,11 +469,12 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         "error",
         "rolled_back",
     }
-    entries = [
-        TreeEntry(Path(row["path"]), row["status"], plan_note(row))
-        for row in rows
-        if row["status"] in actionable
-    ]
+    entries = []
+    for row in rows:
+        if row["status"] not in actionable:
+            continue
+        cells, note = plan_fields(row)
+        entries.append(TreeEntry(Path(row["path"]), row["status"], note, cells))
     print()
     if entries:
         totals = Counter(Path(row["path"]).parent for row in rows)

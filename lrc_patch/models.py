@@ -77,3 +77,7 @@ class TreeEntry:
     path: Path
     status: str
     note: str = ""
+    # Optional fixed columns rendered before ``note``: source / score / diff /
+    # lyric / artist for plan rows.  ``print_tree`` aligns each column per
+    # album group, so ``qq`` and ``netease`` share one score column.
+    cells: tuple[str, ...] = ()
