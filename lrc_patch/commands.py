@@ -222,7 +222,7 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         refresh=args.refresh,
         impersonate=not getattr(args, "no_impersonate", False),
     )
-    source_objects = build_sources(args.sources, client)
+    source_objects = build_sources(args.sources, client, getattr(args, "verbatim", False))
     picks = collect_picks(args, tracks, library)
     report = args.report or (state_dir / "reports" / f"plan-{stamp}.csv")
 
@@ -707,7 +707,7 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         refresh=args.refresh,
         impersonate=not getattr(args, "no_impersonate", False),
     )
-    sources = build_sources(args.sources, client)
+    sources = build_sources(args.sources, client, getattr(args, "verbatim", False))
     wanted = [track for track in tracks if args.all or not track.has_lyrics]
 
     if not args.tsv:

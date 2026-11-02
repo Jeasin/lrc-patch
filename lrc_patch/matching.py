@@ -34,7 +34,7 @@ def parse_pick(value: str) -> tuple[str, str]:
         source, source_id = "netease", raw
     source_id = source_id.strip()
     if source not in SOURCE_NAMES:
-        raise ToolError(f"未知歌词源：{source}（可用：netease,lrclib）")
+        raise ToolError(f"未知歌词源：{source}（可用：netease,qq,lrclib）")
     if not source_id.isdigit():
         raise ToolError(f"候选 ID 应为数字：{value}")
     return source, source_id

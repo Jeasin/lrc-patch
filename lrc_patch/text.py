@@ -416,6 +416,29 @@ def lyric_tag(kind: str) -> str:
     return LYRIC_TAGS.get(kind, kind.upper())
 
 
+_WORD_TIME_STRIP_RE = re.compile(r"<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>")
+
+
+def enhanced_to_line_lrc(text: str) -> str:
+    """Flatten enhanced LRC back to line-timed LRC, dropping word timestamps.
+
+    ``[00:12.34]<00:12.34>一<00:12.78>起`` becomes ``[00:12.34]一起``.  This is
+    the safer form for players that choke on ``<mm:ss.xx>`` markers, at the
+    cost of losing the per-word sync.  Plain LRC and other formats pass through
+    unchanged.
+    """
+    if lyric_kind(text) != "enhanced":
+        return text
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        if not _WORD_TIME_RE.search(line):
+            out.append(line)
+            continue
+        stripped = _WORD_TIME_STRIP_RE.sub("", line)
+        out.append(stripped)
+    return "\n".join(out) + ("\n" if out else "")
+
+
 def lyric_line_count(text: str, kind: str | None = None) -> int:
     """Meaningful line count; TTML counts <p> blocks instead of XML lines."""
     body = text or ""

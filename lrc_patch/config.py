@@ -16,7 +16,7 @@ def default_lrc_dir() -> Path:
     root = Path(base).expanduser() if base else Path.home() / ".cache"
     return root / "lrc-patch" / "lrc"
 
-APP_VERSION = "2.5"
+APP_VERSION = "2.6"
 
 # Bump when the scoring rules change: old ambiguous/suspect plans are then
 # retried once instead of being reused with the previous rules.
@@ -41,6 +41,7 @@ SOURCE_ENDPOINTS = {
         "https://music.163.com/api/song/lyric",
     ),
     "lrclib": ("https://lrclib.net/api/search",),
+    "qq": ("https://u.y.qq.com/cgi-bin/musicu.fcg",),
 }
 
 TIMESTAMP_RE = re.compile(r"^\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]", re.MULTILINE)
@@ -49,12 +50,14 @@ LRC_TIME_RE = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]")
 
 PLACEHOLDERS = {"纯音乐", "純音樂", "instrumental", "暂无歌词", "無歌詞"}
 
-SOURCE_NAMES = {"netease", "lrclib"}
+SOURCE_NAMES = {"netease", "lrclib", "qq"}
 
 # LRCLIB has been continuously answering 503/429, and every failed request only
 # makes the block worse.  It stays available via --sources for the day it
 # recovers (its instrumental flag is still useful), but it is no longer on the
-# default path.
+# default path.  QQ Music (qq) is also opt-in: netease already covers most of
+# the catalogue, and QQ exists as a fallback for the stragglers via
+# ``--sources netease,qq``.
 DEFAULT_SOURCES = ("netease",)
 
 DEFAULT_DURATION_TOLERANCE = 2.0

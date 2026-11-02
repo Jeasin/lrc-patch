@@ -10,6 +10,8 @@ from pathlib import Path
 from unittest import mock
 
 from lrc_patch import commands, render, sorting, sources
+from lrc_patch import qrc as qrc_mod
+from lrc_patch.audio import lrc_dest
 from lrc_patch.cli_args import (
     build_parser,
     normalize_argv,
@@ -23,6 +25,7 @@ from lrc_patch.state import State
 from lrc_patch.text import (
     album_points,
     artist_parts,
+    enhanced_to_line_lrc,
     lrc_timestamp_issue,
     lyric_kind,
     lyric_tag,
@@ -820,6 +823,189 @@ class SearchRequestCountTests(unittest.TestCase):
             make_track(title="Track", artist="Artist", album="Album"), exhaustive=True
         )
         self.assertEqual(len(client.queries), 2)
+
+
+class QrcDecryptTests(unittest.TestCase):
+    """The Triple-DES port must round-trip against the LDDC reference."""
+
+    def _reference(self, plaintext: bytes) -> str:
+        # Re-encrypt with the reference (ENCRYPT direction) so the test does
+        # not depend on a canned ciphertext.  Uses the same key schedule the
+        # decryptor uses, only in the encrypt mode.
+        import zlib
+
+        from lrc_patch.qrc import QRC_KEY, _tripledes_crypt, _tripledes_key_setup, _ENCRYPT
+
+        data = bytearray(zlib.compress(plaintext))
+        schedule = _tripledes_key_setup(QRC_KEY, _ENCRYPT)
+        out = bytearray()
+        for off in range(0, len(data), 8):
+            block = data[off : off + 8]
+            out += _tripledes_crypt(block, schedule) if len(block) == 8 else block
+        return bytes(out).hex()
+
+    def test_roundtrip_short(self) -> None:
+        plaintext = "<Lyric_1 LyricType=\"1\" LyricContent=\"[0,5000](0,200)词\"/>"
+        self.assertEqual(qrc_mod.qrc_decrypt(self._reference(plaintext.encode())), plaintext)
+
+    def test_roundtrip_multi_block(self) -> None:
+        plaintext = "测试歌词" * 200
+        self.assertEqual(
+            qrc_mod.qrc_decrypt(self._reference(plaintext.encode())), plaintext
+        )
+
+    def test_bad_hex_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            qrc_mod.qrc_decrypt("zzzz")
+
+    def test_qrc_to_enhanced_converts_words(self) -> None:
+        qrc_text = "[0,5000](0,200)我(200,300)爱(500,200)你\n[5000,3000](5000,200)中(5200,200)国"
+        enhanced = qrc_mod.qrc_to_enhanced(qrc_text)
+        self.assertIn("[00:00.00]<00:00.00>我<00:00.20>爱<00:00.50>你", enhanced)
+        self.assertIn("[00:05.00]<00:05.00>中<00:05.20>国", enhanced)
+
+    def test_qrc_to_enhanced_keeps_tags(self) -> None:
+        qrc_text = "[ti:Hz(ヘルツ)]\n[0,5000](0,200)词(200,300)语"
+        enhanced = qrc_mod.qrc_to_enhanced(qrc_text)
+        self.assertIn("[ti:Hz(ヘルツ)]", enhanced)
+
+    def test_enhanced_is_detected_as_enhanced_kind(self) -> None:
+        enhanced = "[00:00.00]<00:00.00>我<00:00.20>爱"
+        self.assertEqual(lyric_kind(enhanced), "enhanced")
+
+    def test_enhanced_to_line_lrc_flattens(self) -> None:
+        enhanced = "[00:00.00]<00:00.00>我<00:00.20>爱<00:00.50>你\n[00:05.00]<00:05.00>中<00:05.20>国"
+        line = enhanced_to_line_lrc(enhanced)
+        self.assertIn("[00:00.00]我爱你", line)
+        self.assertNotIn("<00:00.20>", line)
+        self.assertEqual(lyric_kind(line), "lrc")
+
+    def test_enhanced_to_line_lrc_passthrough_plain(self) -> None:
+        plain = "[00:00.00]我爱你"
+        self.assertEqual(enhanced_to_line_lrc(plain), plain)
+
+
+class EsLrcSuffixTests(unittest.TestCase):
+    def test_enhanced_uses_es_lrc_suffix(self) -> None:
+        dest = lrc_dest(
+            Path("/library/Aimer/(2016)daydream/08 Hz.m4a"),
+            Path("/library"),
+            Path("/cache/lrc"),
+            kind="enhanced",
+        )
+        self.assertEqual(dest.suffixes, [".es", ".lrc"])
+        self.assertTrue(str(dest).endswith("08 Hz.es.lrc"))
+
+    def test_plain_lrc_uses_lrc_suffix(self) -> None:
+        dest = lrc_dest(
+            Path("/library/Aimer/(2016)daydream/08 Hz.m4a"),
+            Path("/library"),
+            Path("/cache/lrc"),
+            kind="lrc",
+        )
+        self.assertTrue(str(dest).endswith("08 Hz.lrc"))
+
+
+class QqSourceTests(unittest.TestCase):
+    """QQ source shaping: search parsing and the verbatim toggle, no network."""
+
+    def _client(self, responses):
+        class FakeClient:
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.calls = []
+
+            def request(self, *args, **kwargs):
+                self.calls.append(kwargs)
+                return self.responses.pop(0)
+
+        return FakeClient(responses)
+
+    def _search_payload(self, songs):
+        return (200, {"code": 0, "request": {"code": 0, "data": {"body": {"item_song": songs}}}})
+
+    def test_search_parses_song_fields(self) -> None:
+        songs = [
+            {
+                "id": 108166949,
+                "title": "Hz(ヘルツ) (赫兹)",
+                "singer": [{"name": "Aimer"}],
+                "album": {"name": "デイドリーム"},
+                "interval": 289,
+            }
+        ]
+        client = self._client(
+            [
+                (200, {"code": 0, "request": {"code": 0, "data": {"session": {"uid": "1", "sid": "s", "userip": "ip"}}}}),
+                self._search_payload(songs),
+            ]
+        )
+        qq = sources.QqSource(client)
+        found = qq.search(make_track(title="Hz", artist="Aimer", album="daydream"))
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].source, "qq")
+        self.assertEqual(found[0].source_id, "108166949")
+        self.assertEqual(found[0].artists, ["Aimer"])
+        self.assertEqual(found[0].album, "デイドリーム")
+        self.assertEqual(found[0].duration, 289.0)
+
+    def test_fetch_verbatim_off_flattens(self) -> None:
+        import zlib
+
+        from lrc_patch.qrc import QRC_KEY, _tripledes_crypt, _tripledes_key_setup, _ENCRYPT
+
+        qrc_plain = '<Lyric_1 LyricType="1" LyricContent="[0,5000](0,200)我(200,300)爱"/>'
+        data = bytearray(zlib.compress(qrc_plain.encode()))
+        schedule = _tripledes_key_setup(QRC_KEY, _ENCRYPT)
+        out = bytearray()
+        for off in range(0, len(data), 8):
+            block = data[off : off + 8]
+            out += _tripledes_crypt(block, schedule) if len(block) == 8 else block
+        encrypted = bytes(out).hex()
+
+        lyric_resp = (200, {"code": 0, "request": {"code": 0, "data": {"lyric": encrypted}}})
+        client = self._client(
+            [
+                (200, {"code": 0, "request": {"code": 0, "data": {"session": {"uid": "1", "sid": "s", "userip": "ip"}}}}),
+                lyric_resp,
+            ]
+        )
+        qq = sources.QqSource(client, verbatim=False)
+        result = qq.fetch(
+            Candidate(source="qq", source_id="1", title="Hz", artists=["Aimer"], album="daydream", duration=289.0)
+        )
+        self.assertTrue(result.lyrics)
+        self.assertEqual(lyric_kind(result.lyrics), "lrc")
+        self.assertIn("我爱", result.lyrics)
+
+    def test_fetch_verbatim_on_keeps_enhanced(self) -> None:
+        import zlib
+
+        from lrc_patch.qrc import QRC_KEY, _tripledes_crypt, _tripledes_key_setup, _ENCRYPT
+
+        qrc_plain = '<Lyric_1 LyricType="1" LyricContent="[0,5000](0,200)我(200,300)爱"/>'
+        data = bytearray(zlib.compress(qrc_plain.encode()))
+        schedule = _tripledes_key_setup(QRC_KEY, _ENCRYPT)
+        out = bytearray()
+        for off in range(0, len(data), 8):
+            block = data[off : off + 8]
+            out += _tripledes_crypt(block, schedule) if len(block) == 8 else block
+        encrypted = bytes(out).hex()
+
+        lyric_resp = (200, {"code": 0, "request": {"code": 0, "data": {"lyric": encrypted}}})
+        client = self._client(
+            [
+                (200, {"code": 0, "request": {"code": 0, "data": {"session": {"uid": "1", "sid": "s", "userip": "ip"}}}}),
+                lyric_resp,
+            ]
+        )
+        qq = sources.QqSource(client, verbatim=True)
+        result = qq.fetch(
+            Candidate(source="qq", source_id="1", title="Hz", artists=["Aimer"], album="daydream", duration=289.0)
+        )
+        self.assertTrue(result.lyrics)
+        self.assertEqual(lyric_kind(result.lyrics), "enhanced")
+        self.assertIn("<00:00.20>爱", result.lyrics)
 
 
 if __name__ == "__main__":

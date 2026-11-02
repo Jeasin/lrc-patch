@@ -25,6 +25,7 @@ from .sorting import sort_paths
 from .text import (
     first_text,
     lyric_hash,
+    lyric_kind,
     sha256_bytes,
     sha256_text,
     utc_now,
@@ -418,13 +419,18 @@ def preflight_apply(rows: list[sqlite3.Row], workers: int) -> None:
         )
         raise ToolError("写入前检查未通过：\n  " + "\n  ".join(problems[:8]) + hint)
 
-def lrc_dest(path: Path, library: Path, lrc_dir: Path) -> Path:
-    """Mirror the library layout under the cache, keeping the track name."""
+def lrc_dest(path: Path, library: Path, lrc_dir: Path, kind: str = "lrc") -> Path:
+    """Mirror the library layout under the cache, keeping the track name.
+
+    Verbatim (word-timed) lyrics get an ``.es.lrc`` suffix so they are not
+    mistaken for plain line-timed LRC; everything else keeps ``.lrc``.
+    """
     try:
         rel = path.resolve().relative_to(library)
     except ValueError:
         rel = Path("_external") / f"{sha256_text(str(path))[:8]}-{path.name}"
-    return (lrc_dir / rel).with_suffix(".lrc")
+    suffix = ".es.lrc" if kind == "enhanced" else ".lrc"
+    return (lrc_dir / rel).with_suffix(suffix)
 
 def export_lrc(
     library: Path,
@@ -432,7 +438,11 @@ def export_lrc(
     tracks_by_path: dict[str, Track],
     lrc_dir: Path,
 ) -> tuple[int, int]:
-    """Write .lrc copies; falls back to existing lyrics when plan has none."""
+    """Write .lrc copies; falls back to existing lyrics when plan has none.
+
+    Enhanced (verbatim) lyrics are written as ``歌曲.es.lrc`` to preserve the
+    word-level timing instead of flattening them into a plain ``.lrc``.
+    """
     written = 0
     failed = 0
     for row in rows:
@@ -442,8 +452,9 @@ def export_lrc(
             lyric = track.existing_lyrics if track else ""
         if not lyric or not lyric.strip():
             continue
+        kind = lyric_kind(lyric)
         try:
-            write_text_atomic(lrc_dest(Path(row["path"]), library, lrc_dir), lyric)
+            write_text_atomic(lrc_dest(Path(row["path"]), library, lrc_dir, kind), lyric)
             written += 1
         except OSError as exc:
             failed += 1

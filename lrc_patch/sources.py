@@ -16,6 +16,7 @@ Two kinds of refusal are distinguished:
 """
 from __future__ import annotations
 
+import gzip
 import json
 import random
 import threading
@@ -23,14 +24,16 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from base64 import b64encode
 from typing import Any, Callable
 
 from .config import HTTP_UA
 from .errors import SourceError
 from .matching import score_candidate
 from .models import Candidate, FetchResult, Track
+from .qrc import qrc_decrypt, qrc_to_enhanced, qrc_lyric_text
 from .state import State
-from .text import is_placeholder, sanitize_lyrics, sha256_text
+from .text import enhanced_to_line_lrc, is_placeholder, sanitize_lyrics, sha256_text
 
 
 class _Retryable(Exception):
@@ -39,6 +42,14 @@ class _Retryable(Exception):
 
 class _RateLimited(Exception):
     """Internal marker: the provider is rate limiting this client."""
+
+
+def _gunzip(data: bytes) -> bytes:
+    """Best-effort gzip decompress; returns input unchanged on failure."""
+    try:
+        return gzip.decompress(data)
+    except (OSError, EOFError):
+        return data
 
 
 class UrllibTransport:
@@ -50,18 +61,28 @@ class UrllibTransport:
         self,
         method: str,
         url: str,
-        body: dict[str, Any] | None = None,
+        body: dict[str, Any] | str | bytes | None = None,
         headers: dict[str, str] | None = None,
         timeout: float = 30.0,
     ) -> tuple[int, bytes, dict[str, str]]:
-        data = urllib.parse.urlencode(body).encode() if body else None
+        if isinstance(body, bytes):
+            data: bytes | None = body
+        elif isinstance(body, str):
+            data = body.encode()
+        else:
+            data = urllib.parse.urlencode(body).encode() if body else None
         request = urllib.request.Request(
             url, data=data, headers=headers or {}, method=method
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 status = int(getattr(response, "status", 200) or 200)
-                return status, response.read(), dict(getattr(response, "headers", {}) or {})
+                raw = response.read()
+                headers = dict(getattr(response, "headers", {}) or {})
+                encoding = str(headers.get("Content-Encoding") or headers.get("content-encoding") or "")
+                if "gzip" in encoding.lower():
+                    raw = _gunzip(raw)
+                return status, raw, headers
         except urllib.error.HTTPError as exc:
             payload = exc.read() or b""
             return int(exc.code), payload, dict(exc.headers or {})
@@ -88,7 +109,7 @@ class CurlTransport:
         self,
         method: str,
         url: str,
-        body: dict[str, Any] | None = None,
+        body: dict[str, Any] | str | bytes | None = None,
         headers: dict[str, str] | None = None,
         timeout: float = 30.0,
     ) -> tuple[int, bytes, dict[str, str]]:
@@ -266,6 +287,11 @@ class JsonClient:
             headers["Cookie"] = "appver=2.10.13; os=osx; channel=netease"
         elif source == "lrclib":
             headers["Referer"] = "https://lrclib.net/"
+        elif source == "qq":
+            headers["User-Agent"] = "okhttp/3.14.9"
+            headers["Content-Type"] = "application/json"
+            headers["Accept-Encoding"] = "gzip"
+            headers["Cookie"] = "tmeLoginType=-1;"
         if extra:
             headers.update(extra)
         return headers
@@ -292,6 +318,9 @@ class JsonClient:
         *,
         method: str = "GET",
         body: dict[str, Any] | None = None,
+        raw_body: str | bytes | None = None,
+        extra_headers: dict[str, str] | None = None,
+        expect_code: str = "200",
         cache_predicate: Callable[[Any], bool | float] | None = None,
         cache_extra: str = "",
         kind: str = "request",
@@ -317,8 +346,10 @@ class JsonClient:
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             retry_after: float | None = None
             try:
+                headers = self._headers(source, extra_headers)
+                transport_body: Any = raw_body if raw_body is not None else body
                 status, raw, response_headers = self.transport.request(
-                    method, url, body=body, headers=self._headers(source), timeout=30.0
+                    method, url, body=transport_body, headers=headers, timeout=30.0
                 )
                 retry_after = _retry_after_seconds(response_headers)
                 if status in (400, 404):
@@ -344,7 +375,7 @@ class JsonClient:
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise _Retryable(f"返回内容不是 JSON（{len(raw)} 字节）") from exc
                 code = data.get("code") if isinstance(data, dict) else None
-                if code is not None and str(code) != "200":
+                if code is not None and str(code) != expect_code:
                     text = str(code)
                     if text in RATE_LIMIT_CODES:
                         self._note_rate_limit(source)
@@ -590,6 +621,173 @@ class LrclibSource:
         return FetchResult(note="无可用歌词")
 
 
-def build_sources(names: list[str], client: JsonClient) -> list[Any]:
-    registry = {"netease": NeteaseSource, "lrclib": LrclibSource}
+class QqSource:
+    """QQ Music, used as a fallback when netease has no match.
+
+    The public endpoints are the ``musicu.fcg`` JSON-RPC used by the QQ Music
+    lite client: a one-off ``GetSession`` registers an anonymous uid/sid, then
+    search and lyric requests ride that session.  Lyrics arrive as QRC
+    (verbatim, word-timed) encrypted with QQ's Triple-DES variant; this source
+    decrypts and converts them to enhanced LRC so a fallback never degrades a
+    lyric to plain text.
+
+    QQ is deliberately *not* on the default path: netease already covers most
+    of the user's Japanese catalogue, and every extra provider multiplies
+    request volume.  Enable it with ``--sources netease,qq``.
+    """
+
+    name = "qq"
+    min_interval = 0.9
+    _endpoint = "https://u.y.qq.com/cgi-bin/musicu.fcg"
+
+    def __init__(self, client: JsonClient, verbatim: bool = False):
+        self.client = client
+        self.verbatim = verbatim
+        self._comm: dict[str, Any] = {
+            "ct": 11,
+            "cv": "1003006",
+            "v": "1003006",
+            "os_ver": "15",
+            "phonetype": "24122RKC7C",
+            "rom": "Redmi/miro/miro:15/AE3A.240806.005/OS2.0.10.5.0.VOMCNXM:user/release-keys",
+            "tmeAppID": "qqmusiclight",
+            "nettype": "NETWORK_WIFI",
+            "udid": "0",
+        }
+        self._uid = "0"
+        self._sid = ""
+        self._userip = ""
+
+    def _rpc(self, method: str, module: str, param: dict[str, Any]) -> Any:
+        """POST one musicu.fcg request; returns the inner ``request.data``."""
+        body = {
+            "comm": {**self._comm, "uid": self._uid, "sid": self._sid, "userip": self._userip},
+            "request": {"method": method, "module": module, "param": param},
+        }
+        raw = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        code, data = self.client.request(
+            self.name,
+            self._endpoint,
+            self.min_interval,
+            method="POST",
+            raw_body=raw,
+            expect_code="0",
+            cache_predicate=lambda payload: 30 * 86400
+            if isinstance(payload, dict) and (payload.get("request") or {}).get("data")
+            else 86400,
+            kind="request",
+        )
+        if code != 200 or not isinstance(data, dict):
+            raise SourceError(self.name, f"qq 请求失败（HTTP {code}）")
+        request = data.get("request") or {}
+        if request.get("code") != 0:
+            raise SourceError(self.name, f"qq 返回 code {request.get('code')}")
+        return request.get("data")
+
+    def _init(self) -> None:
+        if self._sid:
+            return
+        data = self._rpc("GetSession", "music.getSession.session", {"caller": 0, "uid": "0", "vkey": 0})
+        session = data.get("session") or {}
+        self._uid = str(session.get("uid") or "0")
+        self._sid = str(session.get("sid") or "")
+        self._userip = str(session.get("userip") or "")
+
+    def search(self, track: Track, exhaustive: bool = False) -> list[Candidate]:
+        try:
+            self._init()
+        except SourceError:
+            raise
+        query = f"{track.title} {track.artist}".strip() if track.artist else track.title
+        param = {
+            "search_id": str(random.randint(1, 20) * 18014398509481984 + random.randint(0, 4194304) * 4294967296 + round(time.time() * 1000) % 86400000),
+            "remoteplace": "search.android.keyboard",
+            "query": query,
+            "search_type": 0,
+            "num_per_page": 20,
+            "page_num": 1,
+            "highlight": 0,
+            "nqc_flag": 0,
+            "page_id": 1,
+            "grp": 1,
+        }
+        data = self._rpc("DoSearchForQQMusicLite", "music.search.SearchCgiService", param)
+        songs = (data or {}).get("body", {}).get("item_song") or []
+        seen: set[str] = set()
+        out: list[Candidate] = []
+        for song in songs:
+            sid = str(song.get("id") or "")
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            artists = [str(s.get("name") or "") for s in (song.get("singer") or []) if s.get("name")]
+            out.append(
+                Candidate(
+                    source=self.name,
+                    source_id=sid,
+                    title=str(song.get("title") or ""),
+                    artists=artists,
+                    album=str((song.get("album") or {}).get("name") or ""),
+                    duration=float(song.get("interval") or 0),
+                )
+            )
+        return out
+
+    def fetch(self, candidate: Candidate) -> FetchResult:
+        try:
+            self._init()
+        except SourceError:
+            raise
+        if not candidate.title or not candidate.album or not candidate.source_id or not candidate.duration:
+            return FetchResult(note="缺少必要参数，无法向 qq 取词")
+        param = {
+            "albumName": b64encode(candidate.album.encode()).decode(),
+            "crypt": 1,
+            "ct": 19,
+            "cv": 2111,
+            "interval": int(candidate.duration),
+            "lrc_t": 0,
+            "qrc": 1,
+            "qrc_t": 0,
+            "roma": 0,
+            "roma_t": 0,
+            "singerName": b64encode(candidate.artist_text.encode()).decode() if candidate.artist_text else b64encode(b"").decode(),
+            "songID": int(candidate.source_id),
+            "songName": b64encode(candidate.title.encode()).decode(),
+            "trans": 0,
+            "trans_t": 0,
+            "type": 0,
+        }
+        data = self._rpc("GetPlayLyricInfo", "music.musichallSong.PlayLyricInfo", param)
+        if not isinstance(data, dict):
+            return FetchResult(note="无可用歌词")
+        encrypted = data.get("lyric") or ""
+        if not encrypted:
+            return FetchResult(note="无可用歌词")
+        try:
+            decrypted = qrc_decrypt(encrypted)
+        except ValueError as exc:
+            return FetchResult(note=f"QRC 解密失败：{exc}")
+        qrc_text = qrc_lyric_text(decrypted)
+        if not qrc_text:
+            return FetchResult(instrumental=False, note="无可用歌词")
+        lyrics = sanitize_lyrics(qrc_to_enhanced(qrc_text))
+        if not lyrics or is_placeholder(lyrics):
+            return FetchResult(instrumental=False, note="无可用歌词")
+        if not self.verbatim:
+            lyrics = enhanced_to_line_lrc(lyrics)
+        return FetchResult(lyrics=lyrics)
+
+    def fetch_plain(self, candidate: Candidate) -> FetchResult:
+        """Fallback: prefer the plain LRC when the verbatim track is absent."""
+        return self.fetch(candidate)
+
+
+def build_sources(names: list[str], client: JsonClient, verbatim: bool = False) -> list[Any]:
+    registry = {"netease": NeteaseSource, "lrclib": LrclibSource, "qq": QqSource}
+    if verbatim:
+        return [
+            QqSource(client, verbatim=True) if name == "qq" else registry[name](client)
+            for name in names
+        ]
     return [registry[name](client) for name in names]

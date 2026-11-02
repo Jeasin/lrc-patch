@@ -247,6 +247,8 @@ def main_help() -> str:
   {style("YRC", "1;34")}    QQ 音乐逐字格式 [起始,时长](起始,时长,0)
   {style("TTML", "1;35")}   Apple Music 的 XML 歌词
   YRC / TTML 这类高级格式只做识别与颜色区分，不做时间轴校验。
+  QQ 音乐（--sources netease,qq）的逐字 QRC 会转成 LRC+；--verbatim 保留逐字，
+  默认降级为逐行 LRC。导出 .lrc 时逐字歌词用 歌曲.es.lrc 后缀。
 
 {style("状态", "1;36")}
   ✓ 可写入      标题/艺术家/专辑/时长都过，apply 会写
@@ -386,6 +388,11 @@ def add_lrc_options(parser: argparse.ArgumentParser) -> None:
         metavar="DIR",
         help=".lrc 输出目录（默认 $XDG_CACHE_HOME/lrc-patch/lrc）",
     )
+    parser.add_argument(
+        "--verbatim",
+        action="store_true",
+        help="保留逐字歌词（QQ 源的增强 LRC），导出 .lrc 时用 歌曲.es.lrc 后缀",
+    )
 
 
 def add_network_options(parser: argparse.ArgumentParser) -> None:
@@ -518,7 +525,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sources",
         metavar="LIST",
         default=",".join(DEFAULT_SOURCES),
-        help="歌词源，逗号分隔（默认 netease；lrclib 可选但近期常不可用）",
+        help="歌词源，逗号分隔（默认 netease；qq 可选 fallback；lrclib 近期常不可用）",
     )
     plan.add_argument(
         "--workers", type=int, metavar="N", default=4, help="查询并发 1..10（默认 4）"
@@ -604,7 +611,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sources",
         metavar="LIST",
         default=",".join(DEFAULT_SOURCES),
-        help="歌词源，逗号分隔（默认 netease；lrclib 可选但近期常不可用）",
+        help="歌词源，逗号分隔（默认 netease；qq 可选 fallback；lrclib 近期常不可用）",
     )
     candidates.add_argument(
         "--top", type=int, metavar="N", default=3, help="每源最多显示 N 条"
