@@ -76,6 +76,10 @@ class DefaultsTests(unittest.TestCase):
         specs = option_specs(build_parser())
         reject_unknown_options(["--workers", "2", "--pick", "netease:1"], specs)
 
+    def test_negative_option_value_is_not_a_flag(self) -> None:
+        specs = option_specs(build_parser())
+        reject_unknown_options(["--tree-limit", "-1"], specs)
+
     def test_lrclib_is_not_a_default_source(self) -> None:
         args = build_parser().parse_args(["plan"])
         self.assertEqual(args.sources, "netease")

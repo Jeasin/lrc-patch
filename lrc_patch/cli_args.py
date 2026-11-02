@@ -553,6 +553,14 @@ def reject_unknown_options(options: list[str], specs: dict[str, int]) -> None:
         name = token.split("=", 1)[0] if token.startswith("--") else token
         if not name.startswith("-") or name in known:
             continue
+        # A negative number is an option *value* (--tree-limit -1), not a flag;
+        # argparse accepts it, so it must not be reported as an unknown option.
+        try:
+            float(name)
+        except ValueError:
+            pass
+        else:
+            continue
         close = difflib.get_close_matches(name, sorted(known), n=1, cutoff=0.55)
         if close:
             hint = f"未知选项 {name}；你是不是想用 {close[0]}？"
