@@ -534,13 +534,18 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
                     key=lambda item: (-item[0], -item[1], item[2], -item[3].synced)
                 )
                 for metadata_score, score, diff, candidate in ranked[: args.top]:
-                    if score >= 85:
+                    if candidate.instrumental:
+                        # Adopting it yields ♪ 纯音乐, not a lyric: do not mark ✓.
+                        symbol, code = "♪", "36"
+                    elif score >= 85:
                         symbol, code = "✓", "1;32"
                     elif metadata_score >= 85:
                         symbol, code = "!", "1;33"
                     else:
                         symbol, code = "·", "90"
-                    if candidate.synced or lyric_kind(candidate.lyrics) == "lrc":
+                    if candidate.instrumental:
+                        kind = "纯音乐"
+                    elif candidate.synced or lyric_kind(candidate.lyrics) == "lrc":
                         kind = "LRC"
                     elif candidate.lyrics:
                         kind = "TXT"
