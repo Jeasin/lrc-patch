@@ -36,6 +36,7 @@ from .config import (
     DEFAULT_SOURCES,
     default_lrc_dir,
     load_config,
+    source_label,
     write_config_template,
 )
 from .errors import ToolError, VerificationError
@@ -95,7 +96,7 @@ def network_line(client) -> str:
         return ""
     bits: list[str] = []
     for name, requests, failed_requests, cooldown in network:
-        text = f"{name} {requests} 次"
+        text = f"{source_label(name)} {requests} 次"
         detail = kinds.get(name, {})
         if detail:
             order = [key for key in ("search", "lyric") if key in detail]
@@ -154,7 +155,7 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
         if not row or row["fingerprint"] != track.fingerprint():
             continue
         cached[str(track.path)] = (
-            str(row["source"] or ""),
+            source_label(str(row["source"] or "")),
             int(row["score"] or 0),
             str(row["status"]),
         )
@@ -241,7 +242,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     workers = config.workers or 4
     rows = [
         ("音乐库", short_path(library), "配置文件" if config.library else "默认"),
-        ("歌词源", ",".join(sources), "配置文件" if config.src else "默认"),
+        ("歌词源", ",".join(source_label(name) for name in sources), "配置文件" if config.src else "默认"),
         ("并发", str(workers), "配置文件" if config.workers else "默认"),
     ]
     value_width = max(disp_width(value) for _, value, _ in rows)
@@ -352,6 +353,7 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     pending: list[Track] = []
     reused = 0
     retrying = 0
+    target_format = getattr(args, "target_format", None)
     for track in tracks:
         old = state.get_plan(str(track.path))
         if str(track.path) in picks:
@@ -365,7 +367,16 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             and old["fingerprint"] == track.fingerprint()
             and not args.refresh
         ):
-            if old["status"] in {"skip_existing", "ready", "instrumental"}:
+            if old["status"] in {"skip_existing", "instrumental"}:
+                reused += 1
+                continue
+            if old["status"] == "ready":
+                # A cached LRC is not a cached QRC: the format is decided when
+                # the lyric is fetched, so asking for a different one has to
+                # fetch again instead of reusing a plan that cannot satisfy it.
+                if target_format and old["lyric_kind"] != target_format:
+                    pending.append(track)
+                    continue
                 reused += 1
                 continue
             if old["status"] == "error":
@@ -386,7 +397,7 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     )
     print_meta(
         "源",
-        f"{','.join(args.src)}"
+        f"{','.join(source_label(name) for name in args.src)}"
         + style(f"   复用 {reused}   查询 {len(pending)}   并发 {args.workers}", "90"),
     )
     if retrying:
@@ -406,7 +417,8 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             gate = f"  {format_diff(diff)}" if diff < 900 else ""
             print_meta(
                 "配对",
-                f"{track.path.name} ← {candidate.source}:{candidate.source_id} "
+                f"{track.path.name} ← {source_label(candidate.source)}:"
+                f"{candidate.source_id} "
                 f"{candidate.title}"
                 + (f" / {candidate.artist_text}" if candidate.artist_text else "")
                 + style(gate, "90"),
@@ -690,7 +702,7 @@ def candidate_rows(track: Track, results: list, args: argparse.Namespace) -> lis
                 CandRow(
                     symbol=symbol,
                     code=code,
-                    ident=f"{candidate.source}:{candidate.source_id}",
+                    ident=f"{source_label(candidate.source)}:{candidate.source_id}",
                     # Show the metadata total, not the gated score: a cover that
                     # only matches the artist reads 30, not a bare "-".
                     score=str(metadata_score),
@@ -817,6 +829,38 @@ def template_target(args: argparse.Namespace, state_dir: Path) -> Path:
     return state_dir / "picks" / f"{name}-{stamp}.tsv"
 
 
+def open_tracks(
+    tracks: list[Track], state_dir: Path, everything: bool = False
+) -> tuple[list[Track], int, int]:
+    """Tracks that still need a decision, plus the two kinds already settled.
+
+    ``candidates`` exists to hand out IDs for the tracks the tool could not
+    settle.  Re-listing the ones that are already ✓ buries the handful that
+    need a human, so a fresh ``ready`` plan in the state database removes a
+    track from the default listing.  The database is opened read-only (and not
+    at all with ``--all``), so a concurrent plan/apply is never disturbed.
+    """
+    with_lyrics = sum(1 for track in tracks if track.has_lyrics)
+    if everything:
+        return list(tracks), 0, with_lyrics
+    cached = read_plan_cache(state_dir / "lyrics.sqlite3")
+    settled = 0
+    wanted: list[Track] = []
+    for track in tracks:
+        if track.has_lyrics:
+            continue
+        row = cached.get(str(track.path))
+        if (
+            row
+            and row["fingerprint"] == track.fingerprint()
+            and row["status"] == "ready"
+        ):
+            settled += 1
+            continue
+        wanted.append(track)
+    return wanted, settled, with_lyrics
+
+
 def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     """Read-only candidate listing: the IDs needed by --pick / --pick-file."""
     library = args.library.expanduser().resolve()
@@ -834,15 +878,26 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         impersonate=not getattr(args, "no_impersonate", False),
     )
     sources = build_sources(args.src, client, getattr(args, "target_format", None))
-    wanted = [track for track in tracks if args.all or not track.has_lyrics]
+    wanted, settled, with_lyrics = open_tracks(tracks, state_dir, args.all)
 
     if not args.tsv:
         print_header(
             "candidates",
-            f"{len(wanted)} 首  ·  每源最多 {args.top} 条  ·  源 {','.join(args.src)}",
+            f"{len(wanted)} 首  ·  每源最多 {args.top} 条"
+            f"  ·  源 {','.join(source_label(name) for name in args.src)}",
         )
+        if settled or with_lyrics:
+            parts = []
+            if settled:
+                parts.append(f"{settled} 首已有 ✓ 计划，可直接 apply")
+            if with_lyrics:
+                parts.append(f"{with_lyrics} 首已有歌词")
+            print_meta(
+                "跳过",
+                "   ".join(parts) + style("   --all 可全部重查", "90"),
+            )
         if not wanted:
-            print("  " + style("范围内所有曲目都已有歌词；加 --all 可强制列出。", "32"))
+            print("  " + style("没有待确认的曲目：能定的都已定下。", "32"))
             print()
             return 0
 
@@ -917,10 +972,6 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
     groups: dict[Path, list[Track]] = {}
     for track in wanted:
         groups.setdefault(track.path.parent, []).append(track)
-    rows_by_track: dict[str, list[CandRow]] = {
-        str(track.path): candidate_rows(track, results[str(track.path)], args)
-        for track in wanted
-    }
     for folder in sort_paths(groups, library):
         print("  " + style("▸ ", "36") + style(short_path(folder, library), "1;36"))
         items = sorted(groups[folder], key=lambda track: name_key(track.path.name))
@@ -946,9 +997,10 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
                 print(candidate_line(row, widths, prefix, branch))
         print()
 
+    count_label = "首待确认" if settled and not args.all else "首"
     print(
         "  "
-        + style(f"共 {len(wanted)} 首。", "90")
+        + style(f"共 {len(wanted)} {count_label}。", "90")
         + "把选中的 SOURCE:ID 交给 "
         + style("plan --pick", "36")
         + "，或整理成 "
@@ -1027,6 +1079,19 @@ def _skip_text(counter: Counter) -> str:
     )
     return " · ".join(parts)
 
+FORMAT_TAGS = {"a2": "A2", "eslrc": "ESLRC", "yrc": "YRC", "qrc": "QRC", "ttml": "TTML"}
+
+
+def format_mismatch(rows: list, target: str) -> list:
+    """Rows whose cached lyric is not the format ``--<target>`` asks for.
+
+    The lyric text is produced while planning — that is where a provider's
+    verbatim track is kept or converted — so a format flag at apply time
+    cannot change it.  Refusing beats writing an LRC while the flag says QRC.
+    """
+    return [row for row in rows if (row["lyric_kind"] or "") != target]
+
+
 def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     library = args.library.expanduser().resolve()
     selected = resolve_selection(library, args.path, strict=False)
@@ -1055,6 +1120,20 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             )
         print()
         return 2
+    target = getattr(args, "target_format", None)
+    if target:
+        mismatched = format_mismatch(rows, target)
+        if mismatched:
+            names = "、".join(Path(row["path"]).name for row in mismatched[:3])
+            more = f" 等 {len(mismatched)} 首" if len(mismatched) > 3 else ""
+            tag = FORMAT_TAGS.get(target, target.upper())
+            scope_args = " ".join(shlex.quote(item) for item in (args.path or []))
+            raise ToolError(
+                f"计划里的歌词不是 {tag}：{names}{more}。\n"
+                "歌词在 plan 取词时就已经定好格式并存入状态库，apply 只写这份文本。\n"
+                f"想换成 {tag}，让 plan 重新取词：lrcpatch plan --{target} --apply"
+                + (f" {scope_args}" if scope_args else "")
+            )
     print_header(
         "apply",
         f"{truncate_display(scope, max(20, screen_width() - 30))}  ·  {len(rows)} 首",
@@ -1102,7 +1181,7 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             for future in as_completed(futures):
                 row = futures[future]
                 path = Path(row["path"])
-                source = row["source"] or "-"
+                source = source_label(row["source"] or "-")
                 try:
                     journal = future.result()
                     state.add_journal(journal)

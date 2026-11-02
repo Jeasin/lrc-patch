@@ -13,6 +13,7 @@ from .config import (
     DEFAULT_LIBRARY,
     DEFAULT_SOURCES,
     Config,
+    source_label,
 )
 from .errors import ToolError
 from .render import disp_width, style
@@ -61,8 +62,8 @@ _EXAMPLES = [
     ('lrcpatch candidates --top 3 "Ado"', "看候选 ID"),
     ('lrcpatch candidates --template "Aimer"', "整张专辑的 pick 模板"),
     ('lrcpatch plan --pick-file picks.tsv "Aimer"', "按模板批量指定"),
-    ('lrcpatch plan --pick netease:123 "Ado/某首.m4a"', "人工指定候选"),
-    ('lrcpatch plan --pick netease:123 --apply "Ado/某首.m4a"', "指定并直接写入"),
+    ('lrcpatch plan --pick ne:123 "Ado/某首.m4a"', "人工指定候选"),
+    ('lrcpatch plan --pick ne:123 --apply "Ado/某首.m4a"', "指定并直接写入"),
     ('lrcpatch apply "Ado"', "只写 ✓ 可写入"),
     ('lrcpatch verify "Ado"', "写入后复核"),
     ('lrcpatch rollback --yes "Ado"', "回滚"),
@@ -307,7 +308,7 @@ def main_help(config: Config | None = None) -> str:
   排序      先按不含时长的元数据分，再按含时长的分，再按时长差，最后偏好带 LRC 的。
   待确认    分数不足 85，或时长差超过容差；用 candidates 看全部候选，再 --pick 指定。
             ! 行会写清每个源给了多少分，以及最佳候选的 ID，可直接拿去 --pick：
-            ! 08 印地安老斑鸠.m4a  netease 72 · qq 72；最佳 qq:244115386 印地安老斑鸠 (Live) / 周杰伦 / 208s
+            ! 08 印地安老斑鸠.m4a  ne 72 · qq 72；最佳 qq:244115386 印地安老斑鸠 (Live) / 周杰伦 / 208s
 
 {style("写入前检查", "1;36")}
   时长差 ≤ 容差；LRC 末行时间戳不超过音频时长 3s；LRC 覆盖 ≥55% 时长。后两条不符会判为 ! 时间轴可疑（常见于 TV size、剪辑版、整轨版）。
@@ -317,13 +318,14 @@ def main_help(config: Config | None = None) -> str:
   A2 / ESLRC 与普通 LRC 共用行时间轴校验；YRC / QRC / TTML 只识别不校验。
   默认拿逐行 LRC；加 --a2 / --eslrc / --ttml 会把源逐字转成对应公有格式，--yrc 只取网易原生、--qrc 只取 QQ 原生（私有格式不跨源转换）。
   导出后缀按格式走：.alrc / .eslrc / .yrc / .qrc / .ttml，逐行用 .lrc。
+  格式在 plan 取词时就定下并存入状态库，apply 只写这份文本；给 apply 的格式参数只用来核对，计划里不是这个格式会直接报错，不会悄悄写错。
 
 {style("状态", "1;36")}
 {states}
 
 {style("网络与缓存", "1;36")}
   每首曲目通常只有 1 次搜索 + 1 次取词：只有当第一条搜索里没有任何标题与艺术家都对得上的候选时，才补发 1 次仅用标题的搜索；已经能确定结果就不再追问。--top 只决定 candidates 显示几行，不影响请求数。
-  netease 约 0.9s 一次，并发不会突破最小间隔；被限流（code 405/406、HTTP 429）时先放慢重试，仍失败就暂停该源约 180s，其余曲目立即失败而不是继续撞墙。
+  ne 约 0.9s 一次，并发不会突破最小间隔；被限流（code 405/406、HTTP 429）时先放慢重试，仍失败就暂停该源约 180s，其余曲目立即失败而不是继续撞墙。
   服务过载（HTTP 500/502/503/504）走退避，两次耗尽后暂停 60s 起。
   请求失败记为 ✗ 失败，不是「无匹配」，不写缓存，也不覆盖已有的 ✓ 计划。
   plan 与 candidates 共用同一个 HTTP 缓存：candidates 查过的搜索，plan 不再请求。想强制重查加 --refresh；装了 curl_cffi 就默认用浏览器 TLS 指纹。
@@ -345,14 +347,15 @@ PLAN_EPILOG = """\
   lrcpatch plan --workers 2 "Ado" "YOASOBI/(2023)THE BOOK 3"
   lrcpatch plan --lrc --lrc-dir ~/.cache/lrc-patch/lrc "米津玄師"
   lrcpatch plan --html "結束バンド"
-  lrcpatch plan --pick netease:2003496467 "結束バンド/11 忘れてやらない.m4a"
+  lrcpatch plan --pick ne:2003496467 "結束バンド/11 忘れてやらない.m4a"
   lrcpatch plan --pick qq:123 qq:456 "周杰伦/(2000)Jay"
-  lrcpatch plan --pick netease:2003496467 --apply "結束バンド/11 忘れてやらない.m4a"
+  lrcpatch plan --pick ne:2003496467 --apply "結束バンド/11 忘れてやらない.m4a"
 
 说明
   plan 只读：不写音频，只更新状态数据库、CSV 和可选的 HTML 复核页。
   ≥85 分且时长在容差内才判 ✓ 可写入；其余是 ! 需确认，需人工 --pick。
   一个 --pick 可连写多个 SOURCE:ID；程序先查每个 ID 的标题/歌手/时长，再按分数配对到范围内缺歌词的曲目，并把配对结果打印出来。
+  SOURCE 写 ne 或 netease 都可以；ne 只是表格里的短名。
   --apply 会在 plan 之后直接写本次的 ✓；! 需确认、✗ 失败/无匹配仍不会写入。
   每首通常 1 次搜索 + 1 次取词；搜索已经能确定结果时不再补发标题搜索。
   打分规则见 lrcpatch -h 的「匹配与打分」。
@@ -369,6 +372,7 @@ APPLY_EPILOG = """\
   只写状态为 ready 的曲目；已有歌词、需确认、无匹配、请求失败都不会写入，并在输出里列出跳过数量与原因。
   范围是整个音乐库或你给出的路径；状态库是所有音乐库共用的，但属于其他 --library 的计划不会被写入。
   带 --pick / --pick-file 时先按人工指定重新 plan（指定的候选天然越过 85 分门槛，但仍检查时间轴），再写入，不需要先单独跑一次 plan。
+  歌词格式在 plan 取词时定下，apply 只写状态库里的这份文本；带 --qrc / --a2 等参数时只用来核对，不符会报错并给出重新取词的命令。
   先写临时副本，回读校验歌词/其他标签/封面/音频后再原子替换；失败则原文件不动。
   开始前会检查目标目录可写且空间足够；确实需要跳过时加 --no-preflight。
 """
@@ -485,7 +489,7 @@ def add_lrc_options(parser: argparse.ArgumentParser) -> None:
     fmt.add_argument(
         "--yrc",
         action="store_true",
-        help="逐字：保留网易云原生 YRC（仅 netease 源），导出用 .yrc",
+        help="逐字：保留网易云原生 YRC（仅 ne 源），导出用 .yrc",
     )
     fmt.add_argument(
         "--qrc",
@@ -514,7 +518,7 @@ def add_source_option(
         "--src",
         metavar="LIST",
         default=",".join(sources),
-        help=f"歌词源，逗号分隔（默认 {','.join(sources)}；配置文件可改）",
+        help=f"歌词源，逗号分隔（默认 {','.join(source_label(name) for name in sources)}；ne = netease；配置文件可改）",
     )
 
 
@@ -715,6 +719,8 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
             '  lrcpatch candidates --top 3 "結束バンド"\n'
             '  lrcpatch candidates --template "Aimer"\n'
             '  lrcpatch candidates --tsv "Ado" > picks.tsv\n\n'
+            "默认只查还没有结论的曲目：已有歌词的、以及状态库里已经 ✓ 可写入的都不再列出来，所以 plan 之后跑一次 candidates，看到的就是那几首真正需要你决定。--all 把范围内全部曲目重新查一遍。\n\n"
+            "状态库按文件路径逐条记录，每首取它自己最后一次 plan 的结果（文件大小或修改时间变了就不算数），不存在「整库最近一次」的快照；因此不同专辑可能来自不同次运行。\n\n"
             "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 格式 / 标题 / 歌手 / 专辑。分数是标题+歌手+专辑的总分（满分 100），时长差单独一列，超过容差显示红色，不再逐条解释原因。\n\n"
             "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
         ),
@@ -729,7 +735,11 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     candidates.add_argument(
         "--top", type=int, metavar="N", default=3, help="每源最多显示 N 条"
     )
-    candidates.add_argument("--all", action="store_true", help="连已有歌词的曲目一起列出")
+    candidates.add_argument(
+        "--all",
+        action="store_true",
+        help="连已有歌词、以及缓存里已经 ✓ 的曲目一起列出（默认只看还需要决定的）",
+    )
     candidates.add_argument("--tsv", action="store_true", help="输出制表符分隔，便于做 pick-file")
     candidates.add_argument(
         "--template",

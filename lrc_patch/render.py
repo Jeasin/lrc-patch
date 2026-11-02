@@ -16,7 +16,7 @@ from collections import Counter
 from html import escape as html_escape
 from pathlib import Path
 
-from .config import APP_VERSION
+from .config import APP_VERSION, source_label
 from .models import Track, TreeEntry
 from .sorting import name_key, sort_paths
 from .text import lyric_kind, lyric_line_count, lyric_tag, write_text_atomic
@@ -126,7 +126,8 @@ def write_plan_html(rows: list[sqlite3.Row], path: Path, library: Path) -> None:
             source = row["source"] or ""
             source_id = row["source_id"] or ""
             link = candidate_url(source, source_id)
-            source_cell = html_escape(f"{source}:{source_id}" if source_id else source)
+            short = source_label(source)
+            source_cell = html_escape(f"{short}:{source_id}" if source_id else short)
             if link:
                 source_cell = (
                     f'<a href="{html_escape(link)}" target="_blank" rel="noreferrer">'
@@ -714,6 +715,7 @@ def print_scan_list(
                 # "qq:100" is an invitation to apply; a cached but unready
                 # verdict gets a question mark so the two never read alike.
                 # A gated score of 0 is not worth printing.
+                source = source_label(source)
                 label = f"{source}:{score}" if score else source
                 label += "" if status == "ready" else "?"
                 cache_tones[id(track)] = CACHE_TONE[status]
@@ -885,7 +887,7 @@ def plan_fields(row: sqlite3.Row) -> tuple[tuple[str, ...], str]:
         lines = row["lyric_lines"] or 0
         artist, notes = _reason_parts(str(row["reason"] or ""))
         cells = (
-            str(row["source"] or ""),
+            source_label(str(row["source"] or "")),
             f"{row['score']}分" if row["score"] else "",
             format_diff(diff) if diff is not None and diff < 900 else "",
             f"{tag} {lines} 行" if tag and lines else tag,
@@ -899,7 +901,7 @@ def plan_fields(row: sqlite3.Row) -> tuple[tuple[str, ...], str]:
     if status == "suspect":
         # Say which provider supplied the lyric that failed the sanity check;
         # otherwise a suspect row looks like it came from nowhere.
-        bits = [str(row["source"])] if row["source"] else []
+        bits = [source_label(str(row["source"]))] if row["source"] else []
         if row["score"]:
             bits.append(f"{row['score']}分")
         head = " ".join(bits)

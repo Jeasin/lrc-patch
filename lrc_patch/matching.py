@@ -5,7 +5,12 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_DURATION_TOLERANCE, SOURCE_NAMES
+from .config import (
+    DEFAULT_DURATION_TOLERANCE,
+    SOURCE_NAMES,
+    canonical_source,
+    source_label,
+)
 from .errors import ToolError
 from .models import Candidate, FetchResult, PlanResult, Track
 from .paths import canonical_path
@@ -24,18 +29,18 @@ from .text import (
 
 
 def parse_pick(value: str) -> tuple[str, str]:
-    """Parse SOURCE:ID, accepting a bare numeric ID as netease."""
+    """Parse SOURCE:ID, accepting `ne` for netease and a bare ID as netease."""
     raw = (value or "").strip()
     if not raw:
-        raise ToolError("--pick 不能为空，格式为 SOURCE:ID，例如 netease:2003496467")
+        raise ToolError("--pick 不能为空，格式为 SOURCE:ID，例如 ne:2003496467")
     if ":" in raw:
         source, source_id = raw.split(":", 1)
-        source = source.strip().lower()
+        source = canonical_source(source)
     else:
         source, source_id = "netease", raw
     source_id = source_id.strip()
     if source not in SOURCE_NAMES:
-        raise ToolError(f"未知歌词源：{source}（可用：netease,qq,lrclib）")
+        raise ToolError(f"未知歌词源：{source}（可用：ne / qq / lrclib）")
     if not source_id.isdigit():
         raise ToolError(f"候选 ID 应为数字：{value}")
     return source, source_id
@@ -364,8 +369,11 @@ def _source_note(name: str, exc: Exception, prefix: str = "") -> str:
         text = str(exc).strip()
     else:
         text = f"{type(exc).__name__}: {exc}"
-    if not text.startswith(name):
-        text = f"{name}: {text}"
+    label = source_label(name)
+    if text.startswith(name):
+        text = label + text[len(name) :]
+    else:
+        text = f"{label}: {text}"
     return f"{prefix} {text}".strip() if prefix else text
 
 
@@ -406,27 +414,28 @@ def plan_one(
     best_partial: tuple[Candidate, int, float, str] | None = None
     best_partial_key: tuple[int, float] | None = None
     for source in sources:
+        label = source_label(source.name)
         try:
             candidates = source.search(track)
         except Exception as exc:
             failed.append(source.name)
-            origin.append(f"{source.name} 失败")
+            origin.append(f"{label} 失败")
             notes.append(_source_note(source.name, exc))
             continue
         if not candidates:
-            origin.append(f"{source.name} 无结果")
-            notes.append(f"{source.name}: 无搜索结果")
+            origin.append(f"{label} 无结果")
+            notes.append(f"{label}: 无搜索结果")
             continue
         candidate, score, diff, reason = choose_candidate(track, candidates, tolerance)
         partial = best_partial_candidate(track, candidates, tolerance)
-        origin.append(f"{source.name} {partial[0][0] if partial else 0}")
+        origin.append(f"{label} {partial[0][0] if partial else 0}")
         if not candidate:
             if partial and (
                 best_partial_key is None or partial[0] > best_partial_key
             ):
                 best_partial_key = partial[0]
                 best_partial = partial[1:]
-            notes.append(f"{source.name}: {reason}")
+            notes.append(f"{label}: {reason}")
             continue
         try:
             fetched = source.fetch(candidate)
@@ -437,11 +446,11 @@ def plan_one(
         if fetched.instrumental:
             return PlanResult(track, "instrumental", "匹配为纯音乐")
         if not fetched.lyrics:
-            notes.append(f"{source.name}: {fetched.note or '无可用歌词'}")
+            notes.append(f"{label}: {fetched.note or '无可用歌词'}")
             continue
         kind = lyric_kind(fetched.lyrics)
         if kind == "plain" and not allow_plain:
-            notes.append(f"{source.name}: 仅纯文本，已按 --no-plain 跳过")
+            notes.append(f"{label}: 仅纯文本，已按 --no-plain 跳过")
             continue
         note = match_note(track, candidate, tolerance)
         reason = candidate.artist_text
@@ -462,7 +471,8 @@ def plan_one(
         return PlanResult(
             track,
             "ambiguous",
-            f"{' · '.join(origin)}；最佳 {candidate.source}:{candidate.source_id} "
+            f"{' · '.join(origin)}；最佳 {source_label(candidate.source)}:"
+            f"{candidate.source_id} "
             f"{candidate.title} / {candidate.artist_text} / "
             f"{candidate.duration:.0f}s",
             candidate,

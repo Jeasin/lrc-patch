@@ -13,7 +13,13 @@ from .cli_args import (
     option_specs,
     reject_unknown_options,
 )
-from .config import APP_VERSION, SOURCE_NAMES, default_state_dir, load_config
+from .config import (
+    APP_VERSION,
+    SOURCE_NAMES,
+    canonical_source,
+    default_state_dir,
+    load_config,
+)
 from .errors import ToolError
 from .render import print_intro, set_color
 from .state import State, state_lock
@@ -68,11 +74,15 @@ def main() -> int:
     args.path = list(getattr(args, "paths", []) or [])
     state_dir = (getattr(args, "state_dir", None) or default_state_dir()).resolve()
     args.src = [
-        item.strip() for item in getattr(args, "src", "").split(",") if item.strip()
+        canonical_source(item)
+        for item in getattr(args, "src", "").split(",")
+        if item.strip()
     ]
     unknown = set(args.src) - SOURCE_NAMES
     if unknown:
-        parser.error(f"未知歌词源: {', '.join(sorted(unknown))}")
+        parser.error(
+            f"未知歌词源: {', '.join(sorted(unknown))}（可用 ne / qq / lrclib）"
+        )
     # Exactly one verbatim-format flag may be set (argparse enforces this);
     # fold it into a single target-format string for the sources.
     target = next(
@@ -85,7 +95,7 @@ def main() -> int:
     if target == "qrc" and "qq" not in args.src:
         parser.error("--qrc 是 QQ 音乐的私有逐字格式，请用 --src 包含 qq（或改用 --a2/--eslrc/--ttml）")
     if target == "yrc" and "netease" not in args.src:
-        parser.error("--yrc 是网易云的私有逐字格式，请用 --src 包含 netease（或改用 --a2/--eslrc/--ttml）")
+        parser.error("--yrc 是网易云的私有逐字格式，请用 --src 包含 ne（或改用 --a2/--eslrc/--ttml）")
     if getattr(args, "workers", 1) < 1 or getattr(args, "workers", 1) > 10:
         parser.error("workers 必须在 1..10 之间")
     tolerance = getattr(args, "duration_tolerance", None)

@@ -19,7 +19,7 @@ def default_lrc_dir() -> Path:
     root = Path(base).expanduser() if base else Path.home() / ".cache"
     return root / "lrc-patch" / "lrc"
 
-APP_VERSION = "2.9"
+APP_VERSION = "2.10"
 
 # Bump when the scoring rules change: old ambiguous/suspect plans are then
 # retried once instead of being reused with the previous rules.
@@ -55,6 +55,30 @@ PLACEHOLDERS = {"纯音乐", "純音樂", "instrumental", "暂无歌词", "無�
 
 SOURCE_NAMES = {"netease", "lrclib", "qq"}
 
+# Display names.  The long name stays canonical in the state database, in
+# reports and on the wire; only the table output is shortened, so `ne` / `qq`
+# are the same width and the score column gets one straight edge.  Every place
+# a source is *typed* accepts the short form as well.
+SOURCE_LABELS = {"netease": "ne", "lrclib": "lrclib", "qq": "qq"}
+
+SOURCE_ALIASES = {
+    "ne": "netease",
+    "netease": "netease",
+    "lrclib": "lrclib",
+    "qq": "qq",
+}
+
+
+def source_label(name: str) -> str:
+    """Short form for tables; unknown names pass through unchanged."""
+    return SOURCE_LABELS.get(name, name)
+
+
+def canonical_source(name: str) -> str:
+    """Map a typed source (``ne``) to the canonical one (``netease``)."""
+    key = (name or "").strip().lower()
+    return SOURCE_ALIASES.get(key, key)
+
 # netease is the primary source: it covers the user's Japanese catalogue best
 # and its line-timed LRC is the most stable.  qq is an automatic fallback for
 # the tracks netease cannot match (its Chinese catalogue and verbatim QRC are
@@ -85,8 +109,8 @@ CONFIG_TEMPLATE = """\
 # 音乐库根目录；相对路径按家目录展开。也可以每次用 --library DIR 临时覆盖。
 library = "~/Music/JMusic"
 
-# 歌词源顺序：先问 netease，缺的再问 qq；lrclib 需要显式写进来。
-src = ["netease", "qq"]
+# 歌词源顺序：先问 ne（网易云），缺的再问 qq；lrclib 需要显式写进来。
+src = ["ne", "qq"]
 
 # 并发查询 / 写入数（1..10）。
 workers = 4
@@ -219,12 +243,13 @@ def load_config(path: Path | None = None) -> Config:
         elif isinstance(raw_src, list):
             items = [str(part).strip() for part in raw_src if str(part).strip()]
         else:
-            raise ToolError(f"{target}：src 应是字符串数组，例如 [\"netease\", \"qq\"]")
+            raise ToolError(f"{target}：src 应是字符串数组，例如 [\"ne\", \"qq\"]")
+        items = [canonical_source(item) for item in items]
         unknown = [item for item in items if item not in SOURCE_NAMES]
         if unknown:
             raise ToolError(
                 f"{target}：未知歌词源 {', '.join(unknown)}；"
-                f"可用：{' / '.join(sorted(SOURCE_NAMES))}"
+                f"可用：ne（netease） / qq / lrclib"
             )
         if not items:
             raise ToolError(f"{target}：src 不能为空")

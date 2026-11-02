@@ -1,6 +1,6 @@
 [project]
 name = "lrc-patch"
-version = "2.9"
+version = "2.10"
 description = "Batch lyrics planning and embedding for a local music library"
 requires-python = ">=3.9"
 dependencies = ["mutagen>=1.47", "curl_cffi>=0.7"]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -19,9 +20,21 @@ from lrc_patch.cli_args import (
     option_specs,
     reject_unknown_options,
 )
-from lrc_patch.config import Config, load_config, write_config_template
+from lrc_patch.config import (
+    Config,
+    canonical_source,
+    load_config,
+    source_label,
+    write_config_template,
+)
 from lrc_patch.errors import SourceError, ToolError
-from lrc_patch.matching import assign_picks, keep_previous_plan, plan_one, score_candidate
+from lrc_patch.matching import (
+    assign_picks,
+    keep_previous_plan,
+    parse_pick,
+    plan_one,
+    score_candidate,
+)
 from lrc_patch.models import Candidate, Track, TreeEntry
 from lrc_patch.state import State
 from lrc_patch.text import (
@@ -1264,7 +1277,9 @@ class AmbiguousReasonTests(unittest.TestCase):
         qq = _FixedSource("qq", [live])
         result = plan_one(track, [netease, qq], True)
         self.assertEqual(result.status, "ambiguous")
-        self.assertIn("netease 72", result.reason)
+        # The table name is short, but a miss must still name every source.
+        self.assertIn("ne 72", result.reason)
+        self.assertNotIn("netease", result.reason)
         self.assertIn("qq 87", result.reason)
         self.assertIn("qq:244115386", result.reason)
 
@@ -1461,6 +1476,116 @@ class LibraryScopeTests(unittest.TestCase):
             selected = resolve_selection(lib_a, [str(lib_a)])
             self.assertTrue(selection_matches(lib_a / "a.m4a", lib_a, None, selected))
             self.assertFalse(selection_matches(lib_b / "a.m4a", lib_a, None, selected))
+
+
+class SourceLabelTests(unittest.TestCase):
+    """Tables show ``ne``; the database and the wire keep ``netease``."""
+
+    def test_display_name_is_short(self) -> None:
+        self.assertEqual(source_label("netease"), "ne")
+        self.assertEqual(source_label("qq"), "qq")
+        self.assertEqual(source_label("lrclib"), "lrclib")
+
+    def test_short_name_is_accepted_where_a_source_is_typed(self) -> None:
+        self.assertEqual(canonical_source("ne"), "netease")
+        self.assertEqual(canonical_source("NE"), "netease")
+        self.assertEqual(parse_pick("ne:123"), ("netease", "123"))
+        self.assertEqual(parse_pick("netease:123"), ("netease", "123"))
+        self.assertEqual(parse_pick("qq:9"), ("qq", "9"))
+
+    def test_ready_row_prints_the_short_name(self) -> None:
+        cells, _ = render.plan_fields(
+            {
+                "status": "ready",
+                "source": "netease",
+                "score": 100,
+                "duration_diff": 0.3,
+                "lyric_kind": "lrc",
+                "lyric_lines": 66,
+                "reason": "周杰伦",
+            }
+        )
+        self.assertEqual(cells[0], "ne")
+
+    def test_suspect_row_starts_with_the_short_name(self) -> None:
+        _, note = render.plan_fields(
+            {
+                "status": "suspect",
+                "source": "netease",
+                "score": 100,
+                "reason": "LRC 末尾 04:20 超过音频 03:10",
+            }
+        )
+        self.assertTrue(note.startswith("ne 100分；"), note)
+
+
+class CandidateScopeTests(unittest.TestCase):
+    """candidates should only ask about tracks that still need a decision."""
+
+    def _state_dir(self, rows: list[tuple[str, str, str, int, str]]) -> Path:
+        tmp = Path(tempfile.mkdtemp())
+        conn = sqlite3.connect(tmp / "lyrics.sqlite3")
+        conn.execute(
+            "CREATE TABLE plans(path TEXT PRIMARY KEY, status TEXT, source TEXT,"
+            " score INTEGER, fingerprint TEXT)"
+        )
+        conn.executemany("INSERT INTO plans VALUES(?,?,?,?,?)", rows)
+        conn.commit()
+        conn.close()
+        return tmp
+
+    def test_ready_plans_and_existing_lyrics_are_skipped(self) -> None:
+        settled = make_track(path=Path("/lib/A/01.m4a"), relpath="A/01.m4a")
+        pending = make_track(path=Path("/lib/A/02.m4a"), relpath="A/02.m4a")
+        written = make_track(
+            path=Path("/lib/A/03.m4a"),
+            relpath="A/03.m4a",
+            existing_lyrics="[00:01]x",
+        )
+        state_dir = self._state_dir(
+            [
+                (str(settled.path), "ready", "netease", 100, settled.fingerprint()),
+                (str(pending.path), "ambiguous", "qq", 72, pending.fingerprint()),
+            ]
+        )
+        wanted, count_settled, count_written = commands.open_tracks(
+            [settled, pending, written], state_dir
+        )
+        self.assertEqual([track.path for track in wanted], [pending.path])
+        self.assertEqual(count_settled, 1)
+        self.assertEqual(count_written, 1)
+
+    def test_a_changed_file_is_offered_again(self) -> None:
+        track = make_track(path=Path("/lib/A/01.m4a"), relpath="A/01.m4a")
+        changed = make_track(
+            path=track.path, relpath=track.relpath, mtime_ns=track.mtime_ns + 1
+        )
+        state_dir = self._state_dir(
+            [(str(track.path), "ready", "netease", 100, track.fingerprint())]
+        )
+        wanted, settled, _ = commands.open_tracks([changed], state_dir)
+        self.assertEqual([item.path for item in wanted], [changed.path])
+        self.assertEqual(settled, 0)
+
+    def test_all_ignores_the_cache_and_existing_lyrics(self) -> None:
+        track = make_track(existing_lyrics="[00:01]x")
+        state_dir = self._state_dir(
+            [(str(track.path), "ready", "netease", 100, track.fingerprint())]
+        )
+        wanted, settled, _ = commands.open_tracks([track], state_dir, everything=True)
+        self.assertEqual(wanted, [track])
+        self.assertEqual(settled, 0)
+
+
+class ApplyFormatGuardTests(unittest.TestCase):
+    def test_only_the_requested_format_is_accepted(self) -> None:
+        rows = [{"lyric_kind": "lrc", "path": "/lib/a.m4a"}]
+        self.assertEqual(len(commands.format_mismatch(rows, "qrc")), 1)
+        self.assertEqual(commands.format_mismatch(rows, "lrc"), [])
+        # Old rows may have no kind at all; those need a re-plan too.
+        self.assertEqual(
+            len(commands.format_mismatch([{"lyric_kind": None, "path": "x"}], "a2")), 1
+        )
 
 
 if __name__ == "__main__":
