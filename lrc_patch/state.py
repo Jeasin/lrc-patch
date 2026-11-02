@@ -273,3 +273,76 @@ class State:
     def set_journal_status(self, path: str, status: str) -> None:
         with self.connection() as conn:
             conn.execute("UPDATE journal SET status=? WHERE path=?", (status, path))
+
+    # -- cleanup --------------------------------------------------------
+    def purge_http_cache(
+        self, expired_only: bool = True, dry_run: bool = False
+    ) -> tuple[int, int]:
+        """Delete cached responses; returns (rows, payload bytes)."""
+        where = "WHERE fetched_at + ttl < ?" if expired_only else ""
+        args: tuple[Any, ...] = (time.time(),) if expired_only else ()
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)),0) "
+                f"FROM http_cache {where}",
+                args,
+            ).fetchone()
+            if not dry_run:
+                conn.execute(f"DELETE FROM http_cache {where}", args)
+        return int(row[0]), int(row[1])
+
+    def purge_plans(
+        self, before: str | None, dry_run: bool = False
+    ) -> tuple[int, int]:
+        """Drop plan rows older than an ISO timestamp (all when None)."""
+        where = "WHERE planned_at < ?" if before else ""
+        args: tuple[Any, ...] = (before,) if before else ()
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(COALESCE(lyric,''))),0) "
+                f"FROM plans {where}",
+                args,
+            ).fetchone()
+            if not dry_run:
+                conn.execute(f"DELETE FROM plans {where}", args)
+        return int(row[0]), int(row[1])
+
+    def purge_journal(
+        self, before: str | None, dry_run: bool = False
+    ) -> tuple[int, int]:
+        """Drop journal rows older than an ISO timestamp (all when None)."""
+        where = "WHERE applied_at < ?" if before else ""
+        args: tuple[Any, ...] = (before,) if before else ()
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(COALESCE(pre_lyrics,''))),0) "
+                f"FROM journal {where}",
+                args,
+            ).fetchone()
+            if not dry_run:
+                conn.execute(f"DELETE FROM journal {where}", args)
+        return int(row[0]), int(row[1])
+
+    def count_http_cache(self, expired_only: bool = True) -> int:
+        where = "WHERE fetched_at + ttl < ?" if expired_only else ""
+        args: tuple[Any, ...] = (time.time(),) if expired_only else ()
+        with self.connection() as conn:
+            return int(
+                conn.execute(f"SELECT COUNT(*) FROM http_cache {where}", args).fetchone()[0]
+            )
+
+    def vacuum(self) -> None:
+        # VACUUM cannot run inside a transaction, so use autocommit mode.
+        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        try:
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+
+    def size(self) -> int:
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            item = Path(str(self.path) + suffix)
+            if item.exists():
+                total += item.stat().st_size
+        return total

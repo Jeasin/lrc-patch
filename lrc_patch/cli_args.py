@@ -17,7 +17,7 @@ from .errors import ToolError
 from .render import disp_width, style
 
 
-COMMAND_NAMES = {"scan", "plan", "apply", "verify", "rollback", "candidates"}
+COMMAND_NAMES = {"scan", "plan", "apply", "verify", "rollback", "candidates", "clean"}
 
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter):
@@ -132,6 +132,7 @@ def main_help() -> str:
                 ("apply", "写入 ✓ 可写入，逐文件校验后原子替换"),
                 ("verify", "复核已写入的歌词、标签、封面、音频"),
                 ("rollback", "移除本工具写入且之后未被改动的歌词"),
+                ("clean", "清理过期缓存、旧报告与旧导出（安全清理）"),
             )
         ],
         indent="  ",
@@ -168,9 +169,17 @@ def main_help() -> str:
                 "candidates",
                 "--top N  --src LIST  --workers N  --template [FILE]  --tsv  --all  --refresh",
             ),
-            ("apply", "--workers N  --no-preflight  --lrc"),
+            (
+                "apply",
+                "--pick SRC:ID  --pick-file FILE  --src LIST  --workers N\n"
+                "--no-preflight  --lrc  --refresh",
+            ),
             ("scan", "--summary"),
             ("rollback", "--yes"),
+            (
+                "clean",
+                "--dry-run  --days N  --http  --reports  --lrc  --picks  --plans  --journal  --all",
+            ),
         ]
     )
 
@@ -209,11 +218,12 @@ def main_help() -> str:
             仅版本后缀不同 +42（Live / Remaster / Da Capo Version / TV Size …）
             其它附加后缀 +35
             合作者不同 +30（feat. 版本）
-            标题主体不同、纯音乐相反、语言版本相反 → 淘汰（0 分）
+            标题主体不同 +0（歌手/专辑仍会加分，但最多 70，到不了 85）
+            纯音乐相反、语言版本相反 → 整条淘汰（0 分）
 
   歌手      标签里的名字全部对得上 +30
             少了一部分合作者 +26（"Aimer" 对上 "Aimer / 阿部真央"）
-            只是名字片段相同 +18；完全无关 → 淘汰
+            只是名字片段相同 +18；完全无关 +0（标题与专辑仍会累加）
             ; ／ ， 、 & feat. 都算并列分隔；AC/DC 这种不加空格的斜杠不拆
 
   专辑      完全相同 +15；同一专辑的另一个版本（Deluxe / Tour / Single / EP…）+12
@@ -236,6 +246,8 @@ def main_help() -> str:
 
   排序      先按不含时长的元数据分，再按含时长的分，再按时长差，最后偏好带 LRC 的
   待确认    分数不足 85，或时长差超过容差。用 candidates 看全部候选，再 --pick 指定。
+            ! 行会写清每个源给了多少分，以及最佳候选的 ID，可直接拿去 --pick：
+            ! 08 印地安老斑鸠.m4a  netease 72 · qq 72；最佳 qq:244115386 印地安老斑鸠 (Live) / 周杰伦 / 208s
 
 {style("写入前检查", "1;36")}
   时长差 ≤ 容差；LRC 末行时间戳不超过音频时长 3s；LRC 覆盖 ≥55% 时长。
@@ -289,11 +301,14 @@ PLAN_EPILOG = """\
   lrcpatch plan --lrc --lrc-dir ~/.cache/lrc-patch/lrc "米津玄師"
   lrcpatch plan --html "結束バンド"
   lrcpatch plan --pick netease:2003496467 "結束バンド/11 忘れてやらない.m4a"
+  lrcpatch plan --pick qq:123 qq:456 "周杰伦/(2000)Jay"
   lrcpatch plan --pick netease:2003496467 --apply "結束バンド/11 忘れてやらない.m4a"
 
 说明
   plan 只读：不写音频，只更新状态数据库、CSV 和可选的 HTML 复核页。
   ≥85 分且时长在容差内才判 ✓ 可写入；其余是 ! 需确认，需人工 --pick。
+  一个 --pick 可连写多个 SOURCE:ID；程序先查每个 ID 的标题/歌手/时长，
+  再按分数配对到范围内缺歌词的曲目，并把配对结果打印出来。
   --apply 会在 plan 之后直接写本次的 ✓；! 需确认、✗ 失败/无匹配仍不会写入。
   每首通常 1 次搜索 + 1 次取词；搜索已经能确定结果时不再补发标题搜索。
   打分规则见 lrcpatch -h 的「匹配与打分」。
@@ -303,11 +318,14 @@ PLAN_EPILOG = """\
 APPLY_EPILOG = """\
 示例
   lrcpatch apply "結束バンド"
+  lrcpatch apply --pick qq:123 qq:456 "周杰伦/(2000)Jay"
   lrcpatch apply --workers 2 "Ado"
 
 说明
   只写状态为 ready 的曲目；已有歌词、需确认、无匹配、请求失败都不会写入，
   并在输出里列出跳过数量与原因。
+  带 --pick / --pick-file 时先按人工指定重新 plan（指定的候选天然越过
+  85 分门槛，但仍检查时间轴），再写入，不需要先单独跑一次 plan。
   先写临时副本，回读校验歌词/其他标签/封面/音频后再原子替换；失败则原文件不动。
   开始前会检查目标目录可写且空间足够；确实需要跳过时加 --no-preflight。
 """
@@ -329,6 +347,24 @@ ROLLBACK_EPILOG = """\
 说明
   只处理 journal 中由本工具写入、且歌词之后没有被改动过的曲目。
   歌词已被你改过的会判为 ! 拒绝回滚，不会覆盖你的修改。
+"""
+
+
+CLEAN_EPILOG = """\
+示例
+  lrcpatch clean --dry-run            只预览，不删除
+  lrcpatch clean                      清过期缓存、30 天前的报告/导出/模板
+  lrcpatch clean --days 7             只清 7 天前的
+  lrcpatch clean --http               只清已过期的 HTTP 缓存
+  lrcpatch clean --all                连同计划状态与回滚记录一起清
+
+说明
+  清理对象分三处：状态库（HTTP 缓存 / 计划 / 回滚记录）、
+  reports/（CSV 与 HTML 复核页）、cache/lrc（--lrc 导出的镜像）。
+  默认只清可再生的内容：已过期缓存、超过 --days 的报告、导出与 pick 模板。
+  计划状态用于断点续跑，回滚记录用于 rollback，因此只在明确指定
+  --plans / --journal 或 --all 时才删除；删了就要重新查询、且无法回滚。
+  删除记录后会执行 VACUUM，空间按实际收缩后的数据库大小报告。
 """
 
 
@@ -621,7 +657,8 @@ def build_parser() -> argparse.ArgumentParser:
             '  lrcpatch candidates --template "Aimer"\n'
             '  lrcpatch candidates --tsv "Ado" > picks.tsv\n\n'
             "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 格式 /\n"
-            "标题 / 歌手 / 专辑，差异写在候选下面那一行，不再挤进同一行。\n\n"
+            "标题 / 歌手 / 专辑。分数是标题+歌手+专辑的总分（满分 100），\n"
+            "时长差单独一列，超过容差显示红色，不再逐条解释原因。\n\n"
             "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，\n"
             "需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
         ),
@@ -676,6 +713,46 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(apply_cmd)
     add_tree_option(apply_cmd)
     add_lrc_options(apply_cmd)
+    add_network_options(apply_cmd)
+    apply_cmd.add_argument(
+        "--src",
+        metavar="LIST",
+        default=",".join(DEFAULT_SOURCES),
+        help="配合 --pick 时用于查词的源（默认 netease,qq）",
+    )
+    apply_cmd.add_argument(
+        "--pick",
+        action="append",
+        metavar="SOURCE:ID",
+        help="直接写入选中的候选（可一次给多个，自动配对到缺词曲目）",
+    )
+    apply_cmd.add_argument(
+        "--pick-file",
+        type=Path,
+        metavar="FILE",
+        help="批量人工指定：每行 曲目路径<TAB>SOURCE:ID",
+    )
+    apply_cmd.add_argument(
+        "--refresh", action="store_true", help="配合 --pick 时忽略 HTTP 缓存并重查"
+    )
+    apply_cmd.add_argument("--no-plain", action="store_true", help="只接受带时间轴的 LRC")
+    apply_cmd.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="配合 --pick 时重查 no_match/ambiguous/suspect",
+    )
+    apply_cmd.add_argument(
+        "--duration-tolerance",
+        type=float,
+        default=DEFAULT_DURATION_TOLERANCE,
+        metavar="SEC",
+        help=f"时长容差（默认 {DEFAULT_DURATION_TOLERANCE:g} 秒）",
+    )
+    apply_cmd.add_argument(
+        "--no-timestamp-check",
+        action="store_true",
+        help="不检查 LRC 末尾时间轴与音频时长是否相符",
+    )
     apply_cmd.add_argument(
         "--workers", type=int, metavar="N", default=4, help="写入并发 1..10（默认 4）"
     )
@@ -720,8 +797,60 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes", action="store_true", help="确认执行移除（不加只预览）"
     )
 
+    clean = sub.add_parser(
+        "clean",
+        prog="lrcpatch clean",
+        usage="lrcpatch clean [--参数 …]",
+        help="清理过期缓存、旧报告与旧导出（安全清理）",
+        description="像 brew cleanup：默认只清过期或超期的生成物，并打印释放量。",
+        epilog=CLEAN_EPILOG,
+        formatter_class=HelpFormatter,
+        add_help=False,
+    )
+    add_help_option(clean)
+    clean.add_argument(
+        "--state-dir",
+        type=Path,
+        metavar="DIR",
+        help="状态、缓存与报告目录（默认 $XDG_STATE_HOME/lrc-patch）",
+    )
+    clean.add_argument(
+        "--lrc-dir",
+        type=Path,
+        metavar="DIR",
+        help="--lrc 导出目录（默认 $XDG_CACHE_HOME/lrc-patch/lrc）",
+    )
+    clean.add_argument(
+        "--no-color",
+        action="store_true",
+        help="关闭彩色输出（也可设 NO_COLOR=1）",
+    )
+    clean.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        metavar="N",
+        help="只清理 N 天前的报告、导出、模板与记录（默认 30）",
+    )
+    clean.add_argument("--dry-run", action="store_true", help="只预览，不删除")
+    clean.add_argument(
+        "--http", action="store_true", help="清 HTTP 缓存（默认只清已过期的）"
+    )
+    clean.add_argument("--reports", action="store_true", help="清旧 CSV 报告与 HTML 复核页")
+    clean.add_argument("--lrc", action="store_true", help="清旧的 --lrc 导出镜像")
+    clean.add_argument("--picks", action="store_true", help="清旧的 pick 模板")
+    clean.add_argument(
+        "--plans", action="store_true", help="清旧计划状态（之后需要重新查询）"
+    )
+    clean.add_argument(
+        "--journal", action="store_true", help="清旧回滚记录（之后无法 rollback）"
+    )
+    clean.add_argument(
+        "--all", action="store_true", help="清全部，包括计划状态与回滚记录"
+    )
+
     # Keep the generated help consistent with the hand-written sections.
-    for item in (parser, scan, plan, candidates, apply_cmd, verify, rollback):
+    for item in (parser, scan, plan, candidates, apply_cmd, verify, rollback, clean):
         item._optionals.title = "选项"  # noqa: SLF001
         item._positionals.title = "路径"  # noqa: SLF001
 
@@ -757,6 +886,14 @@ def option_specs(parser: argparse.ArgumentParser) -> dict[str, int]:
 
 def looks_like_html(value: str) -> bool:
     return not value.startswith("-") and value.lower().endswith((".html", ".htm"))
+
+
+_PICK_RE = re.compile(r"^[A-Za-z]+:\d+$")
+
+
+def looks_like_pick(value: str) -> bool:
+    """``--pick qq:1 qq:2 path`` — picks may be given in one run."""
+    return bool(_PICK_RE.match(value))
 
 
 def looks_like_pick_file(value: str) -> bool:
@@ -831,10 +968,25 @@ def normalize_argv(
             continue
         if token.startswith("-") and token != "-":
             name = token.split("=", 1)[0]
-            options.append(token)
             if "=" in token:
+                options.append(token)
                 index += 1
                 continue
+            if name == "--pick":
+                # One flag may carry a whole album's decisions:
+                #   --pick qq:11 qq:22 netease:33  ~/专辑
+                # argparse stores one value per occurrence, so the flag is
+                # repeated for each value here.
+                index += 1
+                taken = False
+                while index < len(argv) and looks_like_pick(argv[index]):
+                    options.extend(["--pick", argv[index]])
+                    index += 1
+                    taken = True
+                if not taken:
+                    options.append(name)
+                continue
+            options.append(token)
             if name == "--html":
                 if index + 1 < len(argv) and looks_like_html(argv[index + 1]):
                     options.append(argv[index + 1])

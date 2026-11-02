@@ -544,6 +544,43 @@ class NeteaseSource:
                 break
         return candidates
 
+    def lookup(self, ids: list[str]) -> list[Candidate]:
+        """Resolve song IDs to title/artist/album/duration in one request.
+
+        ``--pick`` may name several candidates at once; without their metadata
+        there is no way to tell which track each one belongs to.
+        """
+        wanted = [item for item in ids if str(item).isdigit()]
+        if not wanted:
+            return []
+        url = (
+            "https://music.163.com/api/song/detail?"
+            + urllib.parse.urlencode({"ids": "[" + ",".join(wanted) + "]"})
+        )
+        code, data = self.client.get(self.name, url, self.min_interval, kind="detail")
+        if code != 200 or not isinstance(data, dict):
+            return []
+        out: list[Candidate] = []
+        for song in data.get("songs") or []:
+            sid = str(song.get("id") or "")
+            if not sid:
+                continue
+            out.append(
+                Candidate(
+                    source=self.name,
+                    source_id=sid,
+                    title=str(song.get("name") or ""),
+                    artists=[
+                        str(artist.get("name") or "")
+                        for artist in (song.get("artists") or [])
+                        if artist.get("name")
+                    ],
+                    album=str((song.get("album") or {}).get("name") or ""),
+                    duration=float(song.get("duration") or 0) / 1000.0,
+                )
+            )
+        return out
+
     def fetch(self, candidate: Candidate) -> FetchResult:
         url = (
             "https://music.163.com/api/song/lyric?"
@@ -582,6 +619,10 @@ class LrclibSource:
 
     def __init__(self, client: JsonClient):
         self.client = client
+
+    def lookup(self, ids: list[str]) -> list[Candidate]:
+        """LRCLIB has no per-ID metadata endpoint; multi --pick cannot use it."""
+        return []
 
     def search(self, track: Track, exhaustive: bool = False) -> list[Candidate]:
         params = {"track_name": track.title}
@@ -685,6 +726,10 @@ class QqSource:
             method="POST",
             raw_body=raw,
             expect_code="0",
+            # Every RPC shares one URL, so the body is what tells search,
+            # lyric and detail apart; without it they would all hit the same
+            # cache entry (and GetSession would answer every later call).
+            cache_extra=raw,
             cache_predicate=lambda payload: 30 * 86400
             if isinstance(payload, dict) and (payload.get("request") or {}).get("data")
             else 86400,
@@ -742,6 +787,40 @@ class QqSource:
                     artists=artists,
                     album=str((song.get("album") or {}).get("name") or ""),
                     duration=float(song.get("interval") or 0),
+                )
+            )
+        return out
+
+    def lookup(self, ids: list[str]) -> list[Candidate]:
+        """QQ has no batch detail call; one get_song_detail per picked ID."""
+        out: list[Candidate] = []
+        for sid in ids:
+            if not str(sid).isdigit():
+                continue
+            try:
+                self._init()
+                data = self._rpc(
+                    "get_song_detail",
+                    "music.pf_song_detail_svr",
+                    {"song_id": int(sid)},
+                )
+            except SourceError:
+                raise
+            track = (data or {}).get("track_info") or {}
+            if not track:
+                continue
+            out.append(
+                Candidate(
+                    source=self.name,
+                    source_id=str(track.get("id") or sid),
+                    title=str(track.get("title") or track.get("name") or ""),
+                    artists=[
+                        str(singer.get("name") or "")
+                        for singer in (track.get("singer") or [])
+                        if singer.get("name")
+                    ],
+                    album=str((track.get("album") or {}).get("name") or ""),
+                    duration=float(track.get("interval") or 0),
                 )
             )
         return out

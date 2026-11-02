@@ -19,7 +19,7 @@ from lrc_patch.cli_args import (
     reject_unknown_options,
 )
 from lrc_patch.errors import SourceError, ToolError
-from lrc_patch.matching import keep_previous_plan, plan_one, score_candidate
+from lrc_patch.matching import assign_picks, keep_previous_plan, plan_one, score_candidate
 from lrc_patch.models import Candidate, Track, TreeEntry
 from lrc_patch.state import State
 from lrc_patch.text import (
@@ -1046,6 +1046,207 @@ class QqSourceTests(unittest.TestCase):
         self.assertTrue(result.lyrics)
         self.assertEqual(lyric_kind(result.lyrics), "qrc")
         self.assertIn("(200,300)爱", result.lyrics)
+
+
+class ScoreComponentTests(unittest.TestCase):
+    """Partial matches print what they have instead of a bare 0."""
+
+    def test_artist_only_reports_30(self) -> None:
+        track = make_track(duration=200.0)
+        candidate = Candidate("qq", "1", "完全不同", ["Artist"], "Other", 200.0)
+        self.assertEqual(score_candidate(track, candidate)[0], 30)
+
+    def test_exact_title_without_artist_reports_55(self) -> None:
+        track = make_track(duration=200.0)
+        candidate = Candidate("qq", "1", "Track", ["Someone Else"], "Other", 200.0)
+        self.assertEqual(score_candidate(track, candidate)[0], 55)
+
+    def test_near_title_stays_below_the_auto_line(self) -> None:
+        track = make_track(
+            title="印地安老斑鸠", artist="周杰伦", album="Jay", duration=305.0
+        )
+        candidate = Candidate("qq", "97757", "印第安老斑鸠", ["周杰伦"], "Jay", 305.0)
+        score, diff = score_candidate(track, candidate)
+        self.assertEqual(score, 45)  # title 0 + artist 30 + album 15
+        self.assertLess(score, 85)
+        self.assertAlmostEqual(diff, 0.0)
+
+    def test_duration_gap_still_zeroes_the_gated_score(self) -> None:
+        track = make_track(duration=305.0)
+        candidate = Candidate("qq", "1", "Track", ["Artist"], "Album", 208.0)
+        self.assertEqual(score_candidate(track, candidate)[0], 0)
+        self.assertEqual(score_candidate(track, candidate, 999.0)[0], 100)
+
+
+class _FixedSource:
+    """A provider stub that returns prepared candidates and nothing else."""
+
+    def __init__(self, name: str, candidates: list[Candidate]) -> None:
+        self.name = name
+        self._candidates = candidates
+
+    def search(self, track: Track, exhaustive: bool = False) -> list[Candidate]:
+        return list(self._candidates)
+
+    def lookup(self, ids: list[str]) -> list[Candidate]:
+        wanted = set(ids)
+        return [item for item in self._candidates if item.source_id in wanted]
+
+
+class AmbiguousReasonTests(unittest.TestCase):
+    def test_reason_names_every_source_and_the_best_id(self) -> None:
+        track = make_track(
+            title="印地安老斑鸠", artist="周杰伦", album="Jay", duration=305.0
+        )
+        live = Candidate(
+            "qq", "244115386", "印地安老斑鸠 (Live)", ["周杰伦"], "Jay", 208.0
+        )
+        netease = _FixedSource(
+            "netease",
+            [Candidate("netease", "1400391963", "印地安老斑鸠 (Live)", ["周杰伦"], "巡演", 208.0)],
+        )
+        qq = _FixedSource("qq", [live])
+        result = plan_one(track, [netease, qq], True)
+        self.assertEqual(result.status, "ambiguous")
+        self.assertIn("netease 72", result.reason)
+        self.assertIn("qq 87", result.reason)
+        self.assertIn("qq:244115386", result.reason)
+
+    def test_empty_source_is_named_as_such(self) -> None:
+        track = make_track(title="Track", artist="Artist", album="Album", duration=200.0)
+        result = plan_one(track, [EmptySource()], True)
+        self.assertEqual(result.status, "no_match")
+        self.assertIn("empty", result.reason)
+
+
+class PickAssignmentTests(unittest.TestCase):
+    def _tracks(self) -> list[Track]:
+        return [
+            make_track(path=Path("/lib/Album/01 Alpha.m4a"), title="Alpha", artist="A", album="X", duration=200.0),
+            make_track(path=Path("/lib/Album/02 Beta.m4a"), title="Beta", artist="B", album="Y", duration=180.0),
+        ]
+
+    def test_ids_are_paired_by_metadata_score(self) -> None:
+        alpha = Candidate("qq", "101", "Alpha", ["A"], "X", 200.0)
+        beta = Candidate("qq", "202", "Beta", ["B"], "Y", 180.0)
+        source = _FixedSource("qq", [beta, alpha])  # deliberately reversed order
+        assignments, unresolved, preview = assign_picks(
+            self._tracks(), ["qq:202", "qq:101"], [source], 2.0
+        )
+        self.assertEqual(unresolved, [])
+        self.assertEqual(assignments[str(Path("/lib/Album/01 Alpha.m4a"))], "qq:101")
+        self.assertEqual(assignments[str(Path("/lib/Album/02 Beta.m4a"))], "qq:202")
+        self.assertEqual([row[1].source_id for row in preview], ["101", "202"])
+
+    def test_unrelated_pick_is_reported(self) -> None:
+        source = _FixedSource("qq", [Candidate("qq", "999", "Zeta", ["Z"], "Z", 100.0)])
+        assignments, unresolved, _ = assign_picks(
+            self._tracks(), ["qq:999"], [source], 2.0
+        )
+        self.assertEqual(assignments, {})
+        self.assertEqual(unresolved, ["qq:999"])
+
+    def test_near_title_pairing_uses_similarity_not_score(self) -> None:
+        """印地安 / 印第安 scores 45, but a human pick still lands on the right file."""
+        track = make_track(
+            path=Path("/lib/Jay/08 印地安老斑鸠.m4a"),
+            title="印地安老斑鸠",
+            artist="周杰伦",
+            album="Jay",
+            duration=305.0,
+        )
+        other = make_track(
+            path=Path("/lib/Jay/01 可爱女人.m4a"),
+            title="可爱女人",
+            artist="周杰伦",
+            album="Jay",
+            duration=239.0,
+        )
+        picked = Candidate("qq", "97757", "印第安老斑鸠", ["周杰伦"], "Jay", 305.0)
+        source = _FixedSource("qq", [picked])
+        assignments, unresolved, _ = assign_picks(
+            [other, track], ["qq:97757"], [source], 2.0
+        )
+        self.assertEqual(unresolved, [])
+        self.assertEqual(assignments, {str(track.path): "qq:97757"})
+
+    def test_source_must_be_enabled(self) -> None:
+        with self.assertRaises(ToolError):
+            assign_picks(self._tracks(), ["netease:1"], [_FixedSource("qq", [])], 2.0)
+
+
+class MultiPickArgvTests(unittest.TestCase):
+    def test_one_flag_accepts_several_ids(self) -> None:
+        parser = build_parser()
+        command, options, paths = normalize_argv(
+            ["plan", "--pick", "qq:1", "netease:2", "/lib"], option_specs(parser)
+        )
+        args = parser.parse_args([command, *options, "--", *paths])
+        self.assertEqual(args.pick, ["qq:1", "netease:2"])
+        self.assertEqual(args.paths, ["/lib"])
+
+    def test_a_path_after_the_picks_is_not_swallowed(self) -> None:
+        parser = build_parser()
+        _, options, paths = normalize_argv(
+            ["--pick", "qq:1", "/lib/Album"], option_specs(parser)
+        )
+        self.assertEqual(options, ["--pick", "qq:1"])
+        self.assertEqual(paths, ["/lib/Album"])
+
+
+class CleanTests(unittest.TestCase):
+    def test_only_old_files_are_removed(self) -> None:
+        import time as _time
+
+        from lrc_patch import clean as clean_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "reports"
+            root.mkdir()
+            old = root / "old.csv"
+            old.write_text("x")
+            stale = _time.time() - 40 * 86400
+            old.touch()
+            import os as _os
+
+            _os.utime(old, (stale, stale))
+            fresh = root / "new.csv"
+            fresh.write_text("y")
+            count, size = clean_mod._clean_files(root, _time.time() - 30 * 86400, False)
+            self.assertEqual(count, 1)
+            self.assertFalse(old.exists())
+            self.assertTrue(fresh.exists())
+            self.assertGreater(size, 0)
+
+    def test_dry_run_keeps_everything(self) -> None:
+        import time as _time
+
+        from lrc_patch import clean as clean_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            item = root / "old.csv"
+            item.write_text("x")
+            stale = _time.time() - 40 * 86400
+            import os as _os
+
+            _os.utime(item, (stale, stale))
+            count, _ = clean_mod._clean_files(root, _time.time() - 30 * 86400, True)
+            self.assertEqual(count, 1)
+            self.assertTrue(item.exists())
+
+    def test_http_cache_drops_only_expired_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = State(Path(tmp) / "s.sqlite3")
+            state.cache_http("expired", {"a": 1}, 0)
+            state.cache_http("live", {"b": 2}, 3600)
+            removed, _ = state.purge_http_cache(expired_only=True)
+            self.assertEqual(removed, 1)
+            self.assertIsNone(state.cached_http("expired"))
+            self.assertIsNotNone(state.cached_http("live"))
+            remaining, _ = state.purge_http_cache(expired_only=False)
+            self.assertEqual(remaining, 1)
+            self.assertEqual(state.count_http_cache(expired_only=False), 0)
 
 
 if __name__ == "__main__":

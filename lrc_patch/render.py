@@ -790,6 +790,15 @@ def plan_note(row: sqlite3.Row) -> str:
         return "已有歌词，未覆盖"
     if status == "instrumental":
         return "匹配为纯音乐"
+    if status == "suspect":
+        # Say which provider supplied the lyric that failed the sanity check;
+        # otherwise a suspect row looks like it came from nowhere.
+        bits = [str(row["source"])] if row["source"] else []
+        if row["score"]:
+            bits.append(f"{row['score']}分")
+        head = " ".join(bits)
+        reason = str(row["reason"] or "")
+        return f"{head}；{reason}" if head and reason else head or reason
     return str(row["reason"] or status_style(status)[2])
 
 

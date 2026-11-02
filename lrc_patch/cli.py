@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 
 from . import commands
+from .clean import cmd_clean
 from .cli_args import (
     COMMAND_NAMES,
     build_parser,
@@ -107,11 +108,24 @@ def main() -> int:
         if args.command == "candidates":
             return commands.cmd_candidates(args, state, state_dir)
         if args.command == "apply":
-            return commands.cmd_apply(args, state, state_dir)
+            if getattr(args, "pick", None) or getattr(args, "pick_file", None):
+                # "write these ones" — plan the explicit picks first (a pick is
+                # already a human decision, so the 85-point gate does not apply)
+                # and then chain into the writer, exactly like plan --apply.
+                args.apply = True
+                code = commands.cmd_plan(args, state, state_dir)
+                if code != 0:
+                    return code
+                args.report = None
+                args.no_preflight = False
+                args.progress_every = 10
+                return commands.cmd_apply(args, state, state_dir)
         if args.command == "verify":
             return commands.cmd_verify(args, state)
         if args.command == "rollback":
             return commands.cmd_rollback(args, state, state_dir)
+        if args.command == "clean":
+            return cmd_clean(args, state, state_dir)
 
     print(main_help())
     return 2

@@ -1,4 +1,7 @@
-"""The six user-facing commands: scan, plan, candidates, apply, verify, rollback."""
+"""The user-facing commands: scan, plan, candidates, apply, verify, rollback.
+
+``clean`` lives in :mod:`lrc_patch.clean`.
+"""
 from __future__ import annotations
 
 import argparse
@@ -13,6 +16,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .audio import (
     apply_one,
@@ -26,9 +30,10 @@ from .audio import (
     read_track,
     stage_copy,
 )
-from .config import default_lrc_dir
+from .config import DEFAULT_DURATION_TOLERANCE, default_lrc_dir
 from .errors import ToolError, VerificationError
 from .matching import (
+    assign_picks,
     keep_previous_plan,
     parse_pick,
     plan_one,
@@ -179,32 +184,56 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
     return 1 if errors else 0
 
 def collect_picks(
-    args: argparse.Namespace, tracks: list[Track], library: Path
-) -> dict[str, str]:
-    """Merge --pick and --pick-file into path -> SOURCE:ID."""
+    args: argparse.Namespace,
+    tracks: list[Track],
+    library: Path,
+    sources: list[Any] | None = None,
+    tolerance: float = DEFAULT_DURATION_TOLERANCE,
+) -> tuple[
+    dict[str, str], list[str], list[tuple[Track, Candidate, int, float]]
+]:
+    """Merge --pick and --pick-file into path -> SOURCE:ID.
+
+    One pick in a one-track scope is applied directly (the user is pointing at
+    that file).  Anything else is paired by resolving each ID's metadata and
+    scoring it against the tracks that still need lyrics.
+    """
     picks: dict[str, str] = {}
     pick_file = getattr(args, "pick_file", None)
     if pick_file:
         picks.update(read_pick_file(Path(pick_file), library, tracks))
 
-    values = getattr(args, "pick", None) or []
+    values = [str(value).strip() for value in (getattr(args, "pick", None) or [])]
+    values = [value for value in values if value]
+    preview: list[tuple[Track, Candidate, int, float]] = []
+    unresolved: list[str] = []
     if values:
         eligible = [track for track in tracks if not track.has_lyrics]
-        if len(eligible) != 1:
-            raise ToolError(
-                f"--pick 要求当前范围恰好一首缺歌词的曲目，实际 {len(eligible)} 首。"
-                "请把拖入范围缩小到单首，或改用 --pick-file（每行：路径<TAB>源:ID）。"
+        if not eligible:
+            raise ToolError("--pick 指定了候选，但当前范围内没有缺歌词的曲目")
+        if len(values) == 1 and len(eligible) == 1:
+            picks[str(eligible[0].path)] = values[0]
+        else:
+            if sources is None:
+                raise ToolError("无法为多个 --pick 配对：缺少歌词源")
+            assigned, unresolved, preview = assign_picks(
+                tracks, values, sources, tolerance
             )
-        if len(values) != 1:
-            raise ToolError("单首曲目只能配一个 --pick；批量指定请用 --pick-file。")
-        picks[str(eligible[0].path)] = values[0]
+            picks.update(assigned)
+            if unresolved:
+                raise ToolError(
+                    "这些 --pick 无法配对到范围内的曲目："
+                    + "、".join(unresolved)
+                    + "\n可能是 ID 查不到详情，或标题/歌手与范围内任何缺词曲目都不符。"
+                    "\n把范围缩小到单个文件，或改用 --pick-file（每行：路径<TAB>源:ID）。"
+                )
 
     selected = {str(track.path) for track in tracks}
     for path, value in picks.items():
         if path not in selected:
             raise ToolError(f"人工指定的曲目不在当前 --path 范围内：{path}")
         parse_pick(value)
-    return picks
+    return picks, unresolved, preview
 
 def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     library = args.library.expanduser().resolve()
@@ -223,7 +252,9 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         impersonate=not getattr(args, "no_impersonate", False),
     )
     source_objects = build_sources(args.src, client, getattr(args, "target_format", None))
-    picks = collect_picks(args, tracks, library)
+    picks, _unresolved, pick_preview = collect_picks(
+        args, tracks, library, source_objects, args.duration_tolerance
+    )
     report = args.report or (state_dir / "reports" / f"plan-{stamp}.csv")
 
     pending: list[Track] = []
@@ -279,6 +310,15 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             f"{len(picks)} 首"
             + (style(f"   其中 {ignored} 首已有歌词会被跳过", "33") if ignored else ""),
         )
+        for track, candidate, _identity, diff in pick_preview:
+            gate = f"  {format_diff(diff)}" if diff < 900 else ""
+            print_meta(
+                "配对",
+                f"{track.path.name} ← {candidate.source}:{candidate.source_id} "
+                f"{candidate.title}"
+                + (f" / {candidate.artist_text}" if candidate.artist_text else "")
+                + style(gate, "90"),
+            )
 
     kept_good = 0
     if pending:
@@ -427,9 +467,10 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             + style("指定", "90")
             + "  选中后："
             + style(
-                f"lrcpatch --pick netease:歌曲ID"
+                "lrcpatch --pick SRC:ID"
                 + (" --apply" if getattr(args, "apply", False) else "")
-                + suffix,
+                + suffix
+                + "（可选多个 --pick）",
                 "36",
             )
         )
@@ -551,14 +592,14 @@ def candidate_rows(track: Track, results: list, args: argparse.Namespace) -> lis
             else:
                 kind = "待取词"
             notes = match_notes(track, candidate, args.duration_tolerance)
-            if metadata_score < 85:
-                notes.insert(0, "标题或歌手与文件不一致")
             rows.append(
                 CandRow(
                     symbol=symbol,
                     code=code,
                     ident=f"{candidate.source}:{candidate.source_id}",
-                    score=str(score) if score else "-",
+                    # Show the metadata total, not the gated score: a cover that
+                    # only matches the artist reads 30, not a bare "-".
+                    score=str(metadata_score),
                     diff=format_diff(candidate.duration - track.duration, signed=True)
                     if diff < 900
                     else "Δ?",
@@ -569,7 +610,7 @@ def candidate_rows(track: Track, results: list, args: argparse.Namespace) -> lis
                     notes=notes,
                     metadata_score=metadata_score,
                     over_tolerance=bool(metadata_score) and not score,
-                    score_value=score,
+                    score_value=metadata_score,
                     diff_value=candidate.duration - track.duration,
                 )
             )
@@ -624,16 +665,6 @@ def candidate_line(
         + " "
         + "  ".join(cells).strip()
     )
-
-
-def candidate_note_lines(row: CandRow, prefix: str, last: bool) -> list[str]:
-    """Explanations hang under their own candidate, not under the next one."""
-    rail = "   " if last else "│  "
-    lines = []
-    for index, note in enumerate(row.notes):
-        glyph = "└" if index == len(row.notes) - 1 else "├"
-        lines.append(style(prefix + rail + f"{glyph} {note}", "90"))
-    return lines
 
 
 def write_pick_template(
@@ -819,8 +850,6 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
                 last_row = row_index == len(rows) - 1
                 branch = "└─ " if last_row else "├─ "
                 print(candidate_line(row, widths, prefix, branch))
-                for line in candidate_note_lines(row, prefix, last_row):
-                    print(line)
         print()
 
     print(
@@ -842,8 +871,8 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
             "下一步",
             "编辑模板后运行 "
             + style(
-                f"lrcpatch plan{f' {scope_args}' if scope_args else ''} "
-                f"--pick-file {shlex.quote(str(template_path))}",
+                f"lrcpatch plan --pick-file {shlex.quote(str(template_path))}"
+                f"{f' {scope_args}' if scope_args else ''}",
                 "36",
             ),
         )
