@@ -10,8 +10,13 @@ from pathlib import Path
 from unittest import mock
 
 from lrc_patch import render, sources
-from lrc_patch.cli_args import build_parser, normalize_argv, option_specs
-from lrc_patch.errors import SourceError
+from lrc_patch.cli_args import (
+    build_parser,
+    normalize_argv,
+    option_specs,
+    reject_unknown_options,
+)
+from lrc_patch.errors import SourceError, ToolError
 from lrc_patch.matching import keep_previous_plan, plan_one, score_candidate
 from lrc_patch.models import Candidate, Track, TreeEntry
 from lrc_patch.state import State
@@ -48,6 +53,23 @@ class FailingSource:
 
     def search(self, track: Track) -> list[Candidate]:
         raise SourceError("failing", "failing 连续 3 次失败：HTTP 503（服务繁忙）")
+
+
+class DefaultsTests(unittest.TestCase):
+    def test_notes_do_not_wrap_by_default(self) -> None:
+        self.assertFalse(render._WRAP_ENABLED)
+
+    def test_unknown_option_is_suggested(self) -> None:
+        specs = option_specs(build_parser())
+        with self.assertRaises(ToolError) as ctx:
+            reject_unknown_options(["--no-warp"], specs)
+        message = str(ctx.exception)
+        self.assertIn("--no-wrap", message)
+        self.assertIn("默认已经不换行", message)
+
+    def test_known_options_pass(self) -> None:
+        specs = option_specs(build_parser())
+        reject_unknown_options(["--workers", "2", "--pick", "netease:1"], specs)
 
 
 class NormalizeTests(unittest.TestCase):
@@ -154,7 +176,7 @@ class TreeAlignmentTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         render.screen_width = self._width
-        render.set_wrap(True)
+        render.set_wrap(False)
 
     def _render(self, entries: list[TreeEntry]) -> list[str]:
         buffer = io.StringIO()
@@ -247,7 +269,9 @@ class JsonClientTests(unittest.TestCase):
         with mock.patch.object(sources.urllib.request, "urlopen", fail), mock.patch.object(
             sources.time, "sleep", lambda _seconds: None
         ):
-            client = sources.JsonClient(self.state)
+            client = sources.JsonClient(
+                self.state, transport=sources.UrllibTransport()
+            )
             with self.assertRaises(SourceError):
                 client.get("lrclib", url, 0.0)
 
@@ -267,6 +291,41 @@ class JsonClientTests(unittest.TestCase):
         self.assertGreaterEqual(client.health()[0][3], 58)
         self.assertEqual(len(calls), sources.JsonClient.MAX_ATTEMPTS * 2)
 
+    def test_rate_limit_parks_the_source(self) -> None:
+        """netease answers 200 + {"code":405} when it throttles; that is not a verdict."""
+
+        class Response:
+            def read(self) -> bytes:
+                return b'{"code": 405, "msg": "\\u64cd\\u4f5c\\u9891\\u7e41"}'
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+        url = "https://music.163.com/api/search/get"
+        with mock.patch.object(
+            sources.urllib.request, "urlopen", lambda request, timeout=30: Response()
+        ), mock.patch.object(sources.time, "sleep", lambda _seconds: None):
+            client = sources.JsonClient(
+                self.state, transport=sources.UrllibTransport()
+            )
+            with self.assertRaises(SourceError) as ctx:
+                client.get("netease", url, 0.0)
+        self.assertIn("限流", str(ctx.exception))
+        self.assertGreaterEqual(client.cooldown("netease"), 170)
+
+        # Every later track fails fast instead of hammering a blocked provider.
+        with mock.patch.object(
+            sources.urllib.request,
+            "urlopen",
+            side_effect=AssertionError("must not hit the network while parked"),
+        ):
+            with self.assertRaises(SourceError) as parked:
+                client.get("netease", url, 0.0)
+        self.assertIn("已暂停", str(parked.exception))
+
     def test_success_is_cached(self) -> None:
         class Response:
             def read(self) -> bytes:
@@ -282,7 +341,9 @@ class JsonClientTests(unittest.TestCase):
         with mock.patch.object(
             sources.urllib.request, "urlopen", lambda request, timeout=30: Response()
         ):
-            client = sources.JsonClient(self.state)
+            client = sources.JsonClient(
+                self.state, transport=sources.UrllibTransport()
+            )
             code, data = client.get(
                 "netease", url, 0.0, lambda payload: bool(payload["result"]["songs"])
             )

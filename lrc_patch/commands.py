@@ -6,6 +6,8 @@ import datetime as dt
 import os
 import shlex
 import sqlite3
+import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,7 +34,7 @@ from .matching import (
     read_pick_file,
     score_candidate,
 )
-from .models import PlanResult, Track, TreeEntry
+from .models import Candidate, PlanResult, Track, TreeEntry
 from .paths import resolve_selection, selection_matches
 from .render import (
     ProgressLine,
@@ -52,6 +54,8 @@ from .render import (
     status_style,
     style,
     truncate_display,
+    wrap_display,
+    wrap_enabled,
     write_plan_html,
     write_plan_report,
 )
@@ -151,7 +155,11 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         print("  " + style("没有找到可处理的音频文件。", "33"))
         return 2
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    client = JsonClient(state, refresh=args.refresh)
+    client = JsonClient(
+        state,
+        refresh=args.refresh,
+        impersonate=not getattr(args, "no_impersonate", False),
+    )
     source_objects = build_sources(args.sources, client)
     picks = collect_picks(args, tracks, library)
     report = args.report or (state_dir / "reports" / f"plan-{stamp}.csv")
@@ -341,6 +349,9 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                 if cooldown:
                     text += f" 冷却 {cooldown}s"
                 bits.append(text)
+            transport = getattr(getattr(client, "transport", None), "name", "")
+            if transport:
+                bits.append(f"传输 {transport}")
             print_meta("请求", "  ·  ".join(bits))
         else:
             print_meta("网络", "全部命中本地缓存，未发起请求")
@@ -404,16 +415,69 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
         print_header("candidates")
         print("  " + style("没有找到可处理的音频文件。", "33"))
         return 2
-    client = JsonClient(state, refresh=args.refresh)
+    client = JsonClient(
+        state,
+        refresh=args.refresh,
+        impersonate=not getattr(args, "no_impersonate", False),
+    )
     sources = build_sources(args.sources, client)
     wanted = [track for track in tracks if args.all or not track.has_lyrics]
 
+    if not args.tsv:
+        print_header(
+            "candidates",
+            f"{len(wanted)} 首  ·  每源最多 {args.top} 条  ·  源 {','.join(args.sources)}",
+        )
+        if not wanted:
+            print("  " + style("范围内所有曲目都已有歌词；加 --all 可强制列出。", "32"))
+            print()
+            return 0
+
+    # Query in parallel and buffer the results, so output stays grouped while a
+    # 20-track album does not look frozen for three minutes.
+    paused: dict[str, str] = {}
+    guard = threading.Lock()
+
+    def search_all(track: Track) -> list[tuple[str, list[Candidate] | None, Exception | None, bool]]:
+        rows: list[tuple[str, list[Candidate] | None, Exception | None, bool]] = []
+        for source in sources:
+            with guard:
+                skip = source.name in paused
+            if skip:
+                rows.append((source.name, None, None, True))
+                continue
+            try:
+                rows.append((source.name, source.search(track), None, False))
+            except Exception as exc:
+                if client.cooldown(source.name) > 0:
+                    with guard:
+                        paused.setdefault(source.name, str(exc))
+                rows.append((source.name, None, exc, False))
+        return rows
+
+    results: dict[str, list] = {}
+    live = ProgressLine(stream=sys.stderr if args.tsv else sys.stdout)
+    if not live.enabled and not args.tsv:
+        print("  " + style(f"查询 {len(wanted)} 首…（Ctrl+C 可中断）", "90"), flush=True)
+    started = time.monotonic()
+    live.start(f"查询 0/{len(wanted)}", started)
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = {pool.submit(search_all, track): track for track in wanted}
+        done = 0
+        for future in as_completed(futures):
+            track = futures[future]
+            results[str(track.path)] = future.result()
+            done += 1
+            if live.enabled:
+                elapsed = time.monotonic() - started
+                rate = done / elapsed if elapsed else 0
+                live.update(f"查询 {done}/{len(wanted)}  ·  {rate:.1f} 首/秒")
+    live.close()
+
     if args.tsv:
         for track in wanted:
-            for source in sources:
-                try:
-                    candidates = source.search(track)
-                except Exception:
+            for _name, candidates, _error, skipped in results[str(track.path)]:
+                if skipped or candidates is None:
                     continue
                 ranked = []
                 for candidate in candidates:
@@ -428,15 +492,12 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
                         f"{track.relpath}\t{candidate.source}:{candidate.source_id}"
                         f"\t{score}\t{diff:.1f}\t{candidate.title}"
                     )
-        return 0
-
-    print_header(
-        "candidates",
-        f"{len(wanted)} 首  ·  每源最多 {args.top} 条  ·  源 {','.join(args.sources)}",
-    )
-    if not wanted:
-        print("  " + style("范围内所有曲目都已有歌词；加 --all 可强制列出。", "32"))
-        print()
+        if paused:
+            print(
+                "暂停的源："
+                + ", ".join(f"{name}（{reason}）" for name, reason in paused.items()),
+                file=sys.stderr,
+            )
         return 0
 
     groups: dict[Path, list[Track]] = {}
@@ -454,12 +515,12 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
             )
             prefix = "        " if last_track else "     │  "
             rows: list[tuple[str, str, str, str]] = []
-            for source in sources:
-                try:
-                    candidates = source.search(track)
-                except Exception as exc:
+            for name, candidates, error, skipped in results[str(track.path)]:
+                if skipped:
+                    continue
+                if error is not None:
                     rows.append(
-                        ("✗", "1;31", f"{source.name}", f"搜索失败 {type(exc).__name__}: {exc}")
+                        ("✗", "1;31", name, f"搜索失败 {type(error).__name__}: {error}")
                     )
                     continue
                 ranked = []
@@ -515,11 +576,14 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
                     + " "
                     + style(pad_display(ident, id_width), "36")
                 )
-                budget = screen_width() - disp_width(line) - 3
-                line += "  " + style(
-                    truncate_display(rest, max(16, budget)), "90"
-                )
-                print(line)
+                if wrap_enabled():
+                    note_col = disp_width(line) + 2
+                    chunks = wrap_display(rest, max(24, screen_width() - note_col))
+                    print(line + "  " + style(chunks[0], "90"))
+                    for chunk in chunks[1:]:
+                        print(" " * note_col + style(chunk, "90"))
+                else:
+                    print(line + "  " + style(rest, "90"))
         print()
 
     print(
@@ -533,6 +597,11 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
     )
     if errors:
         print_meta("标签", style(f"读取失败 {len(errors)} 首（详见 scan）", "33"))
+    if paused:
+        print_meta(
+            "暂停",
+            "  ·  ".join(f"{name}: {reason}" for name, reason in paused.items()),
+        )
     print()
     return 0
 

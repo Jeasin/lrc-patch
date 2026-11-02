@@ -4,6 +4,15 @@ Network failures are deliberately *not* treated as "no match": they raise
 :class:`SourceError`, which the planner stores as ``error`` and retries on the
 next run. Successful responses are cached for 30 days; failures are never
 cached, so a transient 406/429/503 cannot freeze a track for a month.
+
+Two kinds of refusal are distinguished:
+
+* **rate limit** (netease ``code 405/406/429``, HTTP 403/405/406/429) — the
+  provider is punishing this IP. The request gets one gentler retry, then the
+  whole source is parked for a few minutes so the remaining tracks fail fast
+  instead of deepening the block.
+* **overload** (HTTP 500/502/503/504) — a busy server. Normal backoff, then a
+  short cooldown after two exhausted requests.
 """
 from __future__ import annotations
 
@@ -27,12 +36,97 @@ class _Retryable(Exception):
     """Internal marker: the same request may be attempted again."""
 
 
+class _RateLimited(Exception):
+    """Internal marker: the provider is rate limiting this client."""
+
+
+class UrllibTransport:
+    """Standard-library HTTP; no external dependency, plain Python TLS."""
+
+    name = "urllib"
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 30.0,
+    ) -> tuple[int, bytes, dict[str, str]]:
+        data = urllib.parse.urlencode(body).encode() if body else None
+        request = urllib.request.Request(
+            url, data=data, headers=headers or {}, method=method
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status = int(getattr(response, "status", 200) or 200)
+                return status, response.read(), dict(getattr(response, "headers", {}) or {})
+        except urllib.error.HTTPError as exc:
+            payload = exc.read() or b""
+            return int(exc.code), payload, dict(exc.headers or {})
+
+
+class CurlTransport:
+    """curl_cffi transport: real browser TLS/JA3 fingerprint.
+
+    Cloudflare-fronted providers (LRCLIB) and netease's WAF both fingerprint
+    the TLS handshake; ``impersonate="chrome"`` makes the request look like a
+    Chrome tab. Network errors are re-raised as OSError so the retry loop and
+    the "not a no-match" rule apply unchanged.
+    """
+
+    name = "curl_cffi"
+
+    def __init__(self, impersonate: str = "chrome"):
+        from curl_cffi import requests as curl_requests
+
+        self.impersonate = impersonate
+        self._session = curl_requests.Session(impersonate=impersonate)
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 30.0,
+    ) -> tuple[int, bytes, dict[str, str]]:
+        try:
+            response = self._session.request(
+                method, url, data=body, headers=headers or {}, timeout=timeout
+            )
+        except Exception as exc:  # curl errors are not OSError subclasses
+            raise OSError(f"{type(exc).__name__}: {exc}") from exc
+        return (
+            int(response.status_code),
+            response.content or b"",
+            dict(response.headers or {}),
+        )
+
+
+def make_transport(impersonate: bool = True) -> Any:
+    """Prefer the browser-fingerprint transport; fall back silently."""
+    if impersonate:
+        try:
+            return CurlTransport()
+        except Exception:
+            pass
+    return UrllibTransport()
+
+
+RATE_LIMIT_STATUS = {403, 405, 406, 429}
+BUSY_STATUS = {500, 502, 503, 504}
+RATE_LIMIT_CODES = {"405", "406", "429"}
+BUSY_CODES = {"500", "502", "503", "504"}
+
+
 class JsonClient:
     """JSON over HTTP with per-source spacing, retry and a circuit breaker.
 
     * starts of concurrent requests are spaced by ``min_interval`` (not just
       the gaps between lock acquisitions, which allowed bursts with workers>1);
-    * 406/429 increase the spacing and back off harder;
+    * rate-limit answers increase the spacing, back off harder, and park the
+      source once the retries are exhausted;
     * two exhausted requests in one run open a cooldown for that source, so a
       blocked provider fails fast instead of stalling the whole album.
     """
@@ -40,10 +134,18 @@ class JsonClient:
     MAX_ATTEMPTS = 3
     FAILURE_THRESHOLD = 2
     BASE_COOLDOWN = 60.0
+    RATE_LIMIT_COOLDOWN = 180.0
 
-    def __init__(self, state: State, refresh: bool = False):
+    def __init__(
+        self,
+        state: State,
+        refresh: bool = False,
+        transport: Any | None = None,
+        impersonate: bool = True,
+    ):
         self.state = state
         self.refresh = refresh
+        self.transport = transport or make_transport(impersonate)
         self._last: dict[str, float] = {}
         self._lock_guard = threading.Lock()
         self._failures: dict[str, int] = {}
@@ -54,6 +156,7 @@ class JsonClient:
         self._failed_requests: dict[str, int] = {}
         self._cache_hits: dict[str, int] = {}
 
+    # -- pacing ---------------------------------------------------------
     def _reserve_slot(self, source: str, min_interval: float) -> None:
         """Reserve the next start slot so parallel workers stay spaced."""
         with self._lock_guard:
@@ -65,20 +168,31 @@ class JsonClient:
         if wait > 0:
             time.sleep(wait)
 
-    def _check_cooldown(self, source: str) -> None:
+    def cooldown(self, source: str) -> float:
         with self._lock_guard:
             until = self._cooldown_until.get(source, 0.0)
-        remaining = until - time.monotonic()
+        return max(0.0, until - time.monotonic())
+
+    def _check_cooldown(self, source: str) -> None:
+        remaining = self.cooldown(source)
         if remaining > 0:
             raise SourceError(
                 source,
-                f"{source} 暂时不可用（风控/限流），约 {remaining:.0f}s 后自动重试",
+                f"{source} 已暂停（限流/连续失败），约 {remaining:.0f}s 后自动解除；"
+                "可稍后重跑，或用 --sources 换源",
             )
+
+    def _open_breaker(self, source: str, seconds: float) -> None:
+        with self._lock_guard:
+            until = max(self._cooldown_until.get(source, 0.0), time.monotonic() + seconds)
+            self._cooldown_until[source] = until
+            self._failures[source] = 0
 
     def _note_success(self, source: str) -> None:
         with self._lock_guard:
             self._failures[source] = 0
             self._trips[source] = 0
+            self._cooldown_until.pop(source, None)
             penalty = self._penalty.get(source, 0.0)
             if penalty:
                 self._penalty[source] = max(0.0, penalty * 0.5 - 0.05)
@@ -98,7 +212,7 @@ class JsonClient:
 
     def _note_rate_limit(self, source: str) -> None:
         with self._lock_guard:
-            self._penalty[source] = min(5.0, self._penalty.get(source, 0.0) + 1.5)
+            self._penalty[source] = min(6.0, self._penalty.get(source, 0.0) + 2.0)
 
     def health(self) -> list[tuple[str, int, int, int]]:
         """(source, requests, failed requests, cooldown seconds)."""
@@ -122,6 +236,24 @@ class JsonClient:
             delay = max(delay, min(retry_after, 30.0))
         return delay + random.uniform(0.0, 0.6)
 
+    @staticmethod
+    def _headers(source: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+        headers = {
+            "User-Agent": HTTP_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        if source == "netease":
+            headers["Referer"] = "https://music.163.com/"
+            headers["Origin"] = "https://music.163.com"
+            headers["Cookie"] = "appver=2.10.13; os=osx; channel=netease"
+        elif source == "lrclib":
+            headers["Referer"] = "https://lrclib.net/"
+        if extra:
+            headers.update(extra)
+        return headers
+
+    # -- requests -------------------------------------------------------
     def get(
         self,
         source: str,
@@ -129,7 +261,23 @@ class JsonClient:
         min_interval: float,
         cache_predicate: Callable[[Any], bool] | None = None,
     ) -> tuple[int, Any | None]:
-        cache_key = sha256_text(url)
+        return self.request(
+            source, url, min_interval, cache_predicate=cache_predicate
+        )
+
+    def request(
+        self,
+        source: str,
+        url: str,
+        min_interval: float,
+        *,
+        method: str = "GET",
+        body: dict[str, Any] | None = None,
+        cache_predicate: Callable[[Any], bool] | None = None,
+        cache_extra: str = "",
+    ) -> tuple[int, Any | None]:
+        key_source = url + (f"\n{cache_extra}" if cache_extra else "")
+        cache_key = sha256_text(key_source)
         if not self.refresh:
             cached = self.state.cached_http(cache_key)
             if cached is not None:
@@ -144,32 +292,45 @@ class JsonClient:
             self._requests[source] = self._requests.get(source, 0) + 1
 
         last_error = ""
+        rate_limited = False
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             retry_after: float | None = None
             try:
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "User-Agent": HTTP_UA,
-                        "Accept": "application/json",
-                        "Referer": "https://music.163.com/"
-                        if source == "netease"
-                        else "https://lrclib.net/",
-                    },
+                status, raw, response_headers = self.transport.request(
+                    method, url, body=body, headers=self._headers(source), timeout=30.0
                 )
-                with urllib.request.urlopen(req, timeout=30) as response:
-                    raw = response.read()
+                retry_after = _retry_after_seconds(response_headers)
+                if status in (400, 404):
+                    self.state.cache_http(
+                        cache_key, {"status": status, "data": None}, 86400
+                    )
+                    self._note_success(source)
+                    return status, None
+                if status in RATE_LIMIT_STATUS:
+                    self._note_rate_limit(source)
+                    rate_limited = True
+                    raise _RateLimited(f"HTTP {status}")
+                if status in BUSY_STATUS:
+                    raise _Retryable(
+                        f"HTTP {status}" + ("（服务繁忙）" if status == 503 else "")
+                    )
+                if status >= 400:
+                    raise SourceError(
+                        source, f"{source} 请求失败: HTTP {status}", retryable=False
+                    )
                 try:
                     data = json.loads(raw.decode("utf-8", "replace"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise _Retryable(
-                        f"返回内容不是 JSON（{len(raw)} 字节）"
-                    ) from exc
+                    raise _Retryable(f"返回内容不是 JSON（{len(raw)} 字节）") from exc
                 code = data.get("code") if isinstance(data, dict) else None
                 if code is not None and str(code) != "200":
-                    if str(code) in {"406", "429"}:
+                    text = str(code)
+                    if text in RATE_LIMIT_CODES:
                         self._note_rate_limit(source)
-                        raise _Retryable(f"返回 code {code}（限流）")
+                        rate_limited = True
+                        raise _RateLimited(f"code {text}{_code_hint(data)}")
+                    if text in BUSY_CODES:
+                        raise _Retryable(f"code {text}（服务繁忙）")
                     raise SourceError(source, f"{source} 返回 code {code}")
                 if cache_predicate is None or cache_predicate(data):
                     self.state.cache_http(
@@ -177,44 +338,51 @@ class JsonClient:
                     )
                 self._note_success(source)
                 return 200, data
-            except urllib.error.HTTPError as exc:
-                if exc.code in (400, 404):
-                    self.state.cache_http(
-                        cache_key, {"status": exc.code, "data": None}, 86400
-                    )
-                    self._note_success(source)
-                    return exc.code, None
-                if exc.code in (406, 429):
-                    self._note_rate_limit(source)
-                    retry_after = _retry_after_seconds(exc)
-                elif exc.code not in (500, 502, 503, 504):
-                    raise SourceError(
-                        source, f"{source} 请求失败: HTTP {exc.code}", retryable=False
-                    ) from exc
-                last_error = f"HTTP {exc.code}"
-                if exc.code == 503:
-                    last_error += "（服务繁忙）"
+            except _RateLimited as exc:
+                last_error = str(exc)
             except _Retryable as exc:
                 last_error = str(exc)
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
             if attempt < self.MAX_ATTEMPTS:
-                time.sleep(self._backoff(attempt, retry_after))
+                delay = self._backoff(attempt, retry_after)
+                if rate_limited:
+                    # A penalty box needs a real pause; 1.5s only makes it worse.
+                    delay = max(delay, 4.0 * attempt)
+                time.sleep(delay)
 
+        if rate_limited:
+            self._open_breaker(source, self.RATE_LIMIT_COOLDOWN)
+            raise SourceError(
+                source,
+                f"{source} 限流（{last_error}），已暂停该源 "
+                f"{self.RATE_LIMIT_COOLDOWN:.0f}s",
+            )
         self._note_failure(source)
         raise SourceError(
             source, f"{source} 连续 {self.MAX_ATTEMPTS} 次失败：{last_error}"
         )
 
 
-def _retry_after_seconds(exc: urllib.error.HTTPError) -> float | None:
-    value = exc.headers.get("Retry-After") if exc.headers else None
-    if not value:
+def _code_hint(payload: Any) -> str:
+    if isinstance(payload, dict):
+        message = str(payload.get("msg") or payload.get("message") or "").strip()
+        if message:
+            return f"（{message}）"
+    return ""
+
+
+def _retry_after_seconds(headers: dict[str, str] | None) -> float | None:
+    if not headers:
         return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
+    for key, value in headers.items():
+        if str(key).lower() != "retry-after":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def netease_has_songs(payload: Any) -> bool:
@@ -223,26 +391,37 @@ def netease_has_songs(payload: Any) -> bool:
 
 
 class NeteaseSource:
+    """Search is POST /api/search/get; the old GET endpoint is deprecated.
+
+    Pacing is deliberately slow: netease answers anonymous clients with
+    ``code 405 操作频繁`` after roughly 30 fast requests and then keeps the IP
+    blocked for minutes, which is far more expensive than 1s of waiting.
+    """
+
     name = "netease"
-    min_interval = 0.35
+    min_interval = 0.9
 
     def __init__(self, client: JsonClient):
         self.client = client
 
     def search(self, track: Track) -> list[Candidate]:
-        base = "https://music.163.com/api/search/get/web?"
+        base = "https://music.163.com/api/search/get"
         queries = [f"{track.title} {track.artist}".strip()]
         if track.artist:
             queries.append(track.title)
         seen: set[str] = set()
         candidates: list[Candidate] = []
         for query in queries:
-            url = base + urllib.parse.urlencode(
-                {"s": query, "type": 1, "limit": 15, "offset": 0}
-            )
+            payload = {"s": query, "type": 1, "limit": 15, "offset": 0}
             try:
-                code, data = self.client.get(
-                    self.name, url, self.min_interval, netease_has_songs
+                code, data = self.client.request(
+                    self.name,
+                    base,
+                    self.min_interval,
+                    method="POST",
+                    body=payload,
+                    cache_predicate=netease_has_songs,
+                    cache_extra=query,
                 )
             except SourceError:
                 if candidates:
@@ -296,7 +475,7 @@ class NeteaseSource:
 
 class LrclibSource:
     name = "lrclib"
-    min_interval = 0.6
+    min_interval = 0.7
 
     def __init__(self, client: JsonClient):
         self.client = client

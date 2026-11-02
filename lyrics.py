@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script --no-project --quiet
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["mutagen>=1.47"]
+# dependencies = ["mutagen>=1.47", "curl_cffi>=0.7"]
 # ///
 """Batch lyrics planner/embedder for a local music library.
 
@@ -12,6 +12,10 @@ short intro.
 Dependencies
   * Python 3.9+ and mutagen; mutagen is declared inline (PEP 723), so the
     shebang above lets uv install it into its cache on first run.
+  * curl_cffi is optional but declared too: it sends requests with a real
+    Chrome TLS fingerprint, which Cloudflare-fronted providers prefer. If it
+    cannot be installed, delete it from the header — the tool falls back to
+    urllib automatically (and ``--no-impersonate`` forces that at runtime).
   * Everything else is the standard library, including sqlite3; the sqlite3
     command-line tool is NOT required.
   * ``python3 lyrics.py`` still works: it re-execs into an interpreter that has

@@ -4,7 +4,13 @@ from __future__ import annotations
 import sys
 
 from . import commands
-from .cli_args import COMMAND_NAMES, build_parser, normalize_argv, option_specs
+from .cli_args import (
+    COMMAND_NAMES,
+    build_parser,
+    normalize_argv,
+    option_specs,
+    reject_unknown_options,
+)
 from .config import APP_VERSION, SOURCE_NAMES, default_state_dir
 from .errors import ToolError
 from .render import print_intro, set_color, set_wrap
@@ -35,7 +41,9 @@ def main() -> int:
         parser.print_help()
         return 0
 
-    command, options, paths = normalize_argv(argv, option_specs(parser))
+    specs = option_specs(parser)
+    command, options, paths = normalize_argv(argv, specs)
+    reject_unknown_options(options, specs)
     normalized = [command or "plan", *options]
     if paths:
         normalized.extend(["--", *paths])
@@ -43,7 +51,7 @@ def main() -> int:
 
     if getattr(args, "no_color", False):
         set_color(False)
-    set_wrap(not getattr(args, "no_wrap", False))
+    set_wrap(bool(getattr(args, "wrap", False)))
     args.path = list(getattr(args, "paths", []) or [])
     state_dir = (args.state_dir or default_state_dir()).resolve()
     args.sources = [

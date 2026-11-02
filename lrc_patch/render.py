@@ -259,13 +259,19 @@ _COLOR_ENABLED = (
     and not os.environ.get("NO_COLOR")
     and os.environ.get("TERM", "") != "dumb"
 )
-_WRAP_ENABLED = True
+# Notes never wrap by default: a folded remark is easy to mistake for the next
+# track's child. ``--wrap`` opts back into window folding.
+_WRAP_ENABLED = False
 
 
 def set_wrap(enabled: bool) -> None:
-    """--no-wrap: let notes run past the window instead of folding them."""
+    """--wrap: fold long notes at the window edge (default: let them overflow)."""
     global _WRAP_ENABLED
     _WRAP_ENABLED = bool(enabled)
+
+
+def wrap_enabled() -> bool:
+    return _WRAP_ENABLED
 
 def set_color(enabled: bool) -> None:
     global _COLOR_ENABLED
@@ -515,13 +521,18 @@ def print_tree(
 
 
 class ProgressLine:
-    """Animated status line; silent when stdout is not a TTY."""
+    """Animated status line; silent when its stream is not a TTY.
+
+    ``stream`` lets a command keep machine-readable output on stdout (TSV) while
+    still showing progress on stderr.
+    """
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-    def __init__(self) -> None:
+    def __init__(self, stream=None) -> None:
+        self._stream = stream or sys.stdout
         self.enabled = (
-            sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+            self._stream.isatty() and os.environ.get("TERM", "") != "dumb"
         )
         self._visible = False
         self._text = ""
@@ -566,8 +577,8 @@ class ProgressLine:
             + self._text
             + style(f"  ·  {elapsed:.0f}s", "90")
         )
-        sys.stdout.write(line + "\033[K")
-        sys.stdout.flush()
+        self._stream.write(line + "\033[K")
+        self._stream.flush()
         self._visible = True
 
     def close(self) -> None:
@@ -578,8 +589,8 @@ class ProgressLine:
             self._thread = None
         if self.enabled and self._visible:
             with self._lock:
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
+                self._stream.write("\r\033[K")
+                self._stream.flush()
                 self._visible = False
 
 def plan_note(row: sqlite3.Row) -> str:
