@@ -9,12 +9,15 @@ from .errors import ToolError
 from .models import Candidate, FetchResult, PlanResult, Track
 from .paths import canonical_path
 from .text import (
+    album_points,
     artist_parts,
     is_placeholder,
     lrc_timestamp_issue,
     lyric_kind,
+    match_note,
     norm_loose,
     sanitize_lyrics,
+    title_points,
 )
 
 
@@ -87,11 +90,10 @@ def score_candidate(
     if diff > tolerance:
         return 0, diff
 
-    title_file = norm_loose(track.title)
-    title_cand = norm_loose(candidate.title)
-    if not title_file or title_file != title_cand:
+    title_score, _ = title_points(track.title, candidate.title)
+    if not title_score:
         return 0, diff
-    score = 55
+    score = title_score
 
     file_artists = artist_parts(track.artist)
     cand_artists = [p for a in candidate.artists for p in artist_parts(a)]
@@ -105,13 +107,8 @@ def score_candidate(
     else:
         return 0, diff
 
-    file_album = norm_loose(track.album)
-    cand_album = norm_loose(candidate.album)
-    if file_album and cand_album:
-        if file_album == cand_album:
-            score += 15
-        elif file_album in cand_album or cand_album in file_album:
-            score += 8
+    album_score, _ = album_points(track.album, candidate.album)
+    score += album_score
     return score, diff
 
 def choose_candidate(
@@ -353,13 +350,17 @@ def plan_one(
         if kind == "plain" and not allow_plain:
             notes.append(f"{source.name}: 仅纯文本，已按 --no-plain 跳过")
             continue
+        note = match_note(track, candidate)
+        reason = f"{kind.upper()} / {candidate.artist_text}"
+        if note:
+            reason += f" · {note}"
         return plan_from_lyrics(
             track,
             candidate,
             fetched.lyrics,
             score,
             diff,
-            f"{kind.upper()} / {candidate.artist_text}",
+            reason,
             check_timestamps,
         )
 

@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
+from .config import SCORING_VERSION
 from .errors import ToolError
 from .models import PlanResult
 from .text import lyric_hash, lyric_kind, lyrics_line_count, utc_now
@@ -119,6 +120,10 @@ class State:
                     ttl REAL NOT NULL,
                     payload TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
             # 1.6 and earlier stored provider failures as no_match. Reclassify
@@ -137,6 +142,23 @@ class State:
                 )
                 """
             )
+            # A new scoring rule invalidates previous "needs review" verdicts:
+            # retry them once so the user does not have to know about
+            # --retry-failed after an upgrade.
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='scoring_version'"
+            ).fetchone()
+            if not row or row["value"] != SCORING_VERSION:
+                conn.execute(
+                    "UPDATE plans SET status='error', "
+                    "reason='匹配规则已更新，等待重新匹配' "
+                    "WHERE status IN ('ambiguous','suspect')"
+                )
+                conn.execute(
+                    "INSERT INTO meta(key,value) VALUES('scoring_version',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (SCORING_VERSION,),
+                )
 
     def cached_http(self, key: str) -> Any | None:
         with self.connection() as conn:

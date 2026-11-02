@@ -20,7 +20,12 @@ from lrc_patch.errors import SourceError, ToolError
 from lrc_patch.matching import keep_previous_plan, plan_one, score_candidate
 from lrc_patch.models import Candidate, Track, TreeEntry
 from lrc_patch.state import State
-from lrc_patch.text import lrc_timestamp_issue, sha256_text
+from lrc_patch.text import (
+    lrc_timestamp_issue,
+    match_note,
+    sha256_text,
+    strip_edition,
+)
 
 
 def make_track(**overrides) -> Track:
@@ -70,6 +75,17 @@ class DefaultsTests(unittest.TestCase):
     def test_known_options_pass(self) -> None:
         specs = option_specs(build_parser())
         reject_unknown_options(["--workers", "2", "--pick", "netease:1"], specs)
+
+    def test_lrclib_is_not_a_default_source(self) -> None:
+        args = build_parser().parse_args(["plan"])
+        self.assertEqual(args.sources, "netease")
+
+    def test_pick_then_apply_is_one_command(self) -> None:
+        args = build_parser().parse_args(
+            ["plan", "--pick", "netease:1", "--apply", "A"]
+        )
+        self.assertTrue(args.apply)
+        self.assertEqual(args.paths, ["A"])
 
 
 class NormalizeTests(unittest.TestCase):
@@ -165,6 +181,63 @@ class MatchingTests(unittest.TestCase):
         self.assertFalse(lrc_timestamp_issue(good, 200.0))
         self.assertIn("超过", lrc_timestamp_issue("[00:10.00]a\n[05:00.00]b", 200.0))
         self.assertIn("TV size", lrc_timestamp_issue("[00:10.00]a\n[00:30.00]b", 200.0))
+
+
+class VersionScoringTests(unittest.TestCase):
+    """Version suffixes must not wipe out the right candidate."""
+
+    def setUp(self) -> None:
+        self.track = make_track(
+            title="Beautiful World",
+            artist="宇多田ヒカル",
+            album="One Last Kiss",
+            duration=358.9,
+        )
+
+    def _score(self, title: str, album: str = "One Last Kiss", duration: float = 359.0) -> int:
+        candidate = Candidate(
+            "netease", "1", title, ["宇多田ヒカル"], album, duration
+        )
+        return score_candidate(self.track, candidate)[0]
+
+    def test_version_suffix_matches_with_album(self) -> None:
+        self.assertEqual(self._score("Beautiful World (Da Capo Version)"), 87)
+
+    def test_instrumental_variant_is_rejected(self) -> None:
+        self.assertEqual(
+            self._score("Beautiful World (Da Capo Version [Instrumental])"), 0
+        )
+
+    def test_feat_variant_stays_below_threshold(self) -> None:
+        self.assertEqual(self._score("Beautiful World (feat. Someone)"), 75)
+
+    def test_album_edition_is_only_three_points_lower(self) -> None:
+        self.assertEqual(self._score("Beautiful World", "One Last Kiss (Deluxe)"), 97)
+
+    def test_symbol_album_with_edition(self) -> None:
+        track = make_track(
+            title="Tides", artist="Ed Sheeran", album="= (Tour Edition)", duration=195.8
+        )
+        candidate = Candidate(
+            "netease", "1", "Tides", ["Ed Sheeran"], "= (Christmas Edition)", 195.8
+        )
+        self.assertEqual(score_candidate(track, candidate)[0], 97)
+
+    def test_match_note_explains_the_deduction(self) -> None:
+        candidate = Candidate(
+            "netease",
+            "1",
+            "Beautiful World (Da Capo Version)",
+            ["宇多田ヒカル"],
+            "One Last Kiss",
+            359.0,
+        )
+        self.assertIn("Da Capo Version", match_note(self.track, candidate))
+
+    def test_album_year_prefix_and_bare_year(self) -> None:
+        self.assertEqual(strip_edition("(2021)One Last Kiss"), "One Last Kiss")
+        self.assertEqual(strip_edition("1989"), "1989")
+        self.assertEqual(strip_edition("1989 (Deluxe Edition)"), "1989")
 
 
 class TreeAlignmentTests(unittest.TestCase):
@@ -350,6 +423,35 @@ class JsonClientTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(data["result"]["songs"][0]["id"], 1)
         self.assertIsNotNone(self.state.cached_http(sha256_text(url)))
+
+
+    def test_empty_search_is_cached_for_a_day(self) -> None:
+        """candidates then plan must not ask the same empty query twice."""
+
+        class Response:
+            def read(self) -> bytes:
+                return b'{"code": 200, "result": {"songs": []}}'
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+        url = "https://music.163.com/api/search/get"
+        with mock.patch.object(
+            sources.urllib.request, "urlopen", lambda request, timeout=30: Response()
+        ):
+            client = sources.JsonClient(
+                self.state, transport=sources.UrllibTransport()
+            )
+            code, _ = client.get(
+                "netease", url, 0.0, cache_predicate=sources.netease_cache_ttl
+            )
+        self.assertEqual(code, 200)
+        cached = self.state.cached_http(sha256_text(url))
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["data"]["result"]["songs"], [])
 
 
 if __name__ == "__main__":

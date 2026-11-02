@@ -52,6 +52,169 @@ def artist_parts(text: str) -> list[str]:
     parts = re.split(r"[,/&、;]|\bfeat\.?\b|\bft\.?\b|\bx\b", raw)
     return [p for p in (norm_loose(x) for x in parts) if p]
 
+
+# -- title / album comparison -------------------------------------------
+#
+# Providers decorate titles in ways that do not change the lyrics:
+# "Beautiful World (Da Capo Version)" is the same song as "Beautiful World"
+# on that album, while "(feat. X)" and language variants are different
+# recordings.  The helpers below separate the base title from its trailing
+# decorations and score the difference, so a version suffix no longer wipes
+# out an otherwise perfect match.
+
+_TITLE_BRACKET_RE = re.compile(r"[\(\[（【]([^\)\]）】]*)[\)\]）】]")
+_TITLE_DASH_RE = re.compile(r"\s+[-–—]\s+(.+)$")
+_ALBUM_BRACKET_RE = re.compile(r"\s*[\(\[（【]([^\)\]）】]*)[\)\]）】]\s*$")
+_ALBUM_DASH_RE = re.compile(r"\s+[-–—]\s+(.+)$")
+_ALBUM_YEAR_RE = re.compile(
+    r"^\s*(?:[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]\s*|(?:19|20)\d{2}\s*[-–—.:]\s*)"
+)
+
+_VERSION_TOKENS = {
+    "version", "ver", "remaster", "remastered", "remix", "live", "acoustic",
+    "extended", "demo", "mono", "stereo", "instrumental", "inst", "karaoke",
+    "dacapo", "reprise", "orchestra", "orchestral", "piano", "anniversary",
+    "deluxe", "edition", "soundtrack", "rerecorded", "tv",
+}
+_INSTRUMENTAL_TOKENS = {"instrumental", "inst", "karaoke"}
+_FEAT_TOKENS = {"feat", "ft", "featuring", "duet"}
+_LANGUAGE_TOKENS = {
+    "english", "japanese", "chinese", "korean", "jpn", "eng", "chi", "kor",
+    "mandarin", "cantonese",
+}
+_EDITION_TOKENS = {
+    "edition", "deluxe", "remaster", "remastered", "special", "expanded",
+    "tour", "bonus", "anniversary", "explicit", "digital", "international",
+    "japan", "japanese", "christmas", "holiday", "mono", "stereo", "reissue",
+    "collector", "limited", "complete",
+}
+_CJK_VERSION = (
+    "バージョン", "リマスター", "ライブ", "アコースティック", "インスト",
+    "カラオケ", "オフボーカル", "ピアノ", "オーケストラ", "版本", "重制",
+)
+_CJK_INSTRUMENTAL = ("インスト", "オフボーカル", "カラオケ", "伴奏", "纯音乐", "純音樂")
+_CJK_LANGUAGE = ("日本語", "英語", "中文", "國語", "粤语", "韓国語", "한국어")
+_CJK_EDITION = ("版", "盤", "盘")
+
+
+def _latin_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z]+", unicodedata.normalize("NFKC", text or "").casefold()))
+
+
+def _has_version(text: str) -> bool:
+    tokens = _latin_tokens(text)
+    if tokens & _VERSION_TOKENS:
+        return True
+    compact = re.sub(r"[^a-z]+", "", unicodedata.normalize("NFKC", text or "").casefold())
+    if "offvocal" in compact or "tvsize" in compact:
+        return True
+    return any(word in (text or "") for word in _CJK_VERSION)
+
+
+def _has_instrumental(text: str) -> bool:
+    if _latin_tokens(text) & _INSTRUMENTAL_TOKENS:
+        return True
+    compact = re.sub(r"[^a-z]+", "", text or "")
+    if "offvocal" in compact:
+        return True
+    return any(word in (text or "") for word in _CJK_INSTRUMENTAL)
+
+
+def _has_feat(text: str) -> bool:
+    return bool(_latin_tokens(text) & _FEAT_TOKENS)
+
+
+def _languages(text: str) -> set[str]:
+    found = set(_latin_tokens(text) & _LANGUAGE_TOKENS)
+    found.update(word for word in _CJK_LANGUAGE if word in (text or ""))
+    return found
+
+
+def split_title(text: str) -> tuple[str, str]:
+    """Return (base, decorations) for ``Beautiful World (Da Capo Version)``."""
+    raw = unicodedata.normalize("NFKC", text or "")
+    decorations = _TITLE_BRACKET_RE.findall(raw)
+    base = _TITLE_BRACKET_RE.sub(" ", raw)
+    match = _TITLE_DASH_RE.search(base)
+    if match and (_has_version(match.group(1)) or _has_feat(match.group(1))):
+        decorations.append(match.group(1))
+        base = base[: match.start()]
+    return norm_loose(base), " ".join(part.strip() for part in decorations if part.strip())
+
+
+def title_points(file_title: str, candidate_title: str) -> tuple[int, str]:
+    """Points for the title alone, plus a human note when it is not exact.
+
+    55 exact / 42 version suffix / 35 other suffix / 30 featuring differs /
+    0 incompatible (different base, instrumental or language variant).
+    """
+    file_base, file_dec = split_title(file_title)
+    cand_base, cand_dec = split_title(candidate_title)
+    if not file_base or not cand_base:
+        return 0, ""
+    if norm_loose(file_title) == norm_loose(candidate_title):
+        return 55, ""
+    if file_base != cand_base:
+        return 0, ""
+
+    if _has_instrumental(file_dec) != _has_instrumental(cand_dec):
+        return 0, "纯音乐版本不同"
+    file_lang, cand_lang = _languages(file_dec), _languages(cand_dec)
+    if file_lang and cand_lang and file_lang != cand_lang:
+        return 0, "语言版本不同"
+    if _has_feat(file_dec) != _has_feat(cand_dec):
+        return 30, "合作者不同"
+
+    detail = cand_dec or file_dec
+    if _has_version(file_dec) or _has_version(cand_dec):
+        return 42, f"标题版本变体（{detail}）" if detail else "标题版本变体"
+    return 35, f"标题附加信息（{detail}）" if detail else "标题附加信息"
+
+
+def _is_edition(text: str) -> bool:
+    if _latin_tokens(text) & _EDITION_TOKENS:
+        return True
+    return any(word in (text or "") for word in _CJK_EDITION)
+
+
+def strip_edition(text: str) -> str:
+    """Drop ``(2021)`` prefixes and ``(Deluxe Edition)`` style suffixes."""
+    value = unicodedata.normalize("NFKC", text or "").strip()
+    value = _ALBUM_YEAR_RE.sub("", value)
+    while True:
+        match = _ALBUM_BRACKET_RE.search(value)
+        if not match or not _is_edition(match.group(1)):
+            break
+        value = value[: match.start()].strip()
+    match = _ALBUM_DASH_RE.search(value)
+    if match and _is_edition(match.group(1)):
+        value = value[: match.start()].strip()
+    return value
+
+
+def album_points(file_album: str, candidate_album: str) -> tuple[int, str]:
+    """15 exact / 12 same album in another edition / 8 containment / 0 none."""
+    file_norm = norm_loose(file_album)
+    cand_norm = norm_loose(candidate_album)
+    if not file_norm or not cand_norm:
+        return 0, ""
+    if file_norm == cand_norm:
+        return 15, ""
+    file_base = strip_edition(file_album)
+    cand_base = strip_edition(candidate_album)
+    if file_base and cand_base and norm_text(file_base) == norm_text(cand_base):
+        return 12, "专辑版本不同"
+    if file_norm in cand_norm or cand_norm in file_norm:
+        return 8, "专辑名相近"
+    return 0, ""
+
+
+def match_note(track: "Any", candidate: "Any") -> str:
+    """Short explanation of every non-exact field, for review output."""
+    _, title_note = title_points(track.title, candidate.title)
+    _, album_note = album_points(track.album, candidate.album)
+    return " · ".join(note for note in (title_note, album_note) if note)
+
 def sanitize_lyrics(text: str) -> str:
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
     return text.strip() + "\n" if text.strip() else ""

@@ -229,6 +229,11 @@ class JsonClient:
                 for name in names
             ]
 
+    def cache_hits(self) -> int:
+        """Requests answered from the shared HTTP cache instead of the network."""
+        with self._lock_guard:
+            return sum(self._cache_hits.values())
+
     @staticmethod
     def _backoff(attempt: int, retry_after: float | None = None) -> float:
         delay = min(20.0, 1.5 * (2 ** (attempt - 1)))
@@ -259,7 +264,7 @@ class JsonClient:
         source: str,
         url: str,
         min_interval: float,
-        cache_predicate: Callable[[Any], bool] | None = None,
+        cache_predicate: Callable[[Any], bool | float] | None = None,
     ) -> tuple[int, Any | None]:
         return self.request(
             source, url, min_interval, cache_predicate=cache_predicate
@@ -273,7 +278,7 @@ class JsonClient:
         *,
         method: str = "GET",
         body: dict[str, Any] | None = None,
-        cache_predicate: Callable[[Any], bool] | None = None,
+        cache_predicate: Callable[[Any], bool | float] | None = None,
         cache_extra: str = "",
     ) -> tuple[int, Any | None]:
         key_source = url + (f"\n{cache_extra}" if cache_extra else "")
@@ -332,9 +337,17 @@ class JsonClient:
                     if text in BUSY_CODES:
                         raise _Retryable(f"code {text}（服务繁忙）")
                     raise SourceError(source, f"{source} 返回 code {code}")
-                if cache_predicate is None or cache_predicate(data):
+                if cache_predicate is None:
+                    ttl = 30 * 86400
+                else:
+                    verdict = cache_predicate(data)
+                    if isinstance(verdict, bool):
+                        ttl = 30 * 86400 if verdict else 0
+                    else:
+                        ttl = float(verdict)
+                if ttl:
                     self.state.cache_http(
-                        cache_key, {"status": 200, "data": data}, 30 * 86400
+                        cache_key, {"status": 200, "data": data}, ttl
                     )
                 self._note_success(source)
                 return 200, data
@@ -385,9 +398,16 @@ def _retry_after_seconds(headers: dict[str, str] | None) -> float | None:
     return None
 
 
-def netease_has_songs(payload: Any) -> bool:
-    """Do not freeze a transient empty search response in the 30-day cache."""
-    return bool(((payload or {}).get("result") or {}).get("songs"))
+def netease_cache_ttl(payload: Any) -> float:
+    """Cache a search for 30 days when it found songs, 1 day when it did not.
+
+    An empty answer is a valid result, not a provider outage, so caching it
+    saves candidates-then-plan from asking twice.  It gets a shorter TTL than
+    a hit because new uploads do change the answer.  Failures are never
+    cached at all.
+    """
+    songs = ((payload or {}).get("result") or {}).get("songs")
+    return 30 * 86400 if songs else 86400
 
 
 class NeteaseSource:
@@ -420,7 +440,7 @@ class NeteaseSource:
                     self.min_interval,
                     method="POST",
                     body=payload,
-                    cache_predicate=netease_has_songs,
+                    cache_predicate=netease_cache_ttl,
                     cache_extra=query,
                 )
             except SourceError:
@@ -491,7 +511,11 @@ class LrclibSource:
             self.name,
             url,
             self.min_interval,
-            cache_predicate=lambda payload: isinstance(payload, list),
+            cache_predicate=lambda payload: (
+                0
+                if not isinstance(payload, list)
+                else (30 * 86400 if payload else 86400)
+            ),
         )
         if code == 404:
             return []

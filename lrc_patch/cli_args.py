@@ -6,7 +6,12 @@ import difflib
 import shutil
 from pathlib import Path
 
-from .config import APP_VERSION, DEFAULT_DURATION_TOLERANCE, DEFAULT_LIBRARY
+from .config import (
+    APP_VERSION,
+    DEFAULT_DURATION_TOLERANCE,
+    DEFAULT_LIBRARY,
+    DEFAULT_SOURCES,
+)
 from .errors import ToolError
 
 
@@ -31,7 +36,33 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter):
         return super()._format_action(action)
 
 
-MAIN_EPILOG = """\
+def _disp_width(text: str) -> int:
+    import unicodedata
+
+    return sum(2 if unicodedata.east_asian_width(ch) in "FW" else 1 for ch in text)
+
+
+_EXAMPLES = [
+    ('lyrics.py "結束バンド"', "拖入目录 = 只读 plan"),
+    ('lyrics.py --lrc "Ado" "YOASOBI"', "选项在前；一次多个目录"),
+    ('lyrics.py candidates "Ado" --top 3', "看候选 ID"),
+    ('lyrics.py "Ado/某首.m4a" --pick netease:123', "人工指定后重新 plan"),
+    ('lyrics.py "Ado/某首.m4a" --pick netease:123 --apply', "选中并直接写入"),
+    ('lyrics.py apply "Ado"', "只写 ✓ 可写入"),
+    ('lyrics.py verify "Ado"', "写入后复核"),
+    ('lyrics.py rollback "Ado" --yes', "回滚"),
+]
+
+
+def _example_block() -> str:
+    width = max(_disp_width(command) for command, _ in _EXAMPLES)
+    return "\n".join(
+        "  " + command + " " * (width - _disp_width(command) + 2) + note
+        for command, note in _EXAMPLES
+    )
+
+
+MAIN_EPILOG = f"""\
 用法
   lyrics.py [命令] [选项] [路径 ...]
   命令可省略（默认 plan，只读）。选项和路径顺序随意；路径可以一次拖入多个
@@ -46,28 +77,33 @@ MAIN_EPILOG = """\
   rollback    移除本工具写入且之后未被改动的歌词
 
 示例
-  lyrics.py "結束バンド"                       拖入目录 = 只读 plan
-  lyrics.py --lrc "Ado" "YOASOBI"              选项在前；一次多个目录
-  lyrics.py candidates "Ado" --top 3           看候选 ID
-  lyrics.py "Ado/某首.m4a" --pick netease:123  人工指定后重新 plan
-  lyrics.py apply "Ado"                        只写 ✓ 可写入
-  lyrics.py verify "Ado"                       写入后复核
-  lyrics.py rollback "Ado" --yes               回滚
+{_example_block()}
 
 匹配与打分
-  每首曲目按标题、艺术家、专辑、时长打分，满分 100；≥85 才会自动写入。
+  按标题、艺术家、专辑、时长打分，满分 100；≥85 自动写入，否则 ! 需确认。
 
-  标题      归一化后完全相同 +55；不同则直接淘汰（0 分）
-  艺术家    完全相同 +30；包含关系（"A feat. B" ⊃ "A"）+20；无关则淘汰
-  专辑      完全相同 +15；包含关系 +8；任一方为空则不加分
-  时长      与本地文件的差值超过容差（默认 2s）直接淘汰，不参与打分
+  标题      完全相同 +55
+            仅版本后缀不同 +42（Live / Remaster / Da Capo Version / TV Size …）
+            仅合作者不同 +30（feat. / duet）
+            其它附加后缀 +35
+            标题主体不同、纯音乐相反、语言版本相反 → 淘汰（0 分）
+
+  艺术家    完全相同 +30；包含关系（"A feat. B" ⊃ "A"）+20；无关 → 淘汰
+  专辑      完全相同 +15；同一专辑的另一个版本（Deluxe / Tour / Remaster…）+12；
+            包含关系 +8；缺失或不同不加分
+  时长      差值超过容差（默认 2s）直接淘汰，不参与打分
+
+  专辑只做佐证，不压倒标题：版本变体的标题（+42）必须专辑也对得上才够 85。
+  反过来，Deluxe 版专辑只比完全相同的专辑少 3 分，不会因为版本名不同而丢候选。
 
   常见组合
     100分   标题 + 艺术家 + 专辑全中
-     93分   标题 + 艺术家全中，专辑名互为包含
-     90分   艺术家是包含关系，专辑全中
+     97分   专辑只是 Deluxe / Tour 等版本
+     93分   专辑名互为包含
+     87分   标题是版本变体，专辑对得上（Beautiful World → Da Capo Version）
      85分   标题 + 艺术家全中，没有专辑信息（刚过阈值）
-     83分   艺术家包含 + 专辑包含：不足 85，落到 ! 需确认
+     84分   标题是版本变体但专辑只是版本相近：不足 85，落到 ! 需确认
+     75分   合作者不同（feat. 版本）：一律 ! 需确认
 
   排序      先按不含时长的元数据分，再按含时长的分，再按时长差，最后偏好带 LRC 的
   待确认    分数不足 85，或时长差超过容差。用 candidates 看全部候选，再 --pick 指定。
@@ -81,19 +117,23 @@ MAIN_EPILOG = """\
   ✓ 已写入      已写入并通过逐项校验
   ! 需确认      分数不足 85 或时长差超容差，apply 不写
   ! 时间轴可疑  LRC 末尾时间戳与音频时长不符，apply 不写
-  ✗ 无匹配      两个源都正常回答，确实没有这首歌
+  ✗ 无匹配      启用的源都正常回答，确实没有这首歌
   ✗ 失败        请求没成功（限流/超时/服务过载），下次运行自动重试
   · 已有歌词    不覆盖
   ♪ 纯音乐      源标记为 instrumental
 
 网络
-  netease 约 0.9s 一次、lrclib 约 0.7s 一次；并发不会突破这个最小间隔。
+  默认只用 netease（约 0.9s 一次，并发不会突破最小间隔）。lrclib 近期持续
+  503/429，已改为可选：加 --sources netease,lrclib 才启用（它的 instrumental
+  标记仍能识别纯音乐）。
   被限流（netease code 405/406、HTTP 429）时先放慢重试，仍失败就暂停该源约
   180s，其余曲目立即失败而不是继续撞墙；稍后重跑同一条命令会自动重试。
   服务过载（HTTP 500/502/503/504）走退避，两次耗尽后暂停 60s 起。
   请求失败记为 ✗ 失败，不是「无匹配」，不写 30 天缓存，也不覆盖已有的 ✓ 计划。
+  plan 与 candidates 共用同一个 HTTP 缓存：candidates 查过的搜索，plan 不再请求；
+  plan 只额外取一次选中候选的歌词。想强制重查加 --refresh。
   装了 curl_cffi 就默认用它的浏览器 TLS 指纹发请求（对 Cloudflare 更友好）；
-  想退回标准库加 --no-impersonate。只想跑一个源用 --sources netease。
+  想退回标准库加 --no-impersonate。
 
 环境
   Python 3.9+；依赖 mutagen（写标签），可选 curl_cffi（浏览器指纹）。
@@ -109,10 +149,12 @@ PLAN_EPILOG = """\
   lyrics.py "米津玄師" --lrc --lrc-dir ~/.cache/lrc-patch/lrc
   lyrics.py "結束バンド" --html
   lyrics.py "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467
+  lyrics.py "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467 --apply
 
 说明
   plan 只读：不写音频，只更新状态数据库、CSV 和可选的 HTML 复核页。
   ≥85 分且时长在容差内才判 ✓ 可写入；其余是 ! 需确认，需人工 --pick。
+  --apply 会在 plan 之后直接写本次的 ✓；! 需确认、✗ 失败/无匹配仍不会写入。
   打分规则见 lyrics.py -h 的「匹配与打分」。
   请求失败（✗）不是结论，下次 plan 会自动重试；也可 --retry-failed 重查其余失败类。
 """
@@ -279,8 +321,8 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument(
         "--sources",
         metavar="LIST",
-        default="netease,lrclib",
-        help="歌词源顺序，逗号分隔（默认 netease,lrclib）",
+        default=",".join(DEFAULT_SOURCES),
+        help="歌词源，逗号分隔（默认 netease；lrclib 可选但近期常不可用）",
     )
     plan.add_argument(
         "--workers", type=int, metavar="N", default=4, help="查询并发 1..10（默认 4）"
@@ -304,6 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="FILE",
         help="批量人工指定：每行 曲目路径<TAB>SOURCE:ID",
+    )
+    plan.add_argument(
+        "--apply",
+        action="store_true",
+        help="plan 完成后立即写入本次 ✓ 可写入的曲目（等价于 plan && apply）",
     )
     plan.add_argument(
         "--duration-tolerance",
@@ -355,8 +402,8 @@ def build_parser() -> argparse.ArgumentParser:
     candidates.add_argument(
         "--sources",
         metavar="LIST",
-        default="netease,lrclib",
-        help="歌词源顺序，逗号分隔（默认 netease,lrclib）",
+        default=",".join(DEFAULT_SOURCES),
+        help="歌词源，逗号分隔（默认 netease；lrclib 可选但近期常不可用）",
     )
     candidates.add_argument(
         "--top", type=int, metavar="N", default=3, help="每源最多显示 N 条"

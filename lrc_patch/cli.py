@@ -80,7 +80,15 @@ def main() -> int:
     with state_lock(state_dir):
         state = State(state_dir / "lyrics.sqlite3")
         if args.command == "plan":
-            return commands.cmd_plan(args, state, state_dir)
+            code = commands.cmd_plan(args, state, state_dir)
+            if code == 0 and getattr(args, "apply", False):
+                # One-shot review-then-write: the plan has just been printed, so
+                # the user has seen exactly which tracks are ready.
+                args.report = None
+                args.no_preflight = False
+                args.progress_every = 10
+                return commands.cmd_apply(args, state, state_dir)
+            return code
         if args.command == "candidates":
             return commands.cmd_candidates(args, state)
         if args.command == "apply":

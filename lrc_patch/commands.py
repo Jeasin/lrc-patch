@@ -61,7 +61,7 @@ from .render import (
 )
 from .sources import JsonClient, build_sources
 from .state import State
-from .text import lyric_hash, lyric_kind
+from .text import lyric_hash, lyric_kind, match_note
 
 
 def summarize_plans(rows: list[sqlite3.Row]) -> Counter:
@@ -207,8 +207,8 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     if retrying:
         print_meta(
             "重试",
-            f"{retrying} 首上次请求失败"
-            + style("（网络/风控失败不作为结论，本次自动重查）", "90"),
+            f"{retrying} 首上次未完成"
+            + style("（失败或匹配规则更新，本次自动重查）", "90"),
         )
     if picks:
         ignored = sum(1 for track in tracks if str(track.path) in picks and track.has_lyrics)
@@ -338,6 +338,7 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     print_meta("报告", short_path(report))
     print_meta("状态", short_path(state.path))
     health = client.health()
+    hits = client.cache_hits()
     if pending:
         network = [item for item in health if item[1]]
         if network:
@@ -349,12 +350,15 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                 if cooldown:
                     text += f" 冷却 {cooldown}s"
                 bits.append(text)
+            if hits:
+                bits.append(f"缓存命中 {hits}")
             transport = getattr(getattr(client, "transport", None), "name", "")
             if transport:
                 bits.append(f"传输 {transport}")
             print_meta("请求", "  ·  ".join(bits))
         else:
-            print_meta("网络", "全部命中本地缓存，未发起请求")
+            suffix_text = f"（命中 {hits} 次）" if hits else ""
+            print_meta("网络", "全部命中本地缓存，未发起请求" + suffix_text)
     elif reused:
         print_meta("网络", "未发起请求，全部复用已有计划")
 
@@ -373,7 +377,11 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             "  "
             + style("指定", "90")
             + "  选中后："
-            + style(f"lyrics.py{suffix} --pick netease:歌曲ID", "36")
+            + style(
+                f"lyrics.py{suffix} --pick netease:歌曲ID"
+                + (" --apply" if getattr(args, "apply", False) else ""),
+                "36",
+            )
         )
         print()
     if summary.get("error", 0):
@@ -394,12 +402,21 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                 + " 暂时只用正常的源，避免等待失败源。"
             )
             print()
-    print(
-        "  "
-        + style("未修改任何音频文件。", "32")
-        + "确认后运行 "
-        + style(f"lyrics.py apply{suffix}", "36")
-    )
+    if getattr(args, "apply", False):
+        print(
+            "  "
+            + style("计划已生成。", "32")
+            + "接下来直接写入本次 "
+            + style("✓ 可写入", "1;32")
+            + " 的曲目；! 需确认和 ✗ 失败不会写入。"
+        )
+    else:
+        print(
+            "  "
+            + style("未修改任何音频文件。", "32")
+            + "确认后运行 "
+            + style(f"lyrics.py apply{suffix}", "36")
+        )
     print()
     return 0
 
@@ -561,6 +578,9 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
                         f"{score_text} {diff_text} {pad_display(kind, 6)}"
                         f"  {candidate.title} — {candidate.artist_text} / {candidate.album}"
                     )
+                    note = match_note(track, candidate)
+                    if note:
+                        rest += f"  ·  {note}"
                     rows.append(
                         (
                             symbol,
@@ -607,6 +627,9 @@ def cmd_candidates(args: argparse.Namespace, state: State) -> int:
             "暂停",
             "  ·  ".join(f"{name}: {reason}" for name, reason in paused.items()),
         )
+    hits = client.cache_hits()
+    if hits:
+        print_meta("缓存", f"命中 {hits} 次；plan 会直接复用这些搜索结果，不再请求")
     print()
     return 0
 

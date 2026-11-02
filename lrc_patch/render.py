@@ -607,6 +607,11 @@ def plan_note(row: sqlite3.Row) -> str:
         kind = str(row["lyric_kind"] or "").upper()
         if kind:
             bits.append(f"{kind} {row['lyric_lines']}行" if row["lyric_lines"] else kind)
+        reason = str(row["reason"] or "")
+        if " · " in reason:
+            note = reason.split(" · ", 1)[1].strip()
+            if note:
+                bits.append(note)
         return " · ".join(bits) or "匹配通过"
     if status == "skip_existing":
         return "已有歌词，未覆盖"
