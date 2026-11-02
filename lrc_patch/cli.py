@@ -56,12 +56,25 @@ def main() -> int:
         set_color(False)
     args.path = list(getattr(args, "paths", []) or [])
     state_dir = (args.state_dir or default_state_dir()).resolve()
-    args.sources = [
-        item.strip() for item in getattr(args, "sources", "").split(",") if item.strip()
+    args.src = [
+        item.strip() for item in getattr(args, "src", "").split(",") if item.strip()
     ]
-    unknown = set(args.sources) - SOURCE_NAMES
+    unknown = set(args.src) - SOURCE_NAMES
     if unknown:
         parser.error(f"未知歌词源: {', '.join(sorted(unknown))}")
+    # Exactly one verbatim-format flag may be set (argparse enforces this);
+    # fold it into a single target-format string for the sources.
+    target = next(
+        (name for name in ("a2", "eslrc", "yrc", "qrc", "ttml") if getattr(args, name, False)),
+        None,
+    )
+    args.target_format = target
+    # Private formats are native to exactly one source; refuse a source list
+    # that cannot produce them instead of silently downgrading.
+    if target == "qrc" and "qq" not in args.src:
+        parser.error("--qrc 是 QQ 音乐的私有逐字格式，请用 --src 包含 qq（或改用 --a2/--eslrc/--ttml）")
+    if target == "yrc" and "netease" not in args.src:
+        parser.error("--yrc 是网易云的私有逐字格式，请用 --src 包含 netease（或改用 --a2/--eslrc/--ttml）")
     if getattr(args, "workers", 1) < 1 or getattr(args, "workers", 1) > 10:
         parser.error("workers 必须在 1..10 之间")
     tolerance = getattr(args, "duration_tolerance", None)

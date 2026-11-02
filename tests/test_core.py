@@ -90,9 +90,9 @@ class DefaultsTests(unittest.TestCase):
         specs = option_specs(build_parser())
         reject_unknown_options(["--tree-limit", "-1"], specs)
 
-    def test_lrclib_is_not_a_default_source(self) -> None:
+    def test_default_source_is_netease_plus_qq_fallback(self) -> None:
         args = build_parser().parse_args(["plan"])
-        self.assertEqual(args.sources, "netease")
+        self.assertEqual(args.src, "netease,qq")
 
     def test_pick_then_apply_is_one_command(self) -> None:
         args = build_parser().parse_args(
@@ -723,9 +723,13 @@ class LyricFormatTests(unittest.TestCase):
         self.assertEqual(lyric_kind("just words\nno timing"), "plain")
         self.assertEqual(lyric_kind("[00:12.34]line\n[00:15.00]two"), "lrc")
         self.assertEqual(
-            lyric_kind("[00:12.34]<00:12.34>word <00:12.80>two"), "enhanced"
+            lyric_kind("[00:12.34]<00:12.34>word <00:12.80>two"), "a2"
+        )
+        self.assertEqual(
+            lyric_kind("[00:12.34]你好[00:13.00]世界"), "eslrc"
         )
         self.assertEqual(lyric_kind("[1234,567](1234,567,0)word"), "yrc")
+        self.assertEqual(lyric_kind("[1234,567]word(1234,567)"), "qrc")
         self.assertEqual(
             lyric_kind('<?xml version="1.0"?><tt xmlns="http://www.w3.org/ns/ttml">'),
             "ttml",
@@ -734,12 +738,16 @@ class LyricFormatTests(unittest.TestCase):
     def test_tags_and_colours_differ(self) -> None:
         self.assertEqual(lyric_tag("plain"), "TXT")
         self.assertEqual(lyric_tag("lrc"), "LRC")
-        self.assertEqual(lyric_tag("enhanced"), "LRC+")
+        self.assertEqual(lyric_tag("a2"), "A2")
+        self.assertEqual(lyric_tag("eslrc"), "ESLRC")
+        self.assertEqual(lyric_tag("yrc"), "YRC")
+        self.assertEqual(lyric_tag("qrc"), "QRC")
+        self.assertEqual(lyric_tag("ttml"), "TTML")
         colours = {
             render.LYRIC_COLORS[kind]
-            for kind in ("plain", "lrc", "enhanced", "yrc", "ttml")
+            for kind in ("plain", "lrc", "a2", "eslrc", "yrc", "qrc", "ttml")
         }
-        self.assertEqual(len(colours), 5)
+        self.assertEqual(len(colours), 7)
 
     def test_timeline_check_skips_advanced_formats(self) -> None:
         yrc = "[1000,500](1000,500,0)word"
@@ -869,13 +877,13 @@ class QrcDecryptTests(unittest.TestCase):
         enhanced = qrc_mod.qrc_to_enhanced(qrc_text)
         self.assertIn("[ti:Hz(ヘルツ)]", enhanced)
 
-    def test_enhanced_is_detected_as_enhanced_kind(self) -> None:
-        enhanced = "[00:00.00]<00:00.00>我<00:00.20>爱"
-        self.assertEqual(lyric_kind(enhanced), "enhanced")
+    def test_a2_is_detected_as_a2_kind(self) -> None:
+        a2 = "[00:00.00]<00:00.00>我<00:00.20>爱"
+        self.assertEqual(lyric_kind(a2), "a2")
 
     def test_enhanced_to_line_lrc_flattens(self) -> None:
-        enhanced = "[00:00.00]<00:00.00>我<00:00.20>爱<00:00.50>你\n[00:05.00]<00:05.00>中<00:05.20>国"
-        line = enhanced_to_line_lrc(enhanced)
+        a2 = "[00:00.00]<00:00.00>我<00:00.20>爱<00:00.50>你\n[00:05.00]<00:05.00>中<00:05.20>国"
+        line = enhanced_to_line_lrc(a2)
         self.assertIn("[00:00.00]我爱你", line)
         self.assertNotIn("<00:00.20>", line)
         self.assertEqual(lyric_kind(line), "lrc")
@@ -884,17 +892,49 @@ class QrcDecryptTests(unittest.TestCase):
         plain = "[00:00.00]我爱你"
         self.assertEqual(enhanced_to_line_lrc(plain), plain)
 
+    def test_eslrc_flattens_to_line_lrc(self) -> None:
+        eslrc = "[00:00.00]我[00:00.20]爱[00:00.50]你"
+        line = enhanced_to_line_lrc(eslrc)
+        self.assertEqual(lyric_kind(line), "lrc")
+        self.assertIn("我爱你", line)
+
 
 class EsLrcSuffixTests(unittest.TestCase):
-    def test_enhanced_uses_es_lrc_suffix(self) -> None:
+    def test_a2_uses_alrc_suffix(self) -> None:
         dest = lrc_dest(
             Path("/library/Aimer/(2016)daydream/08 Hz.m4a"),
             Path("/library"),
             Path("/cache/lrc"),
-            kind="enhanced",
+            kind="a2",
         )
-        self.assertEqual(dest.suffixes, [".es", ".lrc"])
-        self.assertTrue(str(dest).endswith("08 Hz.es.lrc"))
+        self.assertTrue(str(dest).endswith("08 Hz.alrc"))
+
+    def test_eslrc_uses_eslrc_suffix(self) -> None:
+        dest = lrc_dest(
+            Path("/library/Aimer/(2016)daydream/08 Hz.m4a"),
+            Path("/library"),
+            Path("/cache/lrc"),
+            kind="eslrc",
+        )
+        self.assertTrue(str(dest).endswith("08 Hz.eslrc"))
+
+    def test_yrc_uses_yrc_suffix(self) -> None:
+        dest = lrc_dest(
+            Path("/library/Aimer/(2016)daydream/08 Hz.m4a"),
+            Path("/library"),
+            Path("/cache/lrc"),
+            kind="yrc",
+        )
+        self.assertTrue(str(dest).endswith("08 Hz.yrc"))
+
+    def test_qrc_uses_qrc_suffix(self) -> None:
+        dest = lrc_dest(
+            Path("/library/Aimer/(2016)daydream/08 Hz.m4a"),
+            Path("/library"),
+            Path("/cache/lrc"),
+            kind="qrc",
+        )
+        self.assertTrue(str(dest).endswith("08 Hz.qrc"))
 
     def test_plain_lrc_uses_lrc_suffix(self) -> None:
         dest = lrc_dest(
@@ -907,7 +947,7 @@ class EsLrcSuffixTests(unittest.TestCase):
 
 
 class QqSourceTests(unittest.TestCase):
-    """QQ source shaping: search parsing and the verbatim toggle, no network."""
+    """QQ source shaping: search parsing and the target-format toggle, no network."""
 
     def _client(self, responses):
         class FakeClient:
@@ -949,7 +989,7 @@ class QqSourceTests(unittest.TestCase):
         self.assertEqual(found[0].album, "デイドリーム")
         self.assertEqual(found[0].duration, 289.0)
 
-    def test_fetch_verbatim_off_flattens(self) -> None:
+    def test_fetch_default_flattens_to_line_lrc(self) -> None:
         import zlib
 
         from lrc_patch.qrc import QRC_KEY, _tripledes_crypt, _tripledes_key_setup, _ENCRYPT
@@ -970,7 +1010,7 @@ class QqSourceTests(unittest.TestCase):
                 lyric_resp,
             ]
         )
-        qq = sources.QqSource(client, verbatim=False)
+        qq = sources.QqSource(client, target_format=None)
         result = qq.fetch(
             Candidate(source="qq", source_id="1", title="Hz", artists=["Aimer"], album="daydream", duration=289.0)
         )
@@ -978,7 +1018,7 @@ class QqSourceTests(unittest.TestCase):
         self.assertEqual(lyric_kind(result.lyrics), "lrc")
         self.assertIn("我爱", result.lyrics)
 
-    def test_fetch_verbatim_on_keeps_enhanced(self) -> None:
+    def test_fetch_qrc_target_keeps_native_qrc(self) -> None:
         import zlib
 
         from lrc_patch.qrc import QRC_KEY, _tripledes_crypt, _tripledes_key_setup, _ENCRYPT
@@ -999,13 +1039,13 @@ class QqSourceTests(unittest.TestCase):
                 lyric_resp,
             ]
         )
-        qq = sources.QqSource(client, verbatim=True)
+        qq = sources.QqSource(client, target_format="qrc")
         result = qq.fetch(
             Candidate(source="qq", source_id="1", title="Hz", artists=["Aimer"], album="daydream", duration=289.0)
         )
         self.assertTrue(result.lyrics)
-        self.assertEqual(lyric_kind(result.lyrics), "enhanced")
-        self.assertIn("<00:00.20>爱", result.lyrics)
+        self.assertEqual(lyric_kind(result.lyrics), "qrc")
+        self.assertIn("(200,300)爱", result.lyrics)
 
 
 if __name__ == "__main__":

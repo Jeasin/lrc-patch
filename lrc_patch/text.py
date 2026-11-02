@@ -21,17 +21,35 @@ from .config import (
 # Lyric markup beyond plain LRC.  Detection is deliberately conservative: a
 # wrong "advanced" label only changes the colour, but a wrong "ttml" label
 # would skip the timeline check for an ordinary LRC.
+#
+# Format taxonomy (see https://amll.dev/guides/lyric/formats):
+#   * lrc      — plain line-timed ``[mm:ss.xx]``
+#   * a2       — LRC A2: word timestamps in angle brackets, ``[mm:ss.xx]<mm:ss.xx>词``
+#   * eslrc    — ESLyric / SPL: word timestamps in square brackets, ``[mm:ss.xx]词[mm:ss.xx]语``
+#   * yrc      — netease verbatim: ``[lineStart,lineDur](sylStart,sylDur,0)text``
+#   * qrc      — QQ verbatim:     ``[lineStart,lineDur]text(sylStart,sylDur)``
+#   * ttml     — Apple Music XML
 _TTML_RE = re.compile(
     r"<\s*(?:tt|tt:tt|p)\b[^>]*\b(?:begin|xmlns|dur|end)=", re.IGNORECASE
 )
+# Angle-bracket word timestamps (LRC A2): <mm:ss.xx> or <mm:ss.xxx>.
 _WORD_TIME_RE = re.compile(r"<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>")
-_YRC_LINE_RE = re.compile(r"^\[\d{1,4},\d{1,5}\]", re.MULTILINE)
+# ESLyric/SPL: a line whose body still carries square-bracket timestamps.
+_SQ_WORD_TIME_RE = re.compile(r"\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]")
+# YRC/QRC line head: [lineStart,lineDur] where both are integer milliseconds.
+_YRC_LINE_RE = re.compile(r"^\[\d{1,7},\d{1,7}\]", re.MULTILINE)
+# YRC word marker: (start,dur,0)text — timestamp first, three fields.
+_YRC_WORD_RE = re.compile(r"\(\d+,\d+,0\)")
+# QRC word marker: text(start,dur) — timestamp after text, two fields.
+_QRC_WORD_RE = re.compile(r"\(\d+,\d+\)")
 
 LYRIC_TAGS = {
     "plain": "TXT",
     "lrc": "LRC",
-    "enhanced": "LRC+",
+    "a2": "A2",
+    "eslrc": "ESLRC",
     "yrc": "YRC",
+    "qrc": "QRC",
     "ttml": "TTML",
 }
 
@@ -389,14 +407,20 @@ def sanitize_lyrics(text: str) -> str:
     return text.strip() + "\n" if text.strip() else ""
 
 def lyric_kind(text: str) -> str:
-    """Classify lyric markup: plain / lrc / enhanced / yrc / ttml.
+    """Classify lyric markup: plain / lrc / a2 / eslrc / yrc / qrc / ttml.
 
-    Providers and local files use more than one lyric format, and they look
-    identical in a green column.  ``enhanced`` is LRC with per-word
-    timestamps (``[00:12.34]<00:12.34>word``), ``yrc``/``qrc`` are the
-    ``[start,duration](start,duration,0)`` line formats used by QQ Music and
-    karaoke players, ``ttml`` is Apple Music's XML.  Only the first two share
-    the line-timestamp checks; the rest are still accepted as lyrics.
+    Providers and local files use several verbatim formats that look alike in
+    a green column, so they must be told apart:
+      * ``lrc``   — ``[00:12.34]`` line only
+      * ``a2``    — LRC A2, word stamps in angle brackets ``<00:12.34>``
+      * ``eslrc`` — ESLyric/SPL, word stamps in square brackets ``[00:12.34]``
+      * ``yrc``   — netease ``[start,dur](start,dur,0)text``
+      * ``qrc``   — QQ ``[start,dur]text(start,dur)``
+      * ``ttml``  — Apple Music XML
+
+    YRC and QRC share the ``[lineStart,lineDur]`` head but differ in the body:
+    YRC puts ``(start,dur,0)`` *before* the text, QRC puts ``(start,dur)``
+    *after* it.  Only ``lrc`` and ``a2`` share the line-timestamp checks.
     """
     body = (text or "").lstrip("\ufeff")
     if not body.strip():
@@ -405,9 +429,24 @@ def lyric_kind(text: str) -> str:
     if head.startswith("<?xml") or _TTML_RE.search(head):
         return "ttml"
     if _YRC_LINE_RE.search(body):
-        return "yrc"
+        # Both YRC and QRC open with [start,dur]; distinguish on the body.
+        if _YRC_WORD_RE.search(body):
+            return "yrc"
+        return "qrc"
     if TIMESTAMP_RE.search(body):
-        return "enhanced" if _WORD_TIME_RE.search(body) else "lrc"
+        # Line-timed.  Angle brackets → LRC A2; more square timestamps than
+        # the line head → ESLyric; otherwise plain LRC.
+        if _WORD_TIME_RE.search(body):
+            return "a2"
+        # A line head timestamp plus a second square timestamp in the body
+        # (e.g. ``[00:12.34]词[00:12.80]语``) marks ESLyric word timing.
+        lines = [ln for ln in body.splitlines() if _SQ_WORD_TIME_RE.search(ln)]
+        if any(ln.count("[") >= 2 for ln in lines if ln.strip()):
+            # Count square timestamps: more than one on a line → verbatim.
+            for ln in lines:
+                if len(_SQ_WORD_TIME_RE.findall(ln)) >= 2:
+                    return "eslrc"
+        return "lrc"
     return "plain"
 
 
@@ -417,26 +456,51 @@ def lyric_tag(kind: str) -> str:
 
 
 _WORD_TIME_STRIP_RE = re.compile(r"<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>")
+_SQ_WORD_STRIP_RE = re.compile(r"\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]")
+
+
+def verbatim_to_line_lrc(text: str) -> str:
+    """Flatten a verbatim (word-timed) lyric back to line-timed LRC.
+
+    Handles LRC A2 (``[00:12.34]<00:12.34>一<00:12.78>起``) and ESLyric
+    (``[00:12.34]一[00:12.78]起``), dropping the per-word stamps so the result
+    is ``[00:12.34]一起``.  This is the safer form for players that choke on
+    word markers, at the cost of losing per-word sync.  Plain LRC and other
+    formats pass through unchanged.
+    """
+    kind = lyric_kind(text)
+    out: list[str] = []
+    if kind == "a2":
+        strip = _WORD_TIME_STRIP_RE
+        for line in (text or "").splitlines():
+            if not strip.search(line):
+                out.append(line)
+                continue
+            out.append(strip.sub("", line))
+        return "\n".join(out) + ("\n" if out else "")
+    if kind == "eslrc":
+        # ESLyric puts a square timestamp before every word; the first one is
+        # the line start, the rest are word stamps.  Keep the first, drop the
+        # rest so the line stays line-timed LRC.
+        for line in (text or "").splitlines():
+            if not _SQ_WORD_STRIP_RE.search(line):
+                out.append(line)
+                continue
+            # Remove all but the leading timestamp.
+            parts = _SQ_WORD_STRIP_RE.split(line)
+            # parts[0] is "" (line begins with a stamp), parts[1..] are words.
+            stamps = _SQ_WORD_STRIP_RE.findall(line)
+            if stamps:
+                out.append(stamps[0] + "".join(parts[1:]))
+            else:
+                out.append(line)
+        return "\n".join(out) + ("\n" if out else "")
+    return text
 
 
 def enhanced_to_line_lrc(text: str) -> str:
-    """Flatten enhanced LRC back to line-timed LRC, dropping word timestamps.
-
-    ``[00:12.34]<00:12.34>一<00:12.78>起`` becomes ``[00:12.34]一起``.  This is
-    the safer form for players that choke on ``<mm:ss.xx>`` markers, at the
-    cost of losing the per-word sync.  Plain LRC and other formats pass through
-    unchanged.
-    """
-    if lyric_kind(text) != "enhanced":
-        return text
-    out: list[str] = []
-    for line in (text or "").splitlines():
-        if not _WORD_TIME_RE.search(line):
-            out.append(line)
-            continue
-        stripped = _WORD_TIME_STRIP_RE.sub("", line)
-        out.append(stripped)
-    return "\n".join(out) + ("\n" if out else "")
+    """Back-compat alias for :func:`verbatim_to_line_lrc` (LRC A2 flavour)."""
+    return verbatim_to_line_lrc(text)
 
 
 def lyric_line_count(text: str, kind: str | None = None) -> int:
@@ -466,11 +530,11 @@ def lrc_time_values(text: str) -> list[float]:
 def lrc_timestamp_issue(text: str, duration: float) -> str:
     """Describe a suspicious LRC timeline, or return "" when it looks sane.
 
-    Only line-timestamped formats can be checked this way; word-level
-    (enhanced), YRC and TTML carry their own timing model and are left alone
+    Only line-timestamped formats (LRC, LRC A2, ESLyric) can be checked this
+    way; YRC, QRC and TTML carry their own timing model and are left alone
     rather than guessed at.
     """
-    if duration <= 0 or lyric_kind(text) not in {"lrc", "enhanced"}:
+    if duration <= 0 or lyric_kind(text) not in {"lrc", "a2", "eslrc"}:
         return ""
     values = lrc_time_values(text)
     if not values:

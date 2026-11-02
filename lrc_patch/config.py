@@ -16,7 +16,7 @@ def default_lrc_dir() -> Path:
     root = Path(base).expanduser() if base else Path.home() / ".cache"
     return root / "lrc-patch" / "lrc"
 
-APP_VERSION = "2.6"
+APP_VERSION = "2.7"
 
 # Bump when the scoring rules change: old ambiguous/suspect plans are then
 # retried once instead of being reused with the previous rules.
@@ -52,13 +52,12 @@ PLACEHOLDERS = {"纯音乐", "純音樂", "instrumental", "暂无歌词", "無�
 
 SOURCE_NAMES = {"netease", "lrclib", "qq"}
 
-# LRCLIB has been continuously answering 503/429, and every failed request only
-# makes the block worse.  It stays available via --sources for the day it
-# recovers (its instrumental flag is still useful), but it is no longer on the
-# default path.  QQ Music (qq) is also opt-in: netease already covers most of
-# the catalogue, and QQ exists as a fallback for the stragglers via
-# ``--sources netease,qq``.
-DEFAULT_SOURCES = ("netease",)
+# netease is the primary source: it covers the user's Japanese catalogue best
+# and its line-timed LRC is the most stable.  qq is an automatic fallback for
+# the tracks netease cannot match (its Chinese catalogue and verbatim QRC are
+# strong); lrclib is opt-in via ``--src lrclib`` only, as it has been answering
+# 503/429 continuously.
+DEFAULT_SOURCES = ("netease", "qq")
 
 DEFAULT_DURATION_TOLERANCE = 2.0
 

@@ -222,7 +222,7 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         refresh=args.refresh,
         impersonate=not getattr(args, "no_impersonate", False),
     )
-    source_objects = build_sources(args.sources, client, getattr(args, "verbatim", False))
+    source_objects = build_sources(args.src, client, getattr(args, "target_format", None))
     picks = collect_picks(args, tracks, library)
     report = args.report or (state_dir / "reports" / f"plan-{stamp}.csv")
 
@@ -263,7 +263,7 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     )
     print_meta(
         "源",
-        f"{','.join(args.sources)}"
+        f"{','.join(args.src)}"
         + style(f"   复用 {reused}   查询 {len(pending)}   并发 {args.workers}", "90"),
     )
     if retrying:
@@ -427,8 +427,9 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             + style("指定", "90")
             + "  选中后："
             + style(
-                f"lrcpatch{suffix} --pick netease:歌曲ID"
-                + (" --apply" if getattr(args, "apply", False) else ""),
+                f"lrcpatch --pick netease:歌曲ID"
+                + (" --apply" if getattr(args, "apply", False) else "")
+                + suffix,
                 "36",
             )
         )
@@ -441,13 +442,13 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         )
         print()
         failed_names = {name for name, _, failed, _ in health if failed}
-        alive = [name for name in args.sources if name not in failed_names]
-        if len(args.sources) > 1 and 0 < len(alive) < len(args.sources):
+        alive = [name for name in args.src if name not in failed_names]
+        if len(args.src) > 1 and 0 < len(alive) < len(args.src):
             print(
                 "  "
                 + style("绕过", "90")
                 + "  也可加 "
-                + style(f"--sources {','.join(alive)}", "36")
+                + style(f"--src {','.join(alive)}", "36")
                 + " 暂时只用正常的源，避免等待失败源。"
             )
             print()
@@ -707,13 +708,13 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         refresh=args.refresh,
         impersonate=not getattr(args, "no_impersonate", False),
     )
-    sources = build_sources(args.sources, client, getattr(args, "verbatim", False))
+    sources = build_sources(args.src, client, getattr(args, "target_format", None))
     wanted = [track for track in tracks if args.all or not track.has_lyrics]
 
     if not args.tsv:
         print_header(
             "candidates",
-            f"{len(wanted)} 首  ·  每源最多 {args.top} 条  ·  源 {','.join(args.sources)}",
+            f"{len(wanted)} 首  ·  每源最多 {args.top} 条  ·  源 {','.join(args.src)}",
         )
         if not wanted:
             print("  " + style("范围内所有曲目都已有歌词；加 --all 可强制列出。", "32"))

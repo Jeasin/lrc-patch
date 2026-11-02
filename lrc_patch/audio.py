@@ -422,15 +422,25 @@ def preflight_apply(rows: list[sqlite3.Row], workers: int) -> None:
 def lrc_dest(path: Path, library: Path, lrc_dir: Path, kind: str = "lrc") -> Path:
     """Mirror the library layout under the cache, keeping the track name.
 
-    Verbatim (word-timed) lyrics get an ``.es.lrc`` suffix so they are not
-    mistaken for plain line-timed LRC; everything else keeps ``.lrc``.
+    Verbatim formats keep their native extension so they are not mistaken for
+    plain line-timed LRC: ``a2``→``.alrc``, ``eslrc``→``.eslrc``, ``yrc``→
+    ``.yrc``, ``qrc``→``.qrc``, ``ttml``→``.ttml``; everything else is ``.lrc``.
     """
     try:
         rel = path.resolve().relative_to(library)
     except ValueError:
         rel = Path("_external") / f"{sha256_text(str(path))[:8]}-{path.name}"
-    suffix = ".es.lrc" if kind == "enhanced" else ".lrc"
+    suffix = _LYRIC_SUFFIX.get(kind, ".lrc")
     return (lrc_dir / rel).with_suffix(suffix)
+
+
+_LYRIC_SUFFIX = {
+    "a2": ".alrc",
+    "eslrc": ".eslrc",
+    "yrc": ".yrc",
+    "qrc": ".qrc",
+    "ttml": ".ttml",
+}
 
 def export_lrc(
     library: Path,
@@ -440,8 +450,9 @@ def export_lrc(
 ) -> tuple[int, int]:
     """Write .lrc copies; falls back to existing lyrics when plan has none.
 
-    Enhanced (verbatim) lyrics are written as ``歌曲.es.lrc`` to preserve the
-    word-level timing instead of flattening them into a plain ``.lrc``.
+    Verbatim lyrics keep their native extension (``.alrc``/``.eslrc``/
+    ``.yrc``/``.qrc``/``.ttml``) to preserve word-level timing instead of
+    flattening them into a plain ``.lrc``.
     """
     written = 0
     failed = 0

@@ -527,8 +527,10 @@ def format_size(size: int) -> str:
 LYRIC_COLORS = {
     "plain": "36",
     "lrc": "32",
-    "enhanced": "1;32",
+    "a2": "1;32",
+    "eslrc": "1;33",
     "yrc": "1;34",
+    "qrc": "1;36",
     "ttml": "1;35",
 }
 
@@ -791,7 +793,7 @@ def plan_note(row: sqlite3.Row) -> str:
     return str(row["reason"] or status_style(status)[2])
 
 
-_LEGACY_REASON_RE = re.compile(r"^(?:TXT|LRC\+?|YRC|TTML)\s*/\s*(.+)$")
+_LEGACY_REASON_RE = re.compile(r"^(?:TXT|LRC\+?|A2|ESLRC|YRC|QRC|TTML)\s*/\s*(.+)$")
 
 
 def _reason_parts(reason: str) -> tuple[str, str]:
@@ -862,11 +864,11 @@ def print_intro() -> None:
     print("  " + style("常用", "1"))
     rows = [
         ('lrcpatch plan "結束バンド"', "拖入目录 = 只读 plan"),
-        ('lrcpatch plan "Ado" --html', "生成计划与 HTML 复核页"),
+        ('lrcpatch plan --html "Ado"', "生成计划与 HTML 复核页"),
         ('lrcpatch candidates "Ado"', "查看候选 ID（配合 --pick）"),
         ('lrcpatch apply "Ado"', "只写入 ✓ ready 的曲目"),
         ('lrcpatch verify "Ado"', "校验歌词与其他标签"),
-        ('lrcpatch rollback "Ado" --yes', "回滚本工具写入的歌词"),
+        ('lrcpatch rollback --yes "Ado"', "回滚本工具写入的歌词"),
     ]
     width = max(disp_width(command) for command, _ in rows)
     for command, note in rows:

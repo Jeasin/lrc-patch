@@ -44,15 +44,15 @@ def _disp_width(text: str) -> int:
 
 _EXAMPLES = [
     ('lrcpatch "結束バンド"', "省略命令 = 只读 plan"),
-    ('lrcpatch scan "Aimer" --summary', "只看格式汇总"),
-    ('lrcpatch candidates "Ado" --top 3', "看候选 ID"),
-    ('lrcpatch candidates "Aimer" --template', "整张专辑的 pick 模板"),
-    ('lrcpatch plan "Aimer" --pick-file picks.tsv', "按模板批量指定"),
-    ('lrcpatch plan "Ado/某首.m4a" --pick netease:123', "人工指定候选"),
-    ('lrcpatch plan "Ado/某首.m4a" --pick netease:123 --apply', "指定并直接写入"),
+    ('lrcpatch scan --summary "Aimer"', "只看格式汇总"),
+    ('lrcpatch candidates --top 3 "Ado"', "看候选 ID"),
+    ('lrcpatch candidates --template "Aimer"', "整张专辑的 pick 模板"),
+    ('lrcpatch plan --pick-file picks.tsv "Aimer"', "按模板批量指定"),
+    ('lrcpatch plan --pick netease:123 "Ado/某首.m4a"', "人工指定候选"),
+    ('lrcpatch plan --pick netease:123 --apply "Ado/某首.m4a"', "指定并直接写入"),
     ('lrcpatch apply "Ado"', "只写 ✓ 可写入"),
     ('lrcpatch verify "Ado"', "写入后复核"),
-    ('lrcpatch rollback "Ado" --yes', "回滚"),
+    ('lrcpatch rollback --yes "Ado"', "回滚"),
 ]
 
 
@@ -160,12 +160,13 @@ def main_help() -> str:
         [
             (
                 "plan",
-                "--pick SRC:ID  --pick-file FILE  --apply  --sources LIST  --workers N\n"
-                "--refresh  --retry-failed  --html [FILE]  --lrc  --duration-tolerance SEC",
+                "--pick SRC:ID  --pick-file FILE  --apply  --src LIST  --workers N\n"
+                "--refresh  --retry-failed  --html [FILE]  --lrc  --duration-tolerance SEC\n"
+                "--a2  --eslrc  --yrc  --qrc  --ttml",
             ),
             (
                 "candidates",
-                "--top N  --sources LIST  --workers N  --template [FILE]  --tsv  --all  --refresh",
+                "--top N  --src LIST  --workers N  --template [FILE]  --tsv  --all  --refresh",
             ),
             ("apply", "--workers N  --no-preflight  --lrc"),
             ("scan", "--summary"),
@@ -184,7 +185,7 @@ def main_help() -> str:
 
 {style("用法", "1;36")}
 {usage}
-  {style("选项和路径顺序随意；命令可省略，默认 plan。", "90")}
+  {style("建议参数在前、路径在最后；命令可省略，默认 plan。", "90")}
 
 {style("命令", "1;36")}
 {commands}
@@ -243,12 +244,15 @@ def main_help() -> str:
 {style("歌词格式", "1;36")}
   {style("TXT", "36")}    纯文本，没有时间轴
   {style("LRC", "32")}    逐行时间轴，最常见的格式
-  {style("LRC+", "1;32")}  逐字时间轴（Enhanced LRC，<mm:ss.xx> 标记）
-  {style("YRC", "1;34")}    QQ 音乐逐字格式 [起始,时长](起始,时长,0)
-  {style("TTML", "1;35")}   Apple Music 的 XML 歌词
-  YRC / TTML 这类高级格式只做识别与颜色区分，不做时间轴校验。
-  QQ 音乐（--sources netease,qq）的逐字 QRC 会转成 LRC+；--verbatim 保留逐字，
-  默认降级为逐行 LRC。导出 .lrc 时逐字歌词用 歌曲.es.lrc 后缀。
+  {style("A2", "1;32")}   LRC A2 逐字（尖括号 <mm:ss.xx> 标记）
+  {style("ESLRC", "1;33")} ESLyric / SPL 逐字（行内方括号 [mm:ss.xx]）
+  {style("YRC", "1;34")}   网易云逐字 [起始,时长](起始,时长,0)
+  {style("QRC", "1;36")}   QQ 音乐逐字 [起始,时长]文本(起始,时长)
+  {style("TTML", "1;35")}  Apple Music 的 XML 歌词
+  A2 / ESLRC 与普通 LRC 共用行时间轴校验；YRC / QRC / TTML 只识别不校验。
+  默认拿逐行 LRC；加 --a2 / --eslrc / --ttml 会把源逐字转成对应公有格式，
+  --yrc 只取网易原生、--qrc 只取 QQ 原生（私有格式不跨源转换）。导出 .lrc
+  时按格式用原生后缀：.alrc / .eslrc / .yrc / .qrc / .ttml，逐行用 .lrc。
 
 {style("状态", "1;36")}
   ✓ 可写入      标题/艺术家/专辑/时长都过，apply 会写
@@ -281,11 +285,11 @@ def main_help() -> str:
 PLAN_EPILOG = """\
 示例
   lrcpatch plan "結束バンド"
-  lrcpatch plan "Ado" "YOASOBI/(2023)THE BOOK 3" --workers 2
-  lrcpatch plan "米津玄師" --lrc --lrc-dir ~/.cache/lrc-patch/lrc
-  lrcpatch plan "結束バンド" --html
-  lrcpatch plan "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467
-  lrcpatch plan "結束バンド/11 忘れてやらない.m4a" --pick netease:2003496467 --apply
+  lrcpatch plan --workers 2 "Ado" "YOASOBI/(2023)THE BOOK 3"
+  lrcpatch plan --lrc --lrc-dir ~/.cache/lrc-patch/lrc "米津玄師"
+  lrcpatch plan --html "結束バンド"
+  lrcpatch plan --pick netease:2003496467 "結束バンド/11 忘れてやらない.m4a"
+  lrcpatch plan --pick netease:2003496467 --apply "結束バンド/11 忘れてやらない.m4a"
 
 说明
   plan 只读：不写音频，只更新状态数据库、CSV 和可选的 HTML 复核页。
@@ -299,7 +303,7 @@ PLAN_EPILOG = """\
 APPLY_EPILOG = """\
 示例
   lrcpatch apply "結束バンド"
-  lrcpatch apply "Ado" --workers 2
+  lrcpatch apply --workers 2 "Ado"
 
 说明
   只写状态为 ready 的曲目；已有歌词、需确认、无匹配、请求失败都不会写入，
@@ -320,7 +324,7 @@ VERIFY_EPILOG = """\
 ROLLBACK_EPILOG = """\
 示例
   lrcpatch rollback "結束バンド"         只预览，不改文件
-  lrcpatch rollback "結束バンド" --yes   执行移除
+  lrcpatch rollback --yes "結束バンド"   执行移除
 
 说明
   只处理 journal 中由本工具写入、且歌词之后没有被改动过的曲目。
@@ -388,10 +392,31 @@ def add_lrc_options(parser: argparse.ArgumentParser) -> None:
         metavar="DIR",
         help=".lrc 输出目录（默认 $XDG_CACHE_HOME/lrc-patch/lrc）",
     )
-    parser.add_argument(
-        "--verbatim",
+    fmt = parser.add_mutually_exclusive_group()
+    fmt.add_argument(
+        "--a2",
         action="store_true",
-        help="保留逐字歌词（QQ 源的增强 LRC），导出 .lrc 时用 歌曲.es.lrc 后缀",
+        help="逐字：把源歌词转成 LRC A2（尖括号 <mm:ss.xx>）内嵌，导出用 .alrc",
+    )
+    fmt.add_argument(
+        "--eslrc",
+        action="store_true",
+        help="逐字：转成 ESLyric（方括号 [mm:ss.xx]）内嵌，导出用 .eslrc",
+    )
+    fmt.add_argument(
+        "--yrc",
+        action="store_true",
+        help="逐字：保留网易云原生 YRC（仅 netease 源），导出用 .yrc",
+    )
+    fmt.add_argument(
+        "--qrc",
+        action="store_true",
+        help="逐字：保留 QQ 原生 QRC（仅 qq 源），导出用 .qrc",
+    )
+    fmt.add_argument(
+        "--ttml",
+        action="store_true",
+        help="逐字：转成 TTML（Apple Music XML），导出用 .ttml",
     )
 
 
@@ -483,7 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "示例\n"
             '  lrcpatch scan "結束バンド"\n'
-            '  lrcpatch scan "結束バンド" --summary\n'
+            '  lrcpatch scan --summary "結束バンド"\n'
             "  lrcpatch scan --limit 20\n\n"
             "说明\n"
             "  明细按专辑目录分组，一行一首：✓ 已有歌词 / · 待补，后面是格式、\n"
@@ -522,10 +547,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_lrc_options(plan)
     add_network_options(plan)
     plan.add_argument(
-        "--sources",
+        "--src",
         metavar="LIST",
         default=",".join(DEFAULT_SOURCES),
-        help="歌词源，逗号分隔（默认 netease；qq 可选 fallback；lrclib 近期常不可用）",
+        help="歌词源，逗号分隔（默认 netease,qq 自动 fallback；lrclib 近期常不可用）",
     )
     plan.add_argument(
         "--workers", type=int, metavar="N", default=4, help="查询并发 1..10（默认 4）"
@@ -592,9 +617,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="逐首查询并列出候选（ID、分数、时长差），不修改音频和计划。",
         epilog=(
             "示例\n"
-            '  lrcpatch candidates "結束バンド" --top 3\n'
-            '  lrcpatch candidates "Aimer" --template\n'
-            '  lrcpatch candidates "Ado" --tsv > picks.tsv\n\n'
+            '  lrcpatch candidates --top 3 "結束バンド"\n'
+            '  lrcpatch candidates --template "Aimer"\n'
+            '  lrcpatch candidates --tsv "Ado" > picks.tsv\n\n'
             "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 格式 /\n"
             "标题 / 歌手 / 专辑，差异写在候选下面那一行，不再挤进同一行。\n\n"
             "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，\n"
@@ -608,10 +633,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_tree_option(candidates)
     add_network_options(candidates)
     candidates.add_argument(
-        "--sources",
+        "--src",
         metavar="LIST",
         default=",".join(DEFAULT_SOURCES),
-        help="歌词源，逗号分隔（默认 netease；qq 可选 fallback；lrclib 近期常不可用）",
+        help="歌词源，逗号分隔（默认 netease,qq 自动 fallback；lrclib 近期常不可用）",
     )
     candidates.add_argument(
         "--top", type=int, metavar="N", default=3, help="每源最多显示 N 条"

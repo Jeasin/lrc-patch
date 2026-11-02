@@ -29,11 +29,12 @@ from typing import Any, Callable
 
 from .config import HTTP_UA
 from .errors import SourceError
+from .lyric_fmt import check_target_source, lines_to_lrc, parse_qrc, verbatim_to_target
 from .matching import score_candidate
 from .models import Candidate, FetchResult, Track
-from .qrc import qrc_decrypt, qrc_to_enhanced, qrc_lyric_text
+from .qrc import qrc_decrypt, qrc_lyric_text
 from .state import State
-from .text import enhanced_to_line_lrc, is_placeholder, sanitize_lyrics, sha256_text
+from .text import is_placeholder, sanitize_lyrics, sha256_text
 
 
 class _Retryable(Exception):
@@ -204,7 +205,7 @@ class JsonClient:
             raise SourceError(
                 source,
                 f"{source} 已暂停（限流/连续失败），约 {remaining:.0f}s 后自动解除；"
-                "可稍后重跑，或用 --sources 换源",
+                "可稍后重跑，或用 --src 换源",
             )
 
     def _open_breaker(self, source: str, seconds: float) -> None:
@@ -477,8 +478,9 @@ class NeteaseSource:
     name = "netease"
     min_interval = 0.9
 
-    def __init__(self, client: JsonClient):
+    def __init__(self, client: JsonClient, target_format: str | None = None):
         self.client = client
+        self.target_format = target_format
 
     def search(self, track: Track, exhaustive: bool = False) -> list[Candidate]:
         """One search request per track in the normal case.
@@ -546,7 +548,7 @@ class NeteaseSource:
         url = (
             "https://music.163.com/api/song/lyric?"
             + urllib.parse.urlencode(
-                {"id": candidate.source_id, "lv": 1, "kv": 1, "tv": -1}
+                {"id": candidate.source_id, "lv": 1, "kv": 1, "tv": -1, "yv": 1}
             )
         )
         code, data = self.client.get(
@@ -554,11 +556,23 @@ class NeteaseSource:
         )
         if code != 200 or not data:
             return FetchResult(note=f"歌词接口 HTTP {code}")
-        raw = (data.get("lrc") or {}).get("lyric") or ""
+        # Verbatin YRC lives under ``data.yrc.lyric`` (word-timed); the plain
+        # line-timed LRC is ``data.lrc.lyric``.
+        if self.target_format:
+            raw = (data.get("yrc") or {}).get("lyric") or ""
+            if not raw:
+                # No verbatim track: fall back to line LRC and let the caller
+                # decide (it is still a valid lyric, just not word-timed).
+                raw = (data.get("lrc") or {}).get("lyric") or ""
+        else:
+            raw = (data.get("lrc") or {}).get("lyric") or ""
         lyrics = sanitize_lyrics(raw)
         if not lyrics or is_placeholder(lyrics):
             instrumental = bool(data.get("nolyric") or data.get("pureMusic"))
             return FetchResult(instrumental=instrumental, note="无可用歌词")
+        if self.target_format:
+            check_target_source(self.target_format, self.name)
+            lyrics = verbatim_to_target(lyrics, self.name, self.target_format)
         return FetchResult(lyrics=lyrics)
 
 
@@ -628,21 +642,20 @@ class QqSource:
     lite client: a one-off ``GetSession`` registers an anonymous uid/sid, then
     search and lyric requests ride that session.  Lyrics arrive as QRC
     (verbatim, word-timed) encrypted with QQ's Triple-DES variant; this source
-    decrypts and converts them to enhanced LRC so a fallback never degrades a
-    lyric to plain text.
+    decrypts them and, by default, flattens the verbatim timeline to plain
+    line-timed LRC.  With ``--qrc`` it returns the native QRC, and with
+    ``--a2``/``--eslrc``/``--ttml`` it converts to the chosen public format.
 
-    QQ is deliberately *not* on the default path: netease already covers most
-    of the user's Japanese catalogue, and every extra provider multiplies
-    request volume.  Enable it with ``--sources netease,qq``.
+    QQ sits on the default path as an automatic fallback behind netease.
     """
 
     name = "qq"
     min_interval = 0.9
     _endpoint = "https://u.y.qq.com/cgi-bin/musicu.fcg"
 
-    def __init__(self, client: JsonClient, verbatim: bool = False):
+    def __init__(self, client: JsonClient, target_format: str | None = None):
         self.client = client
-        self.verbatim = verbatim
+        self.target_format = target_format
         self._comm: dict[str, Any] = {
             "ct": 11,
             "cv": "1003006",
@@ -771,11 +784,15 @@ class QqSource:
         qrc_text = qrc_lyric_text(decrypted)
         if not qrc_text:
             return FetchResult(instrumental=False, note="无可用歌词")
-        lyrics = sanitize_lyrics(qrc_to_enhanced(qrc_text))
+        if self.target_format:
+            check_target_source(self.target_format, self.name)
+            lyrics = verbatim_to_target(qrc_text, self.name, self.target_format)
+        else:
+            # Default: flatten the verbatim QRC to plain line-timed LRC.
+            lyrics = lines_to_lrc(parse_qrc(qrc_text))
+        lyrics = sanitize_lyrics(lyrics)
         if not lyrics or is_placeholder(lyrics):
             return FetchResult(instrumental=False, note="无可用歌词")
-        if not self.verbatim:
-            lyrics = enhanced_to_line_lrc(lyrics)
         return FetchResult(lyrics=lyrics)
 
     def fetch_plain(self, candidate: Candidate) -> FetchResult:
@@ -783,11 +800,13 @@ class QqSource:
         return self.fetch(candidate)
 
 
-def build_sources(names: list[str], client: JsonClient, verbatim: bool = False) -> list[Any]:
+def build_sources(
+    names: list[str], client: JsonClient, target_format: str | None = None
+) -> list[Any]:
     registry = {"netease": NeteaseSource, "lrclib": LrclibSource, "qq": QqSource}
-    if verbatim:
-        return [
-            QqSource(client, verbatim=True) if name == "qq" else registry[name](client)
-            for name in names
-        ]
-    return [registry[name](client) for name in names]
+    return [
+        registry[name](client, target_format)
+        if name in {"netease", "qq"}
+        else registry[name](client)
+        for name in names
+    ]
