@@ -1717,6 +1717,16 @@ class CandidateScopeTests(unittest.TestCase):
         scope = commands.open_tracks([track], state_dir)
         self.assertEqual([item.path for item in scope.tracks], [track.path])
 
+    def test_an_open_question_survives_existing_lyrics(self) -> None:
+        # `plan --force` on a file that already has lyrics: the plan says !
+        # 需确认, so it stays on the list even though the file is not empty.
+        track = make_track(existing_lyrics="[00:01.00]旧歌词")
+        state_dir = self._state_dir(
+            [(str(track.path), "ambiguous", "qq", 72, track.fingerprint())]
+        )
+        scope = commands.open_tracks([track], state_dir)
+        self.assertEqual([item.path for item in scope.tracks], [track.path])
+
     def test_a_scope_that_was_never_planned_lists_the_unplanned(self) -> None:
         track = make_track()
         scope = commands.open_tracks([track], self._state_dir([]))

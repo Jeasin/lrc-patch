@@ -1186,15 +1186,18 @@ def open_tracks(
     settled = 0
     other_source = 0
     for track in tracks:
-        if track.has_lyrics:
-            continue
         row = cached.get(str(track.path))
         fresh = row is not None and row["fingerprint"] == track.fingerprint()
+        # An open question is about the plan, not about the file: after
+        # `plan --force` a track that already carries lyrics can still be
+        # ! 需确认, and that is exactly the case the user wants to look at.
+        if fresh and row["status"] in {"ambiguous", "suspect"}:
+            questions.append(track)
+            continue
+        if track.has_lyrics:
+            continue
         if not fresh:
             unplanned.append(track)
-            continue
-        if row["status"] in {"ambiguous", "suspect"}:
-            questions.append(track)
             continue
         # A ✓ plan from a source that is no longer selected says nothing about
         # the sources being asked now: `candidates --src qq` must show qq.

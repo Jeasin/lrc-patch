@@ -293,6 +293,8 @@ lrcpatch plan --pick ne:123 --apply "Aimer/某首.m4a"
 
 `--all` 不带路径 = 整个音乐库里所有曲目（含已有歌词的），不是"上次 plan 那批"。
 
+存疑与否看的是**计划**，不是文件：`plan --force` 之后仍判为 `!` 的曲目，就算文件里原本有歌词，也照样留在默认列表里——那正是"重排过了，但还是要你拍板"的情况。
+
 一次 `--pick` 可连写多个 ID，程序先查每个 ID 的标题 / 歌手 / 时长，再按分数配对到范围内缺歌词的曲目，并把配对结果打印出来。整张专辑要批量指定时，用模板：
 
 ```bash
@@ -432,7 +434,7 @@ lrc_patch/
   qrc.py            # QQ QRC 解密（3DES + zlib）
   state.py          # SQLite 状态库
   render.py         # 终端表格与对齐
-tests/test_core.py  # 153 个用例，覆盖解析、打分、写入、回滚与 CLI
+tests/test_core.py  # 154 个用例，覆盖解析、打分、写入、回滚与 CLI
 ```
 
 CI 在 Python 3.9 / 3.11 / 3.13 上跑同一套测试。
