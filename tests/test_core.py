@@ -34,12 +34,14 @@ from lrc_patch.matching import (
     best_partial_candidate,
     keep_previous_plan,
     parse_pick,
+    pick_alternatives,
     plan_from_lyrics,
     plan_one,
+    plan_with_pick,
     score_candidate,
 )
 from lrc_patch.models import Candidate, FetchResult, PlanResult, Track, TreeEntry
-from lrc_patch.state import State, read_plan_cache, row_get
+from lrc_patch.state import State, read_plan_cache, read_state_summary, row_get
 from lrc_patch.text import (
     album_points,
     artist_parts,
@@ -1673,7 +1675,7 @@ class SourceLabelTests(unittest.TestCase):
 
 
 class CandidateScopeTests(unittest.TestCase):
-    """candidates should only ask about tracks that still need a decision."""
+    """candidates should answer "what needs a decision", not "what is in the library"."""
 
     def _state_dir(self, rows: list[tuple[str, str, str, int, str]]) -> Path:
         tmp = Path(tempfile.mkdtemp())
@@ -1687,7 +1689,7 @@ class CandidateScopeTests(unittest.TestCase):
         conn.close()
         return tmp
 
-    def test_ready_plans_and_existing_lyrics_are_skipped(self) -> None:
+    def test_only_the_open_questions_are_listed(self) -> None:
         settled = make_track(path=Path("/lib/A/01.m4a"), relpath="A/01.m4a")
         pending = make_track(path=Path("/lib/A/02.m4a"), relpath="A/02.m4a")
         written = make_track(
@@ -1701,12 +1703,40 @@ class CandidateScopeTests(unittest.TestCase):
                 (str(pending.path), "ambiguous", "qq", 72, pending.fingerprint()),
             ]
         )
-        wanted, count_settled, count_written = commands.open_tracks(
-            [settled, pending, written], state_dir
+        scope = commands.open_tracks([settled, pending, written], state_dir)
+        self.assertEqual([track.path for track in scope.tracks], [pending.path])
+        self.assertEqual(scope.mode, "questions")
+        self.assertEqual(scope.settled, 1)
+        self.assertEqual(scope.with_lyrics, 1)
+
+    def test_suspect_counts_as_an_open_question(self) -> None:
+        track = make_track()
+        state_dir = self._state_dir(
+            [(str(track.path), "suspect", "netease", 100, track.fingerprint())]
         )
-        self.assertEqual([track.path for track in wanted], [pending.path])
-        self.assertEqual(count_settled, 1)
-        self.assertEqual(count_written, 1)
+        scope = commands.open_tracks([track], state_dir)
+        self.assertEqual([item.path for item in scope.tracks], [track.path])
+
+    def test_a_scope_that_was_never_planned_lists_the_unplanned(self) -> None:
+        track = make_track()
+        scope = commands.open_tracks([track], self._state_dir([]))
+        self.assertEqual([item.path for item in scope.tracks], [track.path])
+        self.assertEqual(scope.mode, "unplanned")
+
+    def test_open_questions_win_over_unplanned_tracks(self) -> None:
+        # Nine unplanned tracks must not bury the one the last plan could not
+        # settle: that is the whole point of the default scope.
+        settled = make_track(path=Path("/lib/A/01.m4a"), relpath="A/01.m4a")
+        unplanned = [
+            make_track(path=Path(f"/lib/A/{index:02d}.m4a"), relpath=f"A/{index:02d}.m4a")
+            for index in range(2, 5)
+        ]
+        state_dir = self._state_dir(
+            [(str(settled.path), "ambiguous", "qq", 72, settled.fingerprint())]
+        )
+        scope = commands.open_tracks([settled, *unplanned], state_dir)
+        self.assertEqual([item.path for item in scope.tracks], [settled.path])
+        self.assertEqual(scope.unplanned, 3)
 
     def test_a_changed_file_is_offered_again(self) -> None:
         track = make_track(path=Path("/lib/A/01.m4a"), relpath="A/01.m4a")
@@ -1716,27 +1746,18 @@ class CandidateScopeTests(unittest.TestCase):
         state_dir = self._state_dir(
             [(str(track.path), "ready", "netease", 100, track.fingerprint())]
         )
-        wanted, settled, _ = commands.open_tracks([changed], state_dir)
-        self.assertEqual([item.path for item in wanted], [changed.path])
-        self.assertEqual(settled, 0)
+        scope = commands.open_tracks([changed], state_dir)
+        self.assertEqual([item.path for item in scope.tracks], [changed.path])
+        self.assertEqual(scope.mode, "unplanned")
 
-    def test_refresh_lists_settled_tracks_again(self) -> None:
-        track = make_track()
-        state_dir = self._state_dir(
-            [(str(track.path), "ready", "netease", 100, track.fingerprint())]
-        )
-        wanted, settled, _ = commands.open_tracks([track], state_dir, refresh=True)
-        self.assertEqual(wanted, [track])
-        self.assertEqual(settled, 0)
-
-    def test_all_ignores_the_cache_and_existing_lyrics(self) -> None:
+    def test_all_lists_every_track_including_settled_ones(self) -> None:
         track = make_track(existing_lyrics="[00:01]x")
         state_dir = self._state_dir(
             [(str(track.path), "ready", "netease", 100, track.fingerprint())]
         )
-        wanted, settled, _ = commands.open_tracks([track], state_dir, everything=True)
-        self.assertEqual(wanted, [track])
-        self.assertEqual(settled, 0)
+        scope = commands.open_tracks([track], state_dir, everything=True)
+        self.assertEqual(scope.tracks, [track])
+        self.assertEqual(scope.mode, "all")
 
 
 class ApplyFormatGuardTests(unittest.TestCase):
@@ -1837,11 +1858,11 @@ class ForcePlanTests(unittest.TestCase):
 
     def test_force_also_reaches_the_candidate_list(self) -> None:
         track = make_track(existing_lyrics="[00:01.00]旧歌词")
-        wanted, settled, written = commands.open_tracks(
-            [track], Path(tempfile.mkdtemp()), force=True
+        scope = commands.open_tracks(
+            [track], Path(tempfile.mkdtemp()), everything=True
         )
-        self.assertEqual(wanted, [track])
-        self.assertEqual((settled, written), (0, 1))
+        self.assertEqual(scope.tracks, [track])
+        self.assertEqual(scope.with_lyrics, 1)
 
 
 class SourceScopeTests(unittest.TestCase):
@@ -1871,14 +1892,13 @@ class SourceScopeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             track = make_track()
             state_dir = self._planned(Path(tmp), track)
-            wanted, settled, _ = commands.open_tracks([track], state_dir, sources=["qq"])
-            self.assertEqual([item.path for item in wanted], [track.path])
-            self.assertEqual(settled, 0)
-            kept, settled, _ = commands.open_tracks(
-                [track], state_dir, sources=["netease"]
-            )
-            self.assertEqual(kept, [])
-            self.assertEqual(settled, 1)
+            scope = commands.open_tracks([track], state_dir, sources=["qq"])
+            self.assertEqual([item.path for item in scope.tracks], [track.path])
+            self.assertEqual(scope.settled, 0)
+            self.assertEqual(scope.other_source, 1)
+            kept = commands.open_tracks([track], state_dir, sources=["netease"])
+            self.assertEqual(kept.tracks, [])
+            self.assertEqual(kept.settled, 1)
 
     def test_the_native_lyric_and_src_set_survive_a_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2021,6 +2041,132 @@ class ScanPlansTests(unittest.TestCase):
         out = render.strip_ansi(buffer.getvalue())
         self.assertIn("loose.m4a", out)
         self.assertNotIn("只看有计划", out)
+
+
+class PickWithoutLyricsTests(unittest.TestCase):
+    """A picked ID with no lyric must explain itself, not just refuse."""
+
+    def test_the_message_names_the_next_step(self) -> None:
+        track = make_track(title="Takeaway", artist="The Chainsmokers", duration=209.0)
+        source = _FixedSource(
+            "qq", [Candidate("qq", "1", "Takeaway", ["A"], "B", 209.0)], lyrics=""
+        )
+        result = plan_with_pick(track, [source], "qq:1", True, True)
+        self.assertEqual(result.status, "no_match")
+        self.assertIn("qq 上这个 ID 没有歌词", result.reason)
+        # The only candidate in the search was the pick itself: still no dead end.
+        self.assertIn("--src ne", result.reason)
+
+    def test_other_ids_from_the_same_search_are_offered(self) -> None:
+        track = make_track(duration=200.0)
+        source = _FixedSource(
+            "qq",
+            [
+                Candidate("qq", "1", "Track", ["A"], "B", 200.0),
+                Candidate("qq", "2", "Track (Remix)", ["A"], "B", 201.0),
+            ],
+            lyrics="",
+        )
+        result = plan_with_pick(track, [source], "qq:1", True, True)
+        self.assertIn("qq:2", result.reason)
+        self.assertIn("--pick", result.reason)
+
+    def test_alternatives_prefer_the_duration_tolerance(self) -> None:
+        track = make_track(duration=200.0)
+        results = [
+            Candidate("qq", "1", "A", [], "", 200.0),
+            Candidate("qq", "9", "Live", [], "", 260.0),
+            Candidate("qq", "2", "B", [], "", 201.0),
+        ]
+        self.assertEqual(
+            pick_alternatives(results, "1", track),
+            ["qq:2 B (201s)", "qq:9 Live (260s)"],
+        )
+
+
+class StatusCommandTests(unittest.TestCase):
+    """`status` shows what the database holds, and never creates it."""
+
+    def _args(self, **overrides):
+        values = {"library": None, "json": False, "no_color": True}
+        values.update(overrides)
+        return mock.Mock(**values)
+
+    def _planned_dir(self, root: Path) -> Track:
+        track = make_track()
+        state = State(root / "lyrics.sqlite3")
+        state.upsert_plan(
+            PlanResult(
+                track,
+                "ready",
+                "",
+                Candidate("netease", "1", "Track", ["Artist"], "Album", 200.0),
+                "[00:01.00]x\n",
+                100,
+                0.0,
+            ),
+            track.fingerprint(),
+            src_set="netease,qq",
+        )
+        state.cache_http("key", {"ok": True}, 3600)
+        return track
+
+    def test_plan_and_cache_counts_are_shown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._planned_dir(root)
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                code = commands.cmd_status(self._args(), root)
+            out = render.strip_ansi(buffer.getvalue())
+            self.assertEqual(code, 0)
+            self.assertIn("✓ 可写入 1", out)
+            self.assertIn("来源  ne 1", out)
+            self.assertIn("缓存   1 条", out)
+
+    def test_a_missing_database_is_reported_not_created(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                code = commands.cmd_status(self._args(), root)
+            self.assertEqual(code, 1)
+            self.assertIn("还没有建立", render.strip_ansi(buffer.getvalue()))
+            self.assertFalse((root / "lyrics.sqlite3").exists())
+
+    def test_json_is_machine_readable(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._planned_dir(root)
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                commands.cmd_status(self._args(json=True), root)
+            data = json.loads(buffer.getvalue())
+            self.assertEqual(data["summary"]["plans"]["total"], 1)
+            self.assertEqual(data["summary"]["cache"]["rows"], 1)
+
+
+class StateSummaryTests(unittest.TestCase):
+    def test_statuses_sources_and_expired_rows_are_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            track = make_track()
+            state = State(root / "lyrics.sqlite3")
+            state.upsert_plan(
+                PlanResult(track, "ambiguous", "q", score=72),
+                track.fingerprint(),
+                src_set="qq",
+            )
+            state.cache_http("fresh", {"a": 1}, 3600)
+            state.cache_http("stale", {"a": 2}, 0.0)
+            summary = read_state_summary(root / "lyrics.sqlite3")
+            self.assertEqual(summary["plans"]["total"], 1)
+            self.assertEqual(summary["plans"]["by_status"], {"ambiguous": 1})
+            self.assertEqual(summary["cache"]["rows"], 2)
+            self.assertEqual(summary["cache"]["expired"], 1)
+            self.assertTrue(summary["plans"]["latest"])
 
 
 if __name__ == "__main__":

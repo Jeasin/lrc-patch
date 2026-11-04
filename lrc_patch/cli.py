@@ -119,6 +119,10 @@ def main() -> int:
         return commands.cmd_scan(args, state_dir)
     if args.command == "config":
         return commands.cmd_config(args)
+    if args.command == "status":
+        # Read-only, and deliberately not under the run lock: "what is in the
+        # database" must be answerable while a long plan is running.
+        return commands.cmd_status(args, state_dir)
 
     with state_lock(state_dir):
         state = State(state_dir / "lyrics.sqlite3")

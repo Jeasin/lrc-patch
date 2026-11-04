@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import shlex
 import sqlite3
@@ -79,7 +80,7 @@ from .render import (
 )
 from .sorting import name_key, path_key, sort_paths
 from .sources import JsonClient, build_sources
-from .state import State, read_plan_cache, row_get
+from .state import State, read_plan_cache, read_state_summary, row_get
 from .text import lyric_hash, lyric_kind, lyric_tag, match_notes, sanitize_lyrics
 
 
@@ -299,6 +300,187 @@ def cmd_config(args: argparse.Namespace) -> int:
     print()
     return 0
 
+
+STATUS_ORDER = [
+    ("applied", "✓ 已写入"),
+    ("ready", "✓ 可写入"),
+    ("ambiguous", "! 需确认"),
+    ("suspect", "! 时间轴可疑"),
+    ("no_match", "✗ 无匹配"),
+    ("error", "✗ 失败"),
+    ("instrumental", "♪ 纯音乐"),
+    ("skip_existing", "· 已有歌词"),
+    ("rolled_back", "↩ 已回滚"),
+]
+
+
+def _human_bytes(count: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if count < 1024 or unit == "GB":
+            return f"{count:.1f} {unit}" if unit != "B" else f"{int(count)} B"
+        count /= 1024
+    return f"{count:.1f} GB"
+
+
+def _human_age(seconds: float) -> str:
+    if seconds <= 0:
+        return "刚刚"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.0f} 分钟前"
+    hours = minutes / 60
+    if hours < 48:
+        return f"{hours:.0f} 小时前"
+    return f"{hours / 24:.0f} 天前"
+
+
+def _local_stamp(value: str) -> str:
+    """Stored timestamps are UTC; show them in the user's own time zone."""
+    if not value:
+        return ""
+    try:
+        moment = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return value[:16].replace("T", " ")
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()
+    return moment.strftime("%Y-%m-%d %H:%M")
+
+
+def cmd_status(args: argparse.Namespace, state_dir: Path) -> int:
+    """Read-only overview of the state database, caches and reports."""
+    db = state_dir / "lyrics.sqlite3"
+    config = load_config()
+    library = getattr(args, "library", None) or config.library or DEFAULT_LIBRARY
+    summary = read_state_summary(db)
+    reports = state_dir / "reports"
+    report_files = sorted(reports.glob("*")) if reports.is_dir() else []
+    report_bytes = sum(item.stat().st_size for item in report_files if item.is_file())
+
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "state_dir": str(state_dir),
+                    "database": str(db),
+                    "size": db.stat().st_size if db.exists() else 0,
+                    "library": str(library),
+                    "reports": {"files": len(report_files), "bytes": report_bytes},
+                    "summary": summary,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    print_header("status", short_path(state_dir))
+    if summary is None:
+        if db.exists():
+            print(
+                "  "
+                + style("状态库读不出来：可能正在另一次写入中被锁住，或文件已损坏。", "33")
+            )
+            print_meta("文件", f"{short_path(db)}   {_human_bytes(db.stat().st_size)}")
+        else:
+            print("  " + style("状态库还没有建立：跑一次 plan 就有了。", "33"))
+        print()
+        return 1
+
+    wal = db.with_name(db.name + "-wal")
+    db_size = _human_bytes(db.stat().st_size if db.exists() else 0)
+    wal_size = _human_bytes(wal.stat().st_size) if wal.exists() else "0 B"
+    print_meta("状态库", f"{db_size}" + style(f"   WAL {wal_size}", "90"))
+    print_meta(
+        "配置",
+        short_path(config.path)
+        + style("   已读取" if config.exists else "   不存在，使用默认值", "90"),
+    )
+    print_meta("音乐库", short_path(library))
+    print()
+
+    plans = summary["plans"]
+    by_status = plans["by_status"]
+    print(
+        "  "
+        + style("▸ 计划", "36")
+        + f"   {plans['total']} 条"
+        + style(
+            f"   最近 {_local_stamp(plans['latest'])}" if plans["latest"] else "", "90"
+        )
+    )
+    chips = [
+        style(label, status_style(status)[1]) + f" {by_status[status]}"
+        for status, label in STATUS_ORDER
+        if by_status.get(status)
+    ]
+    if chips:
+        print("    " + "   ".join(chips))
+    if plans["by_source"]:
+        print(
+            "    "
+            + style("来源", "90")
+            + "  "
+            + "   ".join(
+                f"{source_label(name)} {count}"
+                for name, count in sorted(
+                    plans["by_source"].items(), key=lambda item: -item[1]
+                )
+            )
+        )
+    print()
+
+    cache = summary["cache"]
+    oldest_age = (
+        _human_age(time.time() - cache["oldest"]) if cache["oldest"] else "—"
+    )
+    print(
+        "  "
+        + style("▸ 缓存", "36")
+        + f"   {cache['rows']} 条   {_human_bytes(cache['bytes'])}"
+        + style(
+            f"   已过期 {cache['expired']}" if cache["expired"] else "   无过期",
+            "33" if cache["expired"] else "90",
+        )
+        + style(f"   最旧 {oldest_age}", "90")
+    )
+    journal = summary["journal"]
+    print(
+        "  "
+        + style("▸ 记录", "36")
+        + f"   {journal['rows']} 条可回滚"
+        + (
+            style(f"   {journal['rolled_back']} 条已回滚", "90")
+            if journal["rolled_back"]
+            else ""
+        )
+        + (
+            style(f"   最近写入 {_local_stamp(journal['latest'])}", "90")
+            if journal["latest"]
+            else ""
+        )
+    )
+    print(
+        "  "
+        + style("▸ 报告", "36")
+        + f"   {len(report_files)} 个   {_human_bytes(report_bytes)}"
+        + style(f"   {short_path(reports)}", "90")
+    )
+    print()
+    if by_status.get("ambiguous") or by_status.get("suspect"):
+        print(
+            "  "
+            + style("提示", "90")
+            + "  "
+            + style("lrcpatch candidates", "36")
+            + " 看这些 ! 需确认的曲目；"
+            + style("lrcpatch clean --dry-run", "36")
+            + " 看能回收多少空间。"
+        )
+        print()
+    return 0
+
+
 def collect_picks(
     args: argparse.Namespace,
     tracks: list[Track],
@@ -500,6 +682,8 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             )
 
     kept_good = 0
+    switched = 0
+    downgraded = 0
     if pending:
         live = ProgressLine()
         if not live.enabled:
@@ -535,6 +719,16 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                     # good; there is simply no new evidence to replace it.
                     kept_good += 1
                 else:
+                    # There is one plan per file, so a run with another --src
+                    # replaces the previous verdict rather than keeping both.
+                    # Say so: "my netease results vanished" is otherwise a
+                    # silent surprise.
+                    was = row_get(previous, "source", "") if previous else ""
+                    now = result.candidate.source if result.candidate else ""
+                    if was and was != now:
+                        switched += 1
+                        if previous["status"] == "ready" and result.status != "ready":
+                            downgraded += 1
                     state.upsert_plan(result, fingerprint, src_set)
                 done += 1
                 elapsed = time.monotonic() - started
@@ -593,6 +787,21 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             f"{kept_good} 条原 ready 计划"
             + style("（本次请求失败，未用失败结果覆盖）", "90"),
         )
+    if switched:
+        print_meta(
+            "换源",
+            f"{switched} 首改由 {','.join(source_label(name) for name in args.src)} 定论"
+            + style("（一个文件只留一条计划，旧结论已被覆盖；切回原来的源会重查，取词已缓存）", "90"),
+        )
+        if downgraded:
+            print_meta(
+                "降级",
+                style(
+                    f"其中 {downgraded} 首原本 ✓ 可写入，新源只给到 ! / ✗"
+                    "   想保留旧结论：candidates --src <原源> 比较后用 --pick 指定",
+                    "33",
+                ),
+            )
     if errors:
         print_meta("标签", style(f"读取失败 {len(errors)} 首（详见 scan）", "33"))
 
@@ -937,45 +1146,95 @@ def plan_uses_source(row: Any, sources: list[str] | None) -> bool:
     return str(source) in sources
 
 
+@dataclass
+class CandidateScope:
+    """What ``candidates`` is about to list, and what it is leaving out."""
+
+    tracks: list[Track]
+    mode: str  # questions | unplanned | all
+    settled: int = 0
+    unplanned: int = 0
+    with_lyrics: int = 0
+    other_source: int = 0
+
+
 def open_tracks(
     tracks: list[Track],
     state_dir: Path,
     everything: bool = False,
-    refresh: bool = False,
     sources: list[str] | None = None,
-    force: bool = False,
-) -> tuple[list[Track], int, int]:
-    """Tracks that still need a decision, plus the two kinds already settled.
+) -> CandidateScope:
+    """Pick the tracks ``candidates`` should list.
 
-    ``candidates`` exists to hand out IDs for the tracks the tool could not
-    settle.  Re-listing the ones that are already ✓ buries the handful that
-    need a human, so a fresh ``ready`` plan in the state database removes a
-    track from the default listing — unless ``--refresh``/``--force`` is given
-    or the plan came from a source that is no longer selected.  The database is
-    opened read-only (and not at all with ``--all``), so a concurrent
-    plan/apply is never disturbed.
+    The point of ``candidates`` is to answer "what does the tool want me to
+    decide?" — so the default scope is the open questions from the last plan
+    (`!` 需确认 and `!` 时间轴可疑), not the whole library: a library of 2000
+    mostly-unplanned files would otherwise bury the three tracks that matter.
+    ``--all`` still lists everything, and a scope that has never been planned
+    falls back to "everything without lyrics" so the first run is not empty.
+
+    The database is opened read-only (and not at all with ``--all``), so a
+    concurrent plan/apply is never disturbed.
     """
     with_lyrics = sum(1 for track in tracks if track.has_lyrics)
-    if everything or force:
-        return list(tracks), 0, with_lyrics
+    if everything:
+        return CandidateScope(list(tracks), "all", with_lyrics=with_lyrics)
+
     cached = read_plan_cache(state_dir / "lyrics.sqlite3")
+    questions: list[Track] = []
+    unplanned: list[Track] = []
     settled = 0
-    wanted: list[Track] = []
+    other_source = 0
     for track in tracks:
         if track.has_lyrics:
             continue
         row = cached.get(str(track.path))
-        if (
-            row
-            and row["fingerprint"] == track.fingerprint()
-            and row["status"] == "ready"
-            and not refresh
-            and plan_uses_source(row, sources)
-        ):
-            settled += 1
+        fresh = row is not None and row["fingerprint"] == track.fingerprint()
+        if not fresh:
+            unplanned.append(track)
             continue
-        wanted.append(track)
-    return wanted, settled, with_lyrics
+        if row["status"] in {"ambiguous", "suspect"}:
+            questions.append(track)
+            continue
+        # A ✓ plan from a source that is no longer selected says nothing about
+        # the sources being asked now: `candidates --src qq` must show qq.
+        if row["status"] == "ready" and not plan_uses_source(row, sources):
+            other_source += 1
+            questions.append(track)
+            continue
+        settled += 1
+
+    if questions:
+        return CandidateScope(
+            questions, "questions", settled, len(unplanned), with_lyrics, other_source
+        )
+    if unplanned:
+        return CandidateScope(unplanned, "unplanned", settled, len(unplanned), with_lyrics)
+    return CandidateScope([], "questions", settled, 0, with_lyrics)
+
+
+def scope_line(scope: CandidateScope) -> str:
+    """One line saying what is listed and what is being left out."""
+    if scope.mode == "all":
+        return f"全部 {len(scope.tracks)} 首（含 ✓ 与已有歌词）"
+    if scope.mode == "questions":
+        head = f"上次 plan 的 ! 需确认 {len(scope.tracks)} 首"
+        if scope.other_source:
+            head += f"（含 {scope.other_source} 首来自别的源的 ✓）"
+    else:
+        head = f"还没有结论的 {len(scope.tracks)} 首"
+    rest = []
+    if scope.settled:
+        rest.append(f"✓ {scope.settled}")
+    if scope.mode == "questions" and scope.unplanned:
+        rest.append(f"未 plan {scope.unplanned}")
+    if scope.with_lyrics:
+        rest.append(f"已有歌词 {scope.with_lyrics}")
+    if rest:
+        head += style(f"   另有 {' · '.join(rest)}", "90")
+    if scope.mode == "questions":
+        head += style("   看全部加 --all", "90")
+    return head
 
 
 def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> int:
@@ -995,13 +1254,8 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         impersonate=not getattr(args, "no_impersonate", False),
     )
     sources = build_sources(args.src, client, getattr(args, "target_format", None))
-    wanted, settled, with_lyrics = open_tracks(
-        tracks,
-        state_dir,
-        args.all,
-        refresh=args.refresh,
-        sources=args.src,
-    )
+    scope = open_tracks(tracks, state_dir, args.all, sources=args.src)
+    wanted = scope.tracks
 
     if not args.tsv:
         print_header(
@@ -1009,23 +1263,28 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
             f"{len(wanted)} 首  ·  每源最多 {args.top} 条"
             f"  ·  源 {','.join(source_label(name) for name in args.src)}",
         )
-        if settled or with_lyrics:
-            parts = []
-            if settled:
-                parts.append(f"{settled} 首已有 ✓ 计划，可直接 apply")
-            if with_lyrics:
-                parts.append(f"{with_lyrics} 首已有歌词")
-            # With --all nothing was skipped, so the hint would contradict the
-            # command that was just run.
-            print_meta(
-                "范围" if args.all else "跳过",
-                "   ".join(parts)
-                + ("" if args.all else style("   想看全部加 --refresh 或 --all", "90")),
-            )
         if not wanted:
-            print("  " + style("没有待确认的曲目：能定的都已定下。", "32"))
+            if scope.mode == "questions":
+                # Nothing to decide: say what the library already has instead
+                # of an empty table, and name the flag that widens the scope.
+                settled = f"{scope.settled} 首 ✓ 可写入" if scope.settled else ""
+                written = f"{scope.with_lyrics} 首已有歌词" if scope.with_lyrics else ""
+                facts = "，".join(part for part in (settled, written) if part)
+                print(
+                    "  "
+                    + style(
+                        "上一次 plan 没有 ! 需确认的曲目"
+                        + (f"（{facts}）" if facts else "")
+                        + "。",
+                        "32",
+                    )
+                )
+                print("  " + style("要看库里其它曲目的候选，加 --all。", "90"))
+            else:
+                print("  " + style("没有可查询的曲目。", "32"))
             print()
             return 0
+        print_meta("范围", scope_line(scope))
 
     # Query in parallel and buffer the results, so output stays grouped while a
     # 20-track album does not look frozen for three minutes.

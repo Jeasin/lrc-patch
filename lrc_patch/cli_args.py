@@ -26,6 +26,7 @@ COMMAND_NAMES = {
     "verify",
     "rollback",
     "candidates",
+    "status",
     "clean",
     "config",
 }
@@ -66,6 +67,7 @@ _EXAMPLES = [
     ('lrcpatch plan --pick ne:123 --apply "Ado/某首.m4a"', "指定并直接写入"),
     ('lrcpatch apply "Ado"', "只写 ✓ 可写入"),
     ('lrcpatch verify "Ado"', "写入后复核"),
+    ('lrcpatch status', "看状态库与缓存分布"),
     ('lrcpatch rollback --yes "Ado"', "回滚"),
 ]
 
@@ -164,6 +166,7 @@ def main_help(config: Config | None = None) -> str:
                 ("apply", "写入 ✓ 可写入，逐文件校验后原子替换"),
                 ("verify", "复核已写入的歌词、标签、封面、音频"),
                 ("rollback", "移除本工具写入且之后未被改动的歌词"),
+                ("status", "预览状态库里的计划、缓存与报告（只读）"),
                 ("clean", "清理过期缓存、旧报告与旧导出（安全清理）"),
                 ("config", "查看生效的默认值；--init 生成配置文件"),
             )
@@ -210,6 +213,7 @@ def main_help(config: Config | None = None) -> str:
                 "--a2  --eslrc  --yrc  --qrc  --ttml",
             ),
             ("scan", "--summary  --plans"),
+            ("status", "--json"),
             ("rollback", "--yes"),
             (
                 "clean",
@@ -758,9 +762,11 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
             '  lrcpatch candidates --top 3 "結束バンド"\n'
             '  lrcpatch candidates --template "Aimer"\n'
             '  lrcpatch candidates --tsv "Ado" > picks.tsv\n\n'
-            "默认只查还没有结论的曲目：已有歌词的、以及状态库里已经 ✓ 可写入的都不再列出来，所以 plan 之后跑一次 candidates，看到的就是那几首真正需要你决定。\n"
-            "计划来自的源不在当前 --src 里时，那首会重新列出来（用 --src qq 就能看到 qq 那边的候选）；--refresh 会连已 ✓ 的曲目一起重查，--all 连已有歌词的一起查。\n\n"
-            "状态库按文件路径逐条记录，每首取它自己最后一次 plan 的结果（文件大小或修改时间变了就不算数），不存在「整库最近一次」的快照；因此不同专辑可能来自不同次运行。\n\n"
+            "默认范围是上一次 plan 留下的 ! 需确认（含 ! 时间轴可疑）：plan 之后直接跑 candidates，看到的就是那几首真正需要你决定，而不是整个库。\n"
+            "库里还有没 plan 过的曲目时，会单独报一行「未 plan N」，要一起查加 --all；--all 连已有歌词、已经 ✓ 的曲目也列出来。\n"
+            "计划来自的源不在当前 --src 里时，那首也算未决：用 --src qq 就能看到 qq 那边的候选。--refresh 只作用于网络（忽略 HTTP 缓存重查），不改范围。\n\n"
+            "--all 不带路径 = 整个音乐库里所有缺歌词的曲目（含已经 ✓ 的），不是只查上次 plan 那批。\n\n"
+            "状态库按文件路径逐条记录，每首取它自己最后一次 plan 的结果（文件大小或修改时间变了就不算数），不存在「整库最近一次」的快照；因此不同专辑可能来自不同次运行。用 status 看整体分布。\n\n"
             "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 原生 / 标题 / 歌手 / 专辑。分数是标题+歌手+专辑的总分（满分 100），时长差单独一列，超过容差显示红色。"
             "“原生”是源会给出的格式（qq=QRC、ne=YRC/LRC、lrclib=LRC/TXT），apply 时再决定转成什么。排序先看是否在容差内，容差外的不会排在可用的前面。\n\n"
             "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
@@ -779,7 +785,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     candidates.add_argument(
         "--all",
         action="store_true",
-        help="连已有歌词、以及缓存里已经 ✓ 的曲目一起列出（默认只看还需要决定的）",
+        help="列出整个音乐库所有缺歌词的曲目（含已 ✓、已有歌词），不只上次 plan 的存疑项",
     )
     candidates.add_argument("--tsv", action="store_true", help="输出制表符分隔，便于做 pick-file")
     candidates.add_argument(
@@ -905,6 +911,48 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     add_tree_option(rollback)
     rollback.add_argument(
         "--yes", action="store_true", help="确认执行移除（不加只预览）"
+    )
+
+    status = sub.add_parser(
+        "status",
+        prog="lrcpatch status",
+        usage="lrcpatch status [--参数 …]",
+        help="预览状态库：计划、缓存、回滚记录与报告（只读）",
+        description="看一眼状态库里现在存了什么：各状态的计划、各源条数、HTTP 缓存量与过期数、可回滚记录、报告体积。",
+        epilog=(
+            "示例\n"
+            "  lrcpatch status                 概览\n"
+            "  lrcpatch status --json          给脚本用的 JSON\n\n"
+            "说明\n"
+            "  只读：打开状态库用只读连接，不建库、不迁移、不抢锁，可以和 plan/apply 同时跑。\n"
+            "  这里统计的是状态库（每首一条计划），不是音乐库；曲目与歌词格式请看 lrcpatch scan。\n"
+            "  ! 需确认的曲目可以接着用 lrcpatch candidates 看候选，想重新匹配用 lrcpatch plan --force。\n"
+            "  缓存与报告占的空间可以用 lrcpatch clean --dry-run 预估、clean 释放。\n"
+            '  状态库还没有时（没跑过 plan）会直接说明，不会顺手创建它。'
+        ),
+        formatter_class=HelpFormatter,
+        add_help=False,
+    )
+    add_help_option(status)
+    status.add_argument(
+        "--library",
+        type=Path,
+        metavar="DIR",
+        help="只影响这里显示的音乐库路径（默认取配置或 ~/Music/JMusic）",
+    )
+    status.add_argument(
+        "--state-dir",
+        type=Path,
+        metavar="DIR",
+        help="状态、缓存与报告目录（默认 $XDG_STATE_HOME/lrc-patch）",
+    )
+    status.add_argument(
+        "--no-color",
+        action="store_true",
+        help="关闭彩色输出（也可设 NO_COLOR=1）",
+    )
+    status.add_argument(
+        "--json", action="store_true", help="输出 JSON，便于脚本处理"
     )
 
     clean = sub.add_parser(

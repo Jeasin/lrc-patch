@@ -85,6 +85,69 @@ def read_plan_cache(path: Path) -> dict[str, sqlite3.Row]:
     finally:
         conn.close()
 
+
+def read_state_summary(path: Path, now: float | None = None) -> dict[str, Any] | None:
+    """Read-only snapshot of what the database currently holds.
+
+    ``status`` must never create, migrate or lock anything: it is the command
+    you run to find out what state you are in, so it opens the file read-only
+    and returns ``None`` instead of failing when there is nothing to read.
+    """
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)
+    except sqlite3.Error:
+        return None
+    clock = time.time() if now is None else now
+    try:
+        conn.row_factory = sqlite3.Row
+        summary: dict[str, Any] = {
+            "plans": {"total": 0, "by_status": {}, "by_source": {}, "latest": ""},
+            "cache": {"rows": 0, "bytes": 0, "expired": 0, "oldest": 0.0},
+            "journal": {"rows": 0, "rolled_back": 0, "latest": ""},
+        }
+        for row in conn.execute("SELECT status, COUNT(*) n FROM plans GROUP BY status"):
+            summary["plans"]["by_status"][row["status"]] = row["n"]
+            summary["plans"]["total"] += row["n"]
+        for row in conn.execute(
+            "SELECT source, COUNT(*) n FROM plans WHERE source IS NOT NULL AND source != ''"
+            " GROUP BY source"
+        ):
+            summary["plans"]["by_source"][row["source"]] = row["n"]
+        row = conn.execute("SELECT MAX(planned_at) m FROM plans").fetchone()
+        summary["plans"]["latest"] = row["m"] or "" if row else ""
+
+        row = conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(LENGTH(payload)),0) b,"
+            " COALESCE(SUM(CASE WHEN fetched_at + ttl < ? THEN 1 ELSE 0 END),0) expired,"
+            " COALESCE(MIN(fetched_at),0) oldest FROM http_cache",
+            (clock,),
+        ).fetchone()
+        if row:
+            summary["cache"] = {
+                "rows": row["n"],
+                "bytes": row["b"],
+                "expired": row["expired"],
+                "oldest": row["oldest"],
+            }
+
+        for row in conn.execute(
+            "SELECT status, COUNT(*) n FROM journal GROUP BY status"
+        ):
+            if row["status"] == "rolled_back":
+                summary["journal"]["rolled_back"] = row["n"]
+            else:
+                summary["journal"]["rows"] = row["n"]
+        row = conn.execute("SELECT MAX(applied_at) m FROM journal").fetchone()
+        summary["journal"]["latest"] = row["m"] or "" if row else ""
+        return summary
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
 class State:
     def __init__(self, path: Path):
         self.path = path

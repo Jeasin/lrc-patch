@@ -334,6 +334,32 @@ def assign_picks(
     return assignments, unresolved, preview
 
 
+def pick_alternatives(
+    results: list[Candidate], source_id: str, track: Track, limit: int = 2
+) -> list[str]:
+    """Other IDs from the same search, nearest duration first.
+
+    Only metadata is used, so this costs nothing: the search has already been
+    paid for.  Candidates inside the duration tolerance come first, because a
+    different recording is exactly what made the first pick useless.
+    """
+    others = [item for item in results if str(item.source_id) != str(source_id)]
+    tolerance = DEFAULT_DURATION_TOLERANCE
+    others.sort(
+        key=lambda item: (
+            abs(item.duration - track.duration) > tolerance,
+            abs(item.duration - track.duration),
+        )
+    )
+    out: list[str] = []
+    for item in others[:limit]:
+        out.append(
+            f"{source_label(item.source)}:{item.source_id} {item.title}"
+            f" ({item.duration:.0f}s)"
+        )
+    return out
+
+
 def plan_with_pick(
     track: Track,
     sources: list[Any],
@@ -392,9 +418,24 @@ def plan_with_pick(
     if fetched.instrumental:
         return PlanResult(track, "instrumental", f"{label}；标记为纯音乐", candidate)
     if not fetched.lyrics:
-        return PlanResult(
-            track, "error", f"{label}；{fetched.note or '没有可用歌词'}", candidate
-        )
+        # "No lyrics" here means *this ID* has none, which is not the same as
+        # "the provider failed": say it plainly and hand over the neighbouring
+        # IDs from the search we already ran, so the next attempt is one line
+        # instead of a guess.
+        note = fetched.note or "无可用歌词"
+        head = f"{label}；{source_label(source_name)} 上这个 ID 没有歌词"
+        if note != "无可用歌词":
+            head += f"（{note}）"
+        alternatives = pick_alternatives(results, source_id, track)
+        if alternatives:
+            head += "。同一次搜索里还有：" + "、".join(alternatives)
+            head += "  换一个用 --pick"
+        else:
+            # Never leave a dead end: name the two ways out of it.
+            other = [name for name in ("netease", "qq") if name != source_name]
+            hint = ",".join(source_label(name) for name in other) or "ne"
+            head += f"。这次搜索没有其它同名候选：换源试试（--src {hint}），或去掉 --pick 让工具自己挑"
+        return PlanResult(track, "no_match", head, candidate)
     if lyric_kind(fetched.lyrics) == "plain" and not allow_plain:
         return PlanResult(track, "error", f"{label}；只有纯文本，已按 --no-plain 拒绝", candidate)
     if fetched.note:

@@ -1006,6 +1006,7 @@ def print_intro(library: Path | None = None) -> None:
         ('lrcpatch plan "結束バンド"', "拖入目录 = 只读 plan"),
         ('lrcpatch plan --html "Ado"', "生成计划与 HTML 复核页"),
         ('lrcpatch candidates "Ado"', "查看候选 ID（配合 --pick）"),
+        ("lrcpatch status", "看状态库里存了什么"),
         ('lrcpatch apply "Ado"', "只写入 ✓ ready 的曲目"),
         ('lrcpatch verify "Ado"', "校验歌词与其他标签"),
         ('lrcpatch rollback --yes "Ado"', "回滚本工具写入的歌词"),
@@ -1029,6 +1030,7 @@ def print_intro(library: Path | None = None) -> None:
                 "apply",
                 "verify",
                 "rollback",
+                "status",
                 "clean",
                 "config",
             )
