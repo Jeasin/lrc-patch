@@ -1,9 +1,26 @@
+# Python
 __pycache__/
-*.pyc
-.DS_Store
-
+*.py[cod]
+*.egg-info/
 .venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 本地环境
+.DS_Store
 uv.lock
+
+# 工具运行时产物（状态库、报告、导出）
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+reports/
+state/
 
 # 本地随手记的问题反馈，不进版本库
 feedback-user.txt

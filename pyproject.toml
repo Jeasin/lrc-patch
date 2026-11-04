@@ -1,13 +1,36 @@
 [project]
 name = "lrc-patch"
-version = "2.10"
+version = "2.11"
 description = "Batch lyrics planning and embedding for a local music library"
+readme = "README.md"
 requires-python = ">=3.9"
+license = { file = "LICENSE.md" }
+authors = [{ name = "Jeasin", email = "jeasin39@outlook.com" }]
+keywords = ["lyrics", "lrc", "music", "tagging", "metadata", "netease", "qqmusic", "cli"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Sound/Audio",
+  "Topic :: Text Processing :: Markup",
+]
 dependencies = ["mutagen>=1.47", "curl_cffi>=0.7"]
 
 [project.scripts]
 lrcpatch = "lrc_patch.cli:run"
 lyrics = "lrc_patch.cli:run"
+
+[project.urls]
+Homepage = "https://github.com/Jeasin/lrc-patch"
+Issues = "https://github.com/Jeasin/lrc-patch/issues"
 
 [build-system]
 requires = ["hatchling"]
@@ -15,3 +38,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["lrc_patch"]
+
+[tool.hatch.build.targets.sdist]
+include = ["lrc_patch", "tests", "lrcpatch", "README.md", "LICENSE.md", "pyproject.toml"]
