@@ -92,8 +92,18 @@ class UrllibTransport:
                     raw = _gunzip(raw)
                 return status, raw, headers
         except urllib.error.HTTPError as exc:
-            payload = exc.read() or b""
-            return int(exc.code), payload, dict(exc.headers or {})
+            # A body-less HTTPError (no fp) makes exc.read() blow up on 3.9
+            # with KeyError: 'file'; a transport error must never mask the
+            # status code we want to report and retry on.
+            try:
+                payload = exc.read() or b""
+            except Exception:
+                payload = b""
+            try:
+                response_headers = dict(exc.headers or {})
+            except Exception:
+                response_headers = {}
+            return int(exc.code or 0), payload, response_headers
 
 
 class CurlTransport:

@@ -701,6 +701,20 @@ class JsonClientTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def test_bodyless_http_error_reports_its_status(self) -> None:
+        # urlopen raises HTTPError with fp=None: exc.read() must not explode on
+        # 3.9 (KeyError: 'file') and hide the 503 we want to retry on.
+        def fail(request, timeout=30):
+            raise urllib.error.HTTPError(request.full_url, 503, "busy", {}, None)
+
+        with mock.patch.object(sources.urllib.request, "urlopen", fail):
+            status, payload, headers = sources.UrllibTransport().request(
+                "GET", "https://example.invalid/x"
+            )
+        self.assertEqual(status, 503)
+        self.assertEqual(payload, b"")
+        self.assertEqual(headers, {})
+
     def test_retries_then_raises_and_does_not_cache(self) -> None:
         calls: list[str] = []
 
