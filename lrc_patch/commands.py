@@ -29,6 +29,7 @@ from .audio import (
     preflight_apply,
     read_track,
     stage_copy,
+    write_lyrics_only,
 )
 from .config import (
     DEFAULT_DURATION_TOLERANCE,
@@ -40,6 +41,7 @@ from .config import (
     write_config_template,
 )
 from .errors import ToolError, VerificationError
+from .lyric_fmt import render_native
 from .matching import (
     assign_picks,
     keep_previous_plan,
@@ -77,8 +79,8 @@ from .render import (
 )
 from .sorting import name_key, path_key, sort_paths
 from .sources import JsonClient, build_sources
-from .state import State, read_plan_cache
-from .text import lyric_hash, lyric_kind, lyric_tag, match_notes
+from .state import State, read_plan_cache, row_get
+from .text import lyric_hash, lyric_kind, lyric_tag, match_notes, sanitize_lyrics
 
 
 def summarize_plans(rows: list[sqlite3.Row]) -> Counter:
@@ -164,10 +166,29 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
         if row["status"] in {"ambiguous", "suspect"} and not track.has_lyrics:
             review_cached += 1
 
+    if getattr(args, "plans", False):
+        # "Which 14 tracks does apply want to write?" is a question the summary
+        # line raised but could not answer.
+        tracks = [track for track in tracks if str(track.path) in cached]
+        formats = Counter(track.fmt for track in tracks)
+        existing = Counter(track.fmt for track in tracks if track.has_lyrics)
+        ready_cached = sum(
+            1
+            for track in tracks
+            if cached[str(track.path)][2] == "ready" and not track.has_lyrics
+        )
+        review_cached = sum(
+            1
+            for track in tracks
+            if cached[str(track.path)][2] in {"ambiguous", "suspect"}
+            and not track.has_lyrics
+        )
+
     print_header(
         "scan",
         f"{truncate_display(scan_scope(args, library), max(20, screen_width() - 30))}"
-        f"  ·  {len(tracks)} 首",
+        f"  ·  {len(tracks)} 首"
+        + ("  ·  只看有计划" if getattr(args, "plans", False) else ""),
     )
     print("  " + style("▸ ", "36") + style("格式", "1;36"))
     items = sorted(formats)
@@ -204,6 +225,8 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
             parts.append(f"{ready_cached} 首已匹配" + style("，可直接 apply", "90"))
         if review_cached:
             parts.append(f"{review_cached} 首需确认" + style("（带 ?）", "90"))
+        if not getattr(args, "plans", False):
+            parts.append(style("lrcpatch scan --plans 只看这些", "90"))
         print_meta("计划", "   ".join(parts))
     if errors:
         print("  " + style("▸ ", "36") + style("标签读取失败", "1;31"))
@@ -282,6 +305,7 @@ def collect_picks(
     library: Path,
     sources: list[Any] | None = None,
     tolerance: float = DEFAULT_DURATION_TOLERANCE,
+    force: bool = False,
 ) -> tuple[
     dict[str, str], list[str], list[tuple[Track, Candidate, int, float]]
 ]:
@@ -301,16 +325,19 @@ def collect_picks(
     preview: list[tuple[Track, Candidate, int, float]] = []
     unresolved: list[str] = []
     if values:
-        eligible = [track for track in tracks if not track.has_lyrics]
+        eligible = [track for track in tracks if force or not track.has_lyrics]
         if not eligible:
-            raise ToolError("--pick 指定了候选，但当前范围内没有缺歌词的曲目")
+            raise ToolError(
+                "--pick 指定了候选，但当前范围内没有缺歌词的曲目；"
+                "要给已有歌词的文件换词，加 --force"
+            )
         if len(values) == 1 and len(eligible) == 1:
             picks[str(eligible[0].path)] = values[0]
         else:
             if sources is None:
                 raise ToolError("无法为多个 --pick 配对：缺少歌词源")
             assigned, unresolved, preview = assign_picks(
-                tracks, values, sources, tolerance
+                tracks, values, sources, tolerance, force=force
             )
             picks.update(assigned)
             if unresolved:
@@ -318,7 +345,8 @@ def collect_picks(
                     "这些 --pick 无法配对到范围内的曲目："
                     + "、".join(unresolved)
                     + "\n可能是 ID 查不到详情，或标题/歌手与范围内任何缺词曲目都不符。"
-                    "\n把范围缩小到单个文件，或改用 --pick-file（每行：路径<TAB>源:ID）。"
+                    "\n把范围缩小到单个文件，或改用 --pick-file（每行：路径<TAB>源:ID）；"
+                    "已有歌词的文件需要 --force。"
                 )
 
     selected = {str(track.path) for track in tracks}
@@ -346,7 +374,12 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     )
     source_objects = build_sources(args.src, client, getattr(args, "target_format", None))
     picks, _unresolved, pick_preview = collect_picks(
-        args, tracks, library, source_objects, args.duration_tolerance
+        args,
+        tracks,
+        library,
+        source_objects,
+        args.duration_tolerance,
+        force=bool(getattr(args, "force", False)),
     )
     report = args.report or (state_dir / "reports" / f"plan-{stamp}.csv")
 
@@ -354,8 +387,15 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     reused = 0
     retrying = 0
     target_format = getattr(args, "target_format", None)
+    force = bool(getattr(args, "force", False))
+    src_set = ",".join(args.src)
     for track in tracks:
         old = state.get_plan(str(track.path))
+        if force:
+            # --force distrusts both the file's current lyrics and any stored
+            # verdict: search, match and re-plan everything in scope.
+            pending.append(track)
+            continue
         if str(track.path) in picks:
             pending.append(track)
             continue
@@ -377,6 +417,13 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                 if target_format and old["lyric_kind"] != target_format:
                     pending.append(track)
                     continue
+                # A plan from a source that is no longer selected says nothing
+                # about the sources that are: `--src qq` after `ne,qq` must
+                # re-ask qq instead of showing netease's verdict, while the
+                # qq plans it already has stay reused.
+                if not plan_uses_source(old, args.src):
+                    pending.append(track)
+                    continue
                 reused += 1
                 continue
             if old["status"] == "error":
@@ -386,6 +433,15 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                 pending.append(track)
                 continue
             if old["status"] in {"no_match", "ambiguous", "suspect"} and not args.retry_failed:
+                # Every "not settled" verdict depends on which sources answered,
+                # so a different --src list deserves a fresh look: after
+                # `--src qq` the old netease ! / 无匹配 says nothing about qq.
+                # Rows from before src_set existed are trusted once so an
+                # upgrade does not re-query the whole library.
+                stored_src = row_get(old, "src_set", "")
+                if stored_src and stored_src != src_set:
+                    pending.append(track)
+                    continue
                 reused += 1
                 continue
         pending.append(track)
@@ -400,6 +456,21 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         f"{','.join(source_label(name) for name in args.src)}"
         + style(f"   复用 {reused}   查询 {len(pending)}   并发 {args.workers}", "90"),
     )
+    if force:
+        overwrite = sum(1 for track in tracks if track.has_lyrics)
+        print_meta(
+            "强制",
+            "忽略已有计划重新匹配"
+            + (
+                style(
+                    f"   其中 {overwrite} 首已有歌词，写入要 apply --force"
+                    "（一步到位：plan --force --apply）",
+                    "33",
+                )
+                if overwrite
+                else ""
+            ),
+        )
     if retrying:
         print_meta(
             "重试",
@@ -407,7 +478,11 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             + style("（失败或匹配规则更新，本次自动重查）", "90"),
         )
     if picks:
-        ignored = sum(1 for track in tracks if str(track.path) in picks and track.has_lyrics)
+        ignored = sum(
+            1
+            for track in tracks
+            if str(track.path) in picks and track.has_lyrics and not force
+        )
         print_meta(
             "指定",
             f"{len(picks)} 首"
@@ -442,6 +517,7 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                     args.duration_tolerance,
                     not args.no_timestamp_check,
                     picks.get(str(track.path)),
+                    force,
                 ): track
                 for track in pending
             }
@@ -459,7 +535,7 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                     # good; there is simply no new evidence to replace it.
                     kept_good += 1
                 else:
-                    state.upsert_plan(result, fingerprint)
+                    state.upsert_plan(result, fingerprint, src_set)
                 done += 1
                 elapsed = time.monotonic() - started
                 rate = done / elapsed if elapsed else 0
@@ -675,11 +751,22 @@ def candidate_rows(track: Track, results: list, args: argparse.Namespace) -> lis
         for candidate in candidates:
             score, diff = score_candidate(track, candidate, args.duration_tolerance)
             # Rank by metadata first: a correct title/artist with a long
-            # duration gap should outrank a cover that happens to be closer.
+            # duration gap should outrank a cover that happens to be closer —
+            # but only among candidates that could actually be written.  A
+            # live version 13s off must not sit above the right recording.
             metadata_score, _ = score_candidate(track, candidate, 999.0)
-            ranked.append((metadata_score, score, diff, candidate))
-        ranked.sort(key=lambda item: (-item[0], -item[1], item[2], -item[3].synced))
-        for metadata_score, score, diff, candidate in ranked[: args.top]:
+            within = diff <= args.duration_tolerance
+            ranked.append((within, metadata_score, score, diff, candidate))
+        ranked.sort(
+            key=lambda item: (
+                not item[0],
+                -item[1],
+                -item[2],
+                item[3],
+                -int(item[4].synced),
+            )
+        )
+        for within, metadata_score, score, diff, candidate in ranked[: args.top]:
             if candidate.instrumental:
                 # Adopting it yields ♪ 纯音乐, not a lyric: do not mark ✓.
                 symbol, code = "♪", "36"
@@ -695,8 +782,12 @@ def candidate_rows(track: Track, results: list, args: argparse.Namespace) -> lis
                 kind = lyric_tag(lyric_kind(candidate.lyrics))
             elif candidate.synced:
                 kind = "LRC"
+            elif candidate.source == "netease":
+                # netease serves YRC when the track has one and line-timed LRC
+                # otherwise; which one it will be is only known after fetching.
+                kind = "YRC/LRC"
             else:
-                kind = "待取词"
+                kind = lyric_tag(candidate.native_kind or "lrc")
             notes = match_notes(track, candidate, args.duration_tolerance)
             rows.append(
                 CandRow(
@@ -740,7 +831,7 @@ def candidate_table_head(widths: tuple[int, int, int, int, int]) -> str:
         pad_display("候选 ID", w_id),
         pad_display("分数", SCORE_WIDTH),
         pad_display("时长差", w_diff),
-        pad_display("格式", w_kind),
+        pad_display("原生", w_kind),
         pad_display("标题", w_title),
         pad_display("歌手", w_artist),
         "专辑",
@@ -829,19 +920,43 @@ def template_target(args: argparse.Namespace, state_dir: Path) -> Path:
     return state_dir / "picks" / f"{name}-{stamp}.tsv"
 
 
+def plan_uses_source(row: Any, sources: list[str] | None) -> bool:
+    """Did this plan come from one of the sources the user is asking for now?
+
+    A ready plan from netease must not hide a track when the user runs
+    ``candidates --src qq``: they are asking to compare the other provider, and
+    skipping the row made that impossible (``--refresh`` included).
+    """
+    if not sources:
+        return True
+    source = row_get(row, "source", None)
+    if not source:
+        # skip_existing / instrumental rows carry no source; they are about the
+        # file, not about a provider.
+        return True
+    return str(source) in sources
+
+
 def open_tracks(
-    tracks: list[Track], state_dir: Path, everything: bool = False
+    tracks: list[Track],
+    state_dir: Path,
+    everything: bool = False,
+    refresh: bool = False,
+    sources: list[str] | None = None,
+    force: bool = False,
 ) -> tuple[list[Track], int, int]:
     """Tracks that still need a decision, plus the two kinds already settled.
 
     ``candidates`` exists to hand out IDs for the tracks the tool could not
     settle.  Re-listing the ones that are already ✓ buries the handful that
     need a human, so a fresh ``ready`` plan in the state database removes a
-    track from the default listing.  The database is opened read-only (and not
-    at all with ``--all``), so a concurrent plan/apply is never disturbed.
+    track from the default listing — unless ``--refresh``/``--force`` is given
+    or the plan came from a source that is no longer selected.  The database is
+    opened read-only (and not at all with ``--all``), so a concurrent
+    plan/apply is never disturbed.
     """
     with_lyrics = sum(1 for track in tracks if track.has_lyrics)
-    if everything:
+    if everything or force:
         return list(tracks), 0, with_lyrics
     cached = read_plan_cache(state_dir / "lyrics.sqlite3")
     settled = 0
@@ -854,6 +969,8 @@ def open_tracks(
             row
             and row["fingerprint"] == track.fingerprint()
             and row["status"] == "ready"
+            and not refresh
+            and plan_uses_source(row, sources)
         ):
             settled += 1
             continue
@@ -878,7 +995,13 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         impersonate=not getattr(args, "no_impersonate", False),
     )
     sources = build_sources(args.src, client, getattr(args, "target_format", None))
-    wanted, settled, with_lyrics = open_tracks(tracks, state_dir, args.all)
+    wanted, settled, with_lyrics = open_tracks(
+        tracks,
+        state_dir,
+        args.all,
+        refresh=args.refresh,
+        sources=args.src,
+    )
 
     if not args.tsv:
         print_header(
@@ -892,9 +1015,12 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
                 parts.append(f"{settled} 首已有 ✓ 计划，可直接 apply")
             if with_lyrics:
                 parts.append(f"{with_lyrics} 首已有歌词")
+            # With --all nothing was skipped, so the hint would contradict the
+            # command that was just run.
             print_meta(
-                "跳过",
-                "   ".join(parts) + style("   --all 可全部重查", "90"),
+                "范围" if args.all else "跳过",
+                "   ".join(parts)
+                + ("" if args.all else style("   想看全部加 --refresh 或 --all", "90")),
             )
         if not wanted:
             print("  " + style("没有待确认的曲目：能定的都已定下。", "32"))
@@ -1045,11 +1171,13 @@ def select_plan_rows(
     album: str | None,
     limit: int | None,
     paths: list[str] | None = None,
+    statuses: tuple[str, ...] = ("ready",),
 ) -> list[sqlite3.Row]:
     selected = resolve_selection(library, paths, strict=False)
     rows = [
         row
-        for row in state.list_plans("ready")
+        for status in statuses
+        for row in state.list_plans(status)
         if selection_matches(Path(row["path"]), library, album, selected)
     ]
     rows.sort(key=lambda row: path_key(Path(row["path"]), library))
@@ -1082,26 +1210,65 @@ def _skip_text(counter: Counter) -> str:
 FORMAT_TAGS = {"a2": "A2", "eslrc": "ESLRC", "yrc": "YRC", "qrc": "QRC", "ttml": "TTML"}
 
 
-def format_mismatch(rows: list, target: str) -> list:
-    """Rows whose cached lyric is not the format ``--<target>`` asks for.
+def lyric_for_target(row: Any, target: str | None) -> tuple[str, str]:
+    """``(lyrics, kind)`` to write for one row, converting when asked.
 
-    The lyric text is produced while planning — that is where a provider's
-    verbatim track is kept or converted — so a format flag at apply time
-    cannot change it.  Refusing beats writing an LRC while the flag says QRC.
+    The plan keeps the provider's own text (``native_lyric``/``native_kind``)
+    next to the requested one, so ``--qrc``/``--a2``/… at apply time is a
+    conversion instead of a re-fetch.  Raises :class:`ToolError` when the
+    stored plan simply cannot produce that format.
     """
-    return [row for row in rows if (row["lyric_kind"] or "") != target]
+    stored = row_get(row, "lyric", "") or ""
+    stored_kind = row_get(row, "lyric_kind", "") or (
+        lyric_kind(stored) if stored else ""
+    )
+    if not target or target == stored_kind:
+        return stored, stored_kind
+    tag = FORMAT_TAGS.get(target, target.upper())
+    native = row_get(row, "native_lyric", "") or ""
+    native_kind = row_get(row, "native_kind", "") or stored_kind
+    if not native:
+        raise ToolError(
+            f"计划里没有原生歌词（旧版本生成的计划），无法转成 {tag}；"
+            f"请先 plan --{target} 重新取词"
+        )
+    converted, note = render_native(native, native_kind, target)
+    if note:
+        raise ToolError(note)
+    text = sanitize_lyrics(converted)
+    kind = lyric_kind(text)
+    if kind != target:
+        raise ToolError(
+            f"转换结果是 {lyric_tag(kind)}，不是 {tag}"
+        )
+    return text, kind
+
+
+def format_mismatch(rows: list, target: str) -> list:
+    """Rows that cannot produce the format ``--<target>`` asks for."""
+    bad: list = []
+    for row in rows:
+        try:
+            lyric_for_target(row, target)
+        except ToolError:
+            bad.append(row)
+    return bad
 
 
 def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     library = args.library.expanduser().resolve()
+    force = bool(getattr(args, "force", False))
+    writable = ("ready", "suspect") if force else ("ready",)
     selected = resolve_selection(library, args.path, strict=False)
     scoped = [
         row
         for row in state.list_plans()
         if selection_matches(Path(row["path"]), library, args.album, selected)
     ]
-    rows = select_plan_rows(state, library, args.album, args.limit, args.path)
-    skipped = Counter(row["status"] for row in scoped if row["status"] != "ready")
+    rows = select_plan_rows(
+        state, library, args.album, args.limit, args.path, writable
+    )
+    skipped = Counter(row["status"] for row in scoped if row["status"] not in writable)
     scope = selection_label(args)
     if not rows:
         print_header(
@@ -1121,19 +1288,28 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         print()
         return 2
     target = getattr(args, "target_format", None)
-    if target:
-        mismatched = format_mismatch(rows, target)
-        if mismatched:
-            names = "、".join(Path(row["path"]).name for row in mismatched[:3])
-            more = f" 等 {len(mismatched)} 首" if len(mismatched) > 3 else ""
-            tag = FORMAT_TAGS.get(target, target.upper())
-            scope_args = " ".join(shlex.quote(item) for item in (args.path or []))
-            raise ToolError(
-                f"计划里的歌词不是 {tag}：{names}{more}。\n"
-                "歌词在 plan 取词时就已经定好格式并存入状态库，apply 只写这份文本。\n"
-                f"想换成 {tag}，让 plan 重新取词：lrcpatch plan --{target} --apply"
-                + (f" {scope_args}" if scope_args else "")
-            )
+    # Convert every row before touching a file: failing on the third file after
+    # two writes is worse than one clear message.  A row whose native lyric
+    # cannot reach the requested format is skipped (it is written as LRC in a
+    # normal run); only a batch with nothing convertible is refused outright.
+    prepared: dict[str, tuple[str, str]] = {}
+    unusable: list[tuple[str, str]] = []
+    for row in rows:
+        try:
+            prepared[row["path"]] = lyric_for_target(row, target)
+        except ToolError as exc:
+            unusable.append((row["path"], str(exc)))
+    if unusable and not prepared:
+        names = "、".join(Path(path).name for path, _ in unusable[:3])
+        more = f" 等 {len(unusable)} 首" if len(unusable) > 3 else ""
+        raise ToolError(
+            f"这些计划无法写成 {FORMAT_TAGS.get(target or '', target or '')}："
+            f"{names}{more}\n  {unusable[0][1]}\n"
+            "转不出来是因为源只给了逐行 LRC（没有逐字时间轴）；"
+            "去掉该格式参数即可按 LRC 写入"
+        )
+    if unusable:
+        rows = [row for row in rows if row["path"] in prepared]
     print_header(
         "apply",
         f"{truncate_display(scope, max(20, screen_width() - 30))}  ·  {len(rows)} 首",
@@ -1143,12 +1319,36 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         "临时副本验证后原子替换；失败则原文件不动"
         + style(f"   并发 {args.workers}", "90"),
     )
+    if force:
+        print_meta(
+            "强制",
+            "连 ! 时间轴可疑的计划一起写；已有歌词会被覆盖"
+            + style("（rollback 可还原原歌词）", "90"),
+        )
     if skipped:
         print_meta(
             "跳过",
             f"{sum(skipped.values())} 首非 ready：" + _skip_text(skipped),
         )
         print_meta("说明", "只写 ✓ 可写入；! 需确认、✗ 失败/无匹配都不会写入")
+    kinds = Counter(kind for _, kind in prepared.values())
+    if target or len(kinds) > 1 or (kinds and next(iter(kinds)) not in ("lrc", "")):
+        print_meta(
+            "格式",
+            "   ".join(
+                f"{lyric_tag(kind) if kind else '—'} {count}"
+                for kind, count in kinds.most_common()
+            ),
+        )
+    if unusable:
+        tag = FORMAT_TAGS.get(target or "", (target or "").upper())
+        names = "、".join(Path(path).name for path, _ in unusable[:3])
+        more = f" 等 {len(unusable)} 首" if len(unusable) > 3 else ""
+        print_meta(
+            "跳过格式",
+            f"{names}{more} 无法写成 {tag}"
+            + style("（源只给了逐行 LRC，没有逐字时间轴；去掉该参数可按 LRC 写）", "90"),
+        )
 
     if not args.no_preflight:
         live = ProgressLine()
@@ -1165,6 +1365,7 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     applied_paths: set[str] = set()
     outcomes: list[tuple[Path, bool, str, str]] = []
     done = 0
+    overwritten = 0
     failed = False
     batch_size = 10
     live = ProgressLine()
@@ -1176,7 +1377,14 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         for start in range(0, len(rows), batch_size):
             batch = rows[start : start + batch_size]
             futures = {
-                pool.submit(apply_one, row, library): row for row in batch
+                pool.submit(
+                    apply_one,
+                    row,
+                    library,
+                    prepared[row["path"]][0],
+                    force,
+                ): row
+                for row in batch
             }
             for future in as_completed(futures):
                 row = futures[future]
@@ -1188,13 +1396,24 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                     state.set_plan_status(str(path), "applied", "写入并校验成功")
                     applied_paths.add(str(path))
                     counts["applied"] += 1
+                    if journal.get("pre_lyrics_present"):
+                        overwritten += 1
                     sources[source] += 1
                     outcomes.append((path, True, source, ""))
                 except Exception as exc:
                     message = f"{type(exc).__name__}: {exc}"
                     if "file policy" in str(exc):
                         message += "（当前会话无权覆盖音乐库，请在终端运行 apply）"
-                    state.set_plan_status(str(path), "error", message)
+                    elif "拒绝覆盖" in str(exc):
+                        # The plan said ✓, yet the file grew lyrics since: say
+                        # what unlocks it instead of leaving a dead end.
+                        message += "（加 apply --force 可覆盖；原歌词会存入回滚记录）"
+                        # Nothing is wrong with the lyric itself, so keep the
+                        # plan usable: `apply --force` can retry right away
+                        # instead of asking for another network round trip.
+                        state.set_plan_status(str(path), "ready", message)
+                    else:
+                        state.set_plan_status(str(path), "error", message)
                     counts["error"] += 1
                     outcomes.append((path, False, source, message))
                     failed = True
@@ -1226,14 +1445,25 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             "来源",
             "   ".join(f"{name} {count}" for name, count in sources.most_common()),
         )
+    if overwritten:
+        print_meta(
+            "覆盖",
+            f"{overwritten} 首原本已有歌词"
+            + style("，原歌词已存入回滚记录（rollback 可还原）", "90"),
+        )
     if failed and len(rows) > done:
         print_meta("未处理", f"{len(rows) - done} 首因失败停止而保持原样")
     print_meta("网络", "未发起请求，直接使用 plan 结果")
     if getattr(args, "lrc", False):
         lrc_dir = (args.lrc_dir or default_lrc_dir()).expanduser()
+        # Export what was actually written, conversions included.
         written, failed_lrc = export_lrc(
             library,
-            [row for row in rows if row["path"] in applied_paths],
+            [
+                {"path": path, "lyric": prepared[path][0]}
+                for path in sorted(applied_paths)
+                if path in prepared
+            ],
             {},
             lrc_dir,
         )
@@ -1341,6 +1571,14 @@ def cmd_rollback(args: argparse.Namespace, state: State, state_dir: Path) -> int
         return 2
     scope = selection_label(args)
     if not args.yes:
+        # A --force write may have replaced a lyric that was already there, so
+        # rollback is "还原" for those rows and "移除" only for the rest.
+        restores = sum(
+            1
+            for row in rows
+            if row["pre_lyrics_present"] and (row["pre_lyrics"] or "").strip()
+        )
+        removals = len(rows) - restores
         print_header(
             "rollback",
             f"{truncate_display(scope, max(20, screen_width() - 30))}"
@@ -1349,12 +1587,26 @@ def cmd_rollback(args: argparse.Namespace, state: State, state_dir: Path) -> int
         print_meta("范围", "只处理 journal 中由本工具写入、且歌词之后未被改动过的曲目")
         print()
         print_tree(
-            [TreeEntry(Path(row["path"]), "pending") for row in rows],
+            [
+                TreeEntry(
+                    Path(row["path"]),
+                    "pending",
+                    "还原原歌词"
+                    if row["pre_lyrics_present"] and (row["pre_lyrics"] or "").strip()
+                    else "移除本工具写入的歌词",
+                )
+                for row in rows
+            ],
             library,
             args.tree_limit,
         )
         print("  " + rule())
-        print_summary(Counter({"pending": len(rows)}), label="合计")
+        parts = []
+        if restores:
+            parts.append(f"还原 {restores}")
+        if removals:
+            parts.append(f"移除 {removals}")
+        print("  " + style("合计", "90") + "  " + style("↩", "36") + " " + " / ".join(parts))
         print()
         print(
             "  "
@@ -1393,10 +1645,18 @@ def cmd_rollback(args: argparse.Namespace, state: State, state_dir: Path) -> int
             pre_cover = cover_hash(path)
             pre_audio = audio_hash(path)
             staged = stage_copy(path)
+            previous = row["pre_lyrics"] or ""
             try:
-                clear_lyrics_only(staged, row["written_lyrics_sha"])
-                if read_track(staged, library).existing_lyrics:
-                    raise VerificationError("歌词未完全移除")
+                if row["pre_lyrics_present"] and previous.strip():
+                    # A --force write replaced a lyric that was already there:
+                    # rollback puts it back instead of emptying the field.
+                    write_lyrics_only(staged, previous)
+                    if read_track(staged, library).existing_lyrics.strip() != previous.strip():
+                        raise VerificationError("原歌词回写不一致")
+                else:
+                    clear_lyrics_only(staged, row["written_lyrics_sha"])
+                    if read_track(staged, library).existing_lyrics:
+                        raise VerificationError("歌词未完全移除")
                 if non_lyrics_tags_hash(staged) != pre_tags:
                     raise VerificationError("非歌词标签发生变化")
                 if cover_hash(staged) != pre_cover:
@@ -1410,7 +1670,13 @@ def cmd_rollback(args: argparse.Namespace, state: State, state_dir: Path) -> int
             state.set_journal_status(str(path), "rolled_back")
             state.set_plan_status(str(path), "rolled_back", "已回滚")
             counts["rolled_back"] += 1
-            entries.append(TreeEntry(path, "rolled_back", "已移除并校验"))
+            entries.append(
+                TreeEntry(
+                    path,
+                    "rolled_back",
+                    "已还原原歌词" if previous.strip() else "已移除并校验",
+                )
+            )
         except Exception as exc:
             counts["error"] += 1
             entries.append(TreeEntry(path, "error", f"{type(exc).__name__}: {exc}"))

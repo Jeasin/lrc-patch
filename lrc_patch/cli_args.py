@@ -195,7 +195,7 @@ def main_help(config: Config | None = None) -> str:
             (
                 "plan",
                 "--pick SRC:ID  --pick-file FILE  --apply  --html [FILE]  --lrc\n"
-                "--src LIST  --workers N  --refresh  --retry-failed\n"
+                "--src LIST  --workers N  --refresh  --force  --retry-failed\n"
                 "--duration-tolerance SEC  --no-timestamp-check\n"
                 "--a2  --eslrc  --yrc  --qrc  --ttml",
             ),
@@ -205,10 +205,11 @@ def main_help(config: Config | None = None) -> str:
             ),
             (
                 "apply",
-                "--pick SRC:ID  --pick-file FILE  --lrc\n"
-                "--src LIST  --workers N  --refresh  --no-preflight",
+                "--pick SRC:ID  --pick-file FILE  --lrc  --force\n"
+                "--src LIST  --workers N  --refresh  --no-preflight\n"
+                "--a2  --eslrc  --yrc  --qrc  --ttml",
             ),
-            ("scan", "--summary"),
+            ("scan", "--summary  --plans"),
             ("rollback", "--yes"),
             (
                 "clean",
@@ -277,7 +278,7 @@ def main_help(config: Config | None = None) -> str:
 
   标题      完全相同 +55
             标题里的 feat. / with 名字已在歌手里 +55（同一个录音，不是两个版本）
-            Netease 附的译名或假名读音 +50（Hz(ヘルツ)、标题 - English Title）
+            Netease 附的译名或假名读音 +50（Hz(ヘルツ)、歩く (漫步)、标题 - English Title）
             仅版本后缀不同 +42（Live / Remaster / Da Capo Version / TV Size …）
             其它附加后缀 +35
             合作者不同 +30（feat. 版本）
@@ -305,20 +306,32 @@ def main_help(config: Config | None = None) -> str:
      85分   标题 + 歌手全中，专辑不符
      75分   合作者不同（feat. 版本）：一律 ! 需确认
 
-  排序      先按不含时长的元数据分，再按含时长的分，再按时长差，最后偏好带 LRC 的。
+  排序      先看是否在时长容差内（容差外的一律排在后面），再按不含时长的元数据分，
+            再按含时长的分，再按时长差，最后偏好带 LRC 的。
+            现场版比正片长 13 秒时，即使标题一字不差也不会排到专辑对得上的那条前面。
   待确认    分数不足 85，或时长差超过容差；用 candidates 看全部候选，再 --pick 指定。
-            ! 行会写清每个源给了多少分，以及最佳候选的 ID，可直接拿去 --pick：
-            ! 08 印地安老斑鸠.m4a  ne 72 · qq 72；最佳 qq:244115386 印地安老斑鸠 (Live) / 周杰伦 / 208s
+            ! 行会写清每个源给了多少分，以及最佳候选的 ID、专辑与时长差，可直接拿去 --pick：
+            ! 08 印地安老斑鸠.m4a  ne 72 · qq 72；最佳 qq:244115386 印地安老斑鸠 (Live) / 周杰伦 / 巡演 / 208s / Δ97.0s
 
 {style("写入前检查", "1;36")}
-  时长差 ≤ 容差；LRC 末行时间戳不超过音频时长 3s；LRC 覆盖 ≥55% 时长。后两条不符会判为 ! 时间轴可疑（常见于 TV size、剪辑版、整轨版）。
+  时长差 ≤ 容差；只有纯文本（没有时间轴）判为 ! 需确认；LRC 末行时间戳不超过音频时长 3s；LRC 覆盖 ≥55% 时长。
+  后两条不符会判为 ! 时间轴可疑（常见于 TV size、剪辑版、整轨版），纯文本同理。
+  这些都能用 --force 越过（连同"已有歌词不覆盖"一起），见下方「强制与刷新」。
 
 {style("歌词格式", "1;36")}
 {formats}
+  plan 取词时把源的原生歌词一起存下（ne 多为 YRC，qq 为 QRC，lrclib 为 LRC/TXT），并记下这次要写的产物格式；
+  plan 与 candidates 的“原生”列标明源给的是什么，apply 时再按 --a2 / --eslrc / --ttml / --qrc 转换，
+  所以想换格式不必重新联网，`lrcpatch apply --a2` 就够；换成原生格式本身则原样输出。
+  私有格式（--yrc / --qrc）只在原生就是它时才可能；原生是逐行 LRC 时无法凭空生成逐字，会明说而不是硬写。
   A2 / ESLRC 与普通 LRC 共用行时间轴校验；YRC / QRC / TTML 只识别不校验。
-  默认拿逐行 LRC；加 --a2 / --eslrc / --ttml 会把源逐字转成对应公有格式，--yrc 只取网易原生、--qrc 只取 QQ 原生（私有格式不跨源转换）。
-  导出后缀按格式走：.alrc / .eslrc / .yrc / .qrc / .ttml，逐行用 .lrc。
-  格式在 plan 取词时就定下并存入状态库，apply 只写这份文本；给 apply 的格式参数只用来核对，计划里不是这个格式会直接报错，不会悄悄写错。
+  导出后缀按格式走：.alrc / .eslrc / .yrc / .qrc / .ttml，逐行用 .lrc，纯文本用 .txt。
+
+{style("强制与刷新", "1;36")}
+  --refresh   只作用于网络：忽略 HTTP 缓存，重新请求。计划里已有的结论仍然复用。
+  --force     只作用于现状：忽略“文件已有歌词”和“状态库里已有计划”，强制重查重排；
+              apply --force 连 ! 时间轴可疑一起写，并覆盖已有歌词（原歌词进回滚记录，rollback 会还原）。
+  --force 不会自动刷新网络缓存（要更彻底就两个一起给）。它用于原本是 TXT、或原本写错了的歌词。
 
 {style("状态", "1;36")}
 {states}
@@ -328,7 +341,8 @@ def main_help(config: Config | None = None) -> str:
   ne 约 0.9s 一次，并发不会突破最小间隔；被限流（code 405/406、HTTP 429）时先放慢重试，仍失败就暂停该源约 180s，其余曲目立即失败而不是继续撞墙。
   服务过载（HTTP 500/502/503/504）走退避，两次耗尽后暂停 60s 起。
   请求失败记为 ✗ 失败，不是「无匹配」，不写缓存，也不覆盖已有的 ✓ 计划。
-  plan 与 candidates 共用同一个 HTTP 缓存：candidates 查过的搜索，plan 不再请求。想强制重查加 --refresh；装了 curl_cffi 就默认用浏览器 TLS 指纹。
+  plan 与 candidates 共用同一个 HTTP 缓存：candidates 查过的搜索，plan 不再请求，反过来也一样；
+  ne 与 qq 的搜索、取词都进缓存（qq 的请求 id 每次不同，已从缓存键里剔除）。想强制重查加 --refresh；装了 curl_cffi 就默认用浏览器 TLS 指纹。
 
 {style("环境", "1;36")}
   Python 3.9+；依赖 mutagen（写标签），可选 curl_cffi（浏览器指纹）。
@@ -350,6 +364,7 @@ PLAN_EPILOG = """\
   lrcpatch plan --pick ne:2003496467 "結束バンド/11 忘れてやらない.m4a"
   lrcpatch plan --pick qq:123 qq:456 "周杰伦/(2000)Jay"
   lrcpatch plan --pick ne:2003496467 --apply "結束バンド/11 忘れてやらない.m4a"
+  lrcpatch plan --force --apply "某人/(2018)老专辑"      已有 TXT 或写错的歌词，强制重写
 
 说明
   plan 只读：不写音频，只更新状态数据库、CSV 和可选的 HTML 复核页。
@@ -357,7 +372,11 @@ PLAN_EPILOG = """\
   一个 --pick 可连写多个 SOURCE:ID；程序先查每个 ID 的标题/歌手/时长，再按分数配对到范围内缺歌词的曲目，并把配对结果打印出来。
   SOURCE 写 ne 或 netease 都可以；ne 只是表格里的短名。
   --apply 会在 plan 之后直接写本次的 ✓；! 需确认、✗ 失败/无匹配仍不会写入。
+  --refresh 只重新联网；--force 才忽略“已有歌词/已有计划”重排。两者可以一起给。
   每首通常 1 次搜索 + 1 次取词；搜索已经能确定结果时不再补发标题搜索。
+  取词时会把源的原生歌词一起存下（ne 多为 YRC、qq 为 QRC），所以之后 apply 换格式不用重查。
+  --src 换源会按新源重排：来自别的源的 ✓ 会被重查（答案通常已缓存，很快就回来）；只想看另一边的候选、
+  不想动已有结论，用 candidates --src qq。
   打分规则见 lrcpatch -h 的「匹配与打分」。
   请求失败（✗）不是结论，下次 plan 会自动重试；也可 --retry-failed 重查其余失败类。
 """
@@ -365,14 +384,18 @@ PLAN_EPILOG = """\
 APPLY_EPILOG = """\
 示例
   lrcpatch apply "結束バンド"
+  lrcpatch apply --a2 "結束バンド"            用计划里的原生歌词现场转 A2
   lrcpatch apply --pick qq:123 qq:456 "周杰伦/(2000)Jay"
+  lrcpatch apply --force "某人/某专辑"          连同 ! 时间轴可疑一起写，允许覆盖
   lrcpatch apply --workers 2 "Ado"
 
 说明
   只写状态为 ready 的曲目；已有歌词、需确认、无匹配、请求失败都不会写入，并在输出里列出跳过数量与原因。
+  --force 把 ! 时间轴可疑也算进来，并允许覆盖已有歌词；原歌词会存进回滚记录，rollback 会把它还原而不是清空。
   范围是整个音乐库或你给出的路径；状态库是所有音乐库共用的，但属于其他 --library 的计划不会被写入。
   带 --pick / --pick-file 时先按人工指定重新 plan（指定的候选天然越过 85 分门槛，但仍检查时间轴），再写入，不需要先单独跑一次 plan。
-  歌词格式在 plan 取词时定下，apply 只写状态库里的这份文本；带 --qrc / --a2 等参数时只用来核对，不符会报错并给出重新取词的命令。
+  --a2 / --eslrc / --ttml / --yrc / --qrc 在这里是“转换”：从计划存下的原生歌词生成，不联网。
+  转不出来的（原生只有逐行 LRC）会列在「跳过格式」里，其余照写；整批都转不出来才报错。
   先写临时副本，回读校验歌词/其他标签/封面/音频后再原子替换；失败则原文件不动。
   开始前会检查目标目录可写且空间足够；确实需要跳过时加 --no-preflight。
 """
@@ -393,6 +416,7 @@ ROLLBACK_EPILOG = """\
 
 说明
   只处理 journal 中由本工具写入、且歌词之后没有被改动过的曲目。
+  apply --force 覆盖过的曲目会还原成原来那版歌词；原来没有歌词的才清空。预览里分别写「还原」和「移除」。
   歌词已被你改过的会判为 ! 拒绝回滚，不会覆盖你的修改。
 """
 
@@ -403,12 +427,14 @@ CLEAN_EPILOG = """\
   lrcpatch clean                      清过期缓存、30 天前的报告/导出/模板
   lrcpatch clean --days 7             只清 7 天前的
   lrcpatch clean --http               只清已过期的 HTTP 缓存
-  lrcpatch clean --all                连同计划状态与回滚记录一起清
+  lrcpatch clean --all                清全部，且不限天数
 
 说明
   清理对象分三处：状态库（HTTP 缓存 / 计划 / 回滚记录）、reports/（CSV 与 HTML 复核页）、cache/lrc（--lrc 导出的镜像）。
-  默认只清可再生的内容：已过期缓存、超过 --days 的报告、导出与 pick 模板。
+  默认只清可再生的内容：已过期缓存、超过 --days（默认 30 天）的报告、导出与 pick 模板。
+  --all 不看时间：所有类别都清空，包括刚生成的报告和刚查好的计划。
   计划状态用于断点续跑，回滚记录用于 rollback，因此只在明确指定 --plans / --journal 或 --all 时才删除；删了就要重新查询、且无法回滚。
+  每行都会说清删了几项、释放多少，以及"因为未满 --days 而没动"这件事。
   删除记录后会执行 VACUUM，空间按实际收缩后的数据库大小报告。
 """
 
@@ -609,10 +635,13 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
             "示例\n"
             '  lrcpatch scan "結束バンド"\n'
             '  lrcpatch scan --summary "結束バンド"\n'
+            "  lrcpatch scan --plans\n"
             "  lrcpatch scan --limit 20\n\n"
             "说明\n"
             "  明细按专辑目录分组，一行一首：✓ 已有歌词 / · 待补，后面是格式、时长、大小、歌词类型与行数；标题或艺术家缺失会标出「缺 …」。\n"
+            "  歌词列是「标签 + 行数」，标签左对齐、行数右对齐，所以 LRC / ESLRC / TXT 混在一张专辑里时“行”也是齐的。\n"
             "  待补的曲目若已有匹配好的计划，会多出一列 qq:100（源:分数），说明可以直接 apply，不用再查询；qq? 表示缓存里是需确认的结果，apply 还不会写。\n"
+            "  --plans 只列出已有计划的曲目，用来回答“apply 到底会写哪几首”。\n"
             "  目录与文件名按 Finder 顺序排列（拼音、数字自然序）。\n"
             "  --summary 只看格式与数量汇总；--tree-limit N 限制明细行数（0 = 全部）。\n"
             "  只读；以只读方式看一眼计划库（不改状态），可以和 plan/apply 同时运行。"
@@ -629,6 +658,11 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         "--summary",
         action="store_true",
         help="只看格式与数量汇总，不逐文件列出",
+    )
+    scan.add_argument(
+        "--plans",
+        action="store_true",
+        help="只列出状态库里已有计划的曲目（apply 会写哪些）",
     )
 
     plan = sub.add_parser(
@@ -656,6 +690,11 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     )
     plan.add_argument("--no-plain", action="store_true", help="只接受带时间轴的 LRC")
     plan.add_argument("--refresh", action="store_true", help="忽略 HTTP 缓存并重查")
+    plan.add_argument(
+        "--force",
+        action="store_true",
+        help="忽略已有歌词与已有计划，强制重查重排（apply 时配合写入）",
+    )
     plan.add_argument(
         "--retry-failed",
         action="store_true",
@@ -719,9 +758,11 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
             '  lrcpatch candidates --top 3 "結束バンド"\n'
             '  lrcpatch candidates --template "Aimer"\n'
             '  lrcpatch candidates --tsv "Ado" > picks.tsv\n\n'
-            "默认只查还没有结论的曲目：已有歌词的、以及状态库里已经 ✓ 可写入的都不再列出来，所以 plan 之后跑一次 candidates，看到的就是那几首真正需要你决定。--all 把范围内全部曲目重新查一遍。\n\n"
+            "默认只查还没有结论的曲目：已有歌词的、以及状态库里已经 ✓ 可写入的都不再列出来，所以 plan 之后跑一次 candidates，看到的就是那几首真正需要你决定。\n"
+            "计划来自的源不在当前 --src 里时，那首会重新列出来（用 --src qq 就能看到 qq 那边的候选）；--refresh 会连已 ✓ 的曲目一起重查，--all 连已有歌词的一起查。\n\n"
             "状态库按文件路径逐条记录，每首取它自己最后一次 plan 的结果（文件大小或修改时间变了就不算数），不存在「整库最近一次」的快照；因此不同专辑可能来自不同次运行。\n\n"
-            "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 格式 / 标题 / 歌手 / 专辑。分数是标题+歌手+专辑的总分（满分 100），时长差单独一列，超过容差显示红色，不再逐条解释原因。\n\n"
+            "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 原生 / 标题 / 歌手 / 专辑。分数是标题+歌手+专辑的总分（满分 100），时长差单独一列，超过容差显示红色。"
+            "“原生”是源会给出的格式（qq=QRC、ne=YRC/LRC、lrclib=LRC/TXT），apply 时再决定转成什么。排序先看是否在容差内，容差外的不会排在可用的前面。\n\n"
             "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
         ),
         formatter_class=HelpFormatter,
@@ -795,6 +836,11 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     apply_cmd.add_argument(
         "--refresh", action="store_true", help="配合 --pick 时忽略 HTTP 缓存并重查"
     )
+    apply_cmd.add_argument(
+        "--force",
+        action="store_true",
+        help="连 ! 时间轴可疑一起写，并允许覆盖已有歌词（原歌词存入回滚记录）",
+    )
     apply_cmd.add_argument("--no-plain", action="store_true", help="只接受带时间轴的 LRC")
     apply_cmd.add_argument(
         "--retry-failed",
@@ -849,7 +895,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         prog="lrcpatch rollback",
         usage="lrcpatch rollback [--参数 …] 路径 …",
         help="移除本工具写入且未改动的歌词",
-        description="移除 journal 中由本工具写入、且之后未被改动过的歌词。",
+        description="撤销写入：移除 journal 中由本工具写入、且之后未被改动过的歌词；apply --force 覆盖过的还原原歌词。",
         epilog=ROLLBACK_EPILOG,
         formatter_class=HelpFormatter,
         add_help=False,
@@ -910,7 +956,9 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         "--journal", action="store_true", help="清旧回滚记录（之后无法 rollback）"
     )
     clean.add_argument(
-        "--all", action="store_true", help="清全部，包括计划状态与回滚记录"
+        "--all",
+        action="store_true",
+        help="清全部，且不限 --days（包括计划状态与回滚记录）",
     )
 
     config_cmd = sub.add_parser(

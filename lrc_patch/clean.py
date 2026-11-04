@@ -57,8 +57,10 @@ def _iso_cutoff(days: int) -> str:
     return moment.isoformat(timespec="seconds")
 
 
-def _clean_files(root: Path, cutoff: float, dry_run: bool) -> tuple[int, int]:
-    """Delete files under ``root`` older than ``cutoff``; returns (n, bytes)."""
+def _clean_files(
+    root: Path, cutoff: float | None, dry_run: bool
+) -> tuple[int, int]:
+    """Delete files under ``root`` older than ``cutoff`` (all when None)."""
     if not root.is_dir():
         return 0, 0
     count = size = 0
@@ -69,7 +71,7 @@ def _clean_files(root: Path, cutoff: float, dry_run: bool) -> tuple[int, int]:
             stat = path.stat()
         except OSError:
             continue
-        if stat.st_mtime >= cutoff:
+        if cutoff is not None and stat.st_mtime >= cutoff:
             continue
         count += 1
         size += stat.st_size
@@ -98,8 +100,12 @@ def cmd_clean(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     days = int(getattr(args, "days", 30))
     if days < 1:
         raise ToolError("--days 必须大于 0")
+    # --all means "everything, whatever its age"; --days stays the default for
+    # every other mode.  Mixing the two made `clean --all` leave today's
+    # reports and plans behind, which is exactly what it promised to remove.
+    everything = bool(getattr(args, "all", False))
     wanted = _selected(args)
-    cutoff = _cutoff(days)
+    cutoff = None if everything else _cutoff(days)
     before_size = state.size()
 
     lrc_dir = (getattr(args, "lrc_dir", None) or default_lrc_dir()).expanduser()
@@ -112,17 +118,19 @@ def cmd_clean(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     print_header(
         "clean",
         f"{short_path(state_dir)}  ·  {format_size(before_size)}"
-        + ("  ·  预览" if dry_run else ""),
+        + ("  ·  预览" if dry_run else "")
+        + ("  ·  全部（不限天数）" if everything else ""),
     )
 
     freed = 0
     freed_rows = 0
     db_rows = 0
+    skipped = 0
     for name in wanted:
         label = TARGETS[name]
         unit = _UNITS.get(name, "个")
         if name == "http":
-            expired_only = not getattr(args, "all", False)
+            expired_only = not everything
             count, size = state.purge_http_cache(
                 expired_only=expired_only, dry_run=dry_run
             )
@@ -134,12 +142,22 @@ def cmd_clean(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             count, size = _clean_files(paths[name], cutoff, dry_run)
             tail = ""
             if count:
-                tail = style(f"   {days} 天前", "90")
+                tail = style(
+                    "   全部" if everything else f"   {days} 天前", "90"
+                )
+            elif not everything:
+                skipped += 1
         else:  # plans / journal
-            before = _iso_cutoff(days)
+            before = None if everything else _iso_cutoff(days)
             purge = state.purge_plans if name == "plans" else state.purge_journal
             count, size = purge(before, dry_run=dry_run)
-            tail = style(f"   {days} 天前", "90") if count else ""
+            tail = (
+                style("   全部" if everything else f"   {days} 天前", "90")
+                if count
+                else ""
+            )
+            if not count and not everything:
+                skipped += 1
 
         if name in {"http", "plans", "journal"}:
             db_rows += count
@@ -148,8 +166,10 @@ def cmd_clean(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         verb = "可释放" if dry_run else "释放"
         if count:
             body = f"{verb} {count} {unit} · {format_size(size)}{tail}"
+        elif everything:
+            body = style("目录为空", "90")
         else:
-            body = style("无需清理", "90")
+            body = style(f"无需清理（没有 {days} 天前的）", "90")
         print("  " + style(pad_display(label, 10), "90") + "  " + body)
 
     print("  " + rule())
@@ -178,9 +198,15 @@ def cmd_clean(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             + f"  {freed_rows} 项  ·  {format_size(freed)}"
             + extra
         )
-    else:
+    if not freed_rows and skipped and not everything:
+        print(
+            "  "
+            + style("没有需要清理的内容。", "32")
+            + style(f"   忽略的 {skipped} 类都未满 {days} 天（--all 不限天数）", "90")
+        )
+    elif not freed_rows:
         print("  " + style("没有需要清理的内容。", "32"))
-    if "plans" in wanted or "journal" in wanted:
+    if (freed_rows or dry_run) and ("plans" in wanted or "journal" in wanted):
         print_meta(
             "注意",
             style(

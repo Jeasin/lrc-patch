@@ -19,11 +19,11 @@ def default_lrc_dir() -> Path:
     root = Path(base).expanduser() if base else Path.home() / ".cache"
     return root / "lrc-patch" / "lrc"
 
-APP_VERSION = "2.10"
+APP_VERSION = "2.11"
 
 # Bump when the scoring rules change: old ambiguous/suspect plans are then
 # retried once instead of being reused with the previous rules.
-SCORING_VERSION = "5"
+SCORING_VERSION = "6"
 
 AUDIO_EXTS = {".m4a": "m4a", ".mp3": "mp3", ".dsf": "dsf"}
 

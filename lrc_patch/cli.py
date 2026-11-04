@@ -91,10 +91,15 @@ def main() -> int:
     )
     args.target_format = target
     # Private formats are native to exactly one source; refuse a source list
-    # that cannot produce them instead of silently downgrading.
-    if target == "qrc" and "qq" not in args.src:
+    # that cannot produce them instead of silently downgrading.  apply does not
+    # query anything — it converts from the plan's native lyric — so the check
+    # only applies when sources are actually asked (or a --pick chains a plan).
+    asks_network = args.command in {"plan", "candidates"} or bool(
+        getattr(args, "pick", None) or getattr(args, "pick_file", None)
+    )
+    if asks_network and target == "qrc" and "qq" not in args.src:
         parser.error("--qrc 是 QQ 音乐的私有逐字格式，请用 --src 包含 qq（或改用 --a2/--eslrc/--ttml）")
-    if target == "yrc" and "netease" not in args.src:
+    if asks_network and target == "yrc" and "netease" not in args.src:
         parser.error("--yrc 是网易云的私有逐字格式，请用 --src 包含 ne（或改用 --a2/--eslrc/--ttml）")
     if getattr(args, "workers", 1) < 1 or getattr(args, "workers", 1) > 10:
         parser.error("workers 必须在 1..10 之间")

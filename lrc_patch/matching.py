@@ -148,19 +148,26 @@ def choose_candidate(
 
 def best_partial_candidate(
     track: Track, candidates: list[Candidate], tolerance: float
-) -> tuple[tuple[int, float], Candidate, int, float, str] | None:
-    """Pick the most plausible rejected candidate, with its real duration gap."""
-    best: tuple[int, float, Candidate] | None = None
+) -> tuple[tuple[int, float, int], Candidate, int, float, str] | None:
+    """Pick the most plausible rejected candidate, with its real duration gap.
+
+    A candidate inside the tolerance wins even with a lower metadata score: it
+    is the one that could still be written after a ``--pick``, while a
+    perfect-looking live version 13 seconds off can never be.
+    """
+    best: tuple[tuple[int, float, int], Candidate, float] | None = None
     for candidate in candidates:
         if not candidate.duration:
             continue
         metadata_score, diff = score_candidate(track, candidate, 999.0)
-        key = (metadata_score, -diff)
-        if best is None or key > (best[0], -best[1]):
-            best = (metadata_score, diff, candidate)
+        within = 1 if diff <= tolerance else 0
+        key = (within, metadata_score, -diff)
+        if best is None or key > best[0]:
+            best = (key, candidate, diff)
     if best is None:
         return None
-    metadata_score, diff, candidate = best
+    key, candidate, diff = best
+    metadata_score = key[1]
     score, _ = score_candidate(track, candidate, tolerance)
     if metadata_score < 85:
         reason = f"候选元数据仅 {metadata_score} 分（标题或艺术家不一致）"
@@ -168,7 +175,7 @@ def best_partial_candidate(
         reason = f"时长差 {diff:.1f}s，超过容差 {tolerance:.1f}s"
     else:
         reason = "未达到自动写入条件"
-    return (metadata_score, -diff), candidate, score, diff, reason
+    return key, candidate, score, diff, reason
 
 def local_sidecar(track: Track) -> FetchResult | None:
     sidecar = track.path.with_suffix(".lrc")
@@ -190,15 +197,49 @@ def plan_from_lyrics(
     diff: float | None,
     reason: str,
     check_timestamps: bool,
+    native_lyrics: str = "",
+    native_kind: str = "",
 ) -> PlanResult:
     """Common tail: timestamp sanity check, then ready or suspect."""
     if check_timestamps:
+        if lyric_kind(lyrics) == "plain":
+            # No timeline at all: a text-only lyric is a last resort, not a
+            # result.  `--force` (or --no-timestamp-check) is how to accept it.
+            return PlanResult(
+                track,
+                "suspect",
+                f"{reason}；只有纯文本，没有时间轴",
+                candidate,
+                lyrics,
+                score,
+                diff,
+                native_lyrics,
+                native_kind,
+            )
         issue = lrc_timestamp_issue(lyrics, track.duration)
         if issue:
             return PlanResult(
-                track, "suspect", f"{reason}；{issue}", candidate, lyrics, score, diff
+                track,
+                "suspect",
+                f"{reason}；{issue}",
+                candidate,
+                lyrics,
+                score,
+                diff,
+                native_lyrics,
+                native_kind,
             )
-    return PlanResult(track, "ready", reason, candidate, lyrics, score, diff)
+    return PlanResult(
+        track,
+        "ready",
+        reason,
+        candidate,
+        lyrics,
+        score,
+        diff,
+        native_lyrics,
+        native_kind,
+    )
 
 # A picked ID only needs to be *identified*, not trusted: the score floor is
 # how sure we must be that this ID belongs to that file.  A title that matches
@@ -227,6 +268,7 @@ def assign_picks(
     values: list[str],
     sources: list[Any],
     tolerance: float = DEFAULT_DURATION_TOLERANCE,
+    force: bool = False,
 ) -> tuple[dict[str, str], list[str], list[tuple[Track, Candidate, int, float]]]:
     """Pair a flat list of ``SOURCE:ID`` with the tracks they belong to.
 
@@ -234,7 +276,8 @@ def assign_picks(
     not which file each belongs to.  Every ID is resolved to its metadata once
     (netease batch, QQ one call per ID) and then scored against each track that
     still needs lyrics; a greedy best-score assignment pairs them without
-    depending on the order on the command line.
+    depending on the order on the command line.  ``force`` makes tracks that
+    already have lyrics eligible too, matching ``plan --force --pick``.
     """
     by_source: dict[str, list[str]] = {}
     for value in values:
@@ -254,7 +297,7 @@ def assign_picks(
             raise ToolError(f"{name} 不支持按 ID 查详情，请改用单曲 --pick 或 --pick-file")
         candidates.extend(lookup(ids))
 
-    eligible = [track for track in tracks if not track.has_lyrics]
+    eligible = [track for track in tracks if force or not track.has_lyrics]
     pairs: list[tuple[int, float, Track, Candidate]] = []
     for track in eligible:
         for candidate in candidates:
@@ -277,7 +320,14 @@ def assign_picks(
         used.add(ident)
         preview.append((track, candidate, score, diff))
 
-    unresolved = [value for value in dict.fromkeys(values) if value not in used]
+    # "ne:1" and "netease:1" name the same candidate, so compare the canonical
+    # SOURCE:ID form; comparing the raw flag text reported every short-name pick
+    # as unresolved even though it had just been paired.
+    canonical = {
+        value: f"{parse_pick(value)[0]}:{parse_pick(value)[1]}"
+        for value in dict.fromkeys(values)
+    }
+    unresolved = [value for value in canonical if canonical[value] not in used]
     # Greedy order is by score, but the preview should read like the album does.
     order = {str(track.path): index for index, track in enumerate(tracks)}
     preview.sort(key=lambda item: order.get(str(item[0].path), len(order)))
@@ -347,8 +397,18 @@ def plan_with_pick(
         )
     if lyric_kind(fetched.lyrics) == "plain" and not allow_plain:
         return PlanResult(track, "error", f"{label}；只有纯文本，已按 --no-plain 拒绝", candidate)
+    if fetched.note:
+        label = f"{label}；{fetched.note}"
     return plan_from_lyrics(
-        track, candidate, fetched.lyrics, 100, diff, label, check_timestamps
+        track,
+        candidate,
+        fetched.lyrics,
+        100,
+        diff,
+        label,
+        check_timestamps,
+        fetched.native_lyrics,
+        fetched.native_kind,
     )
 
 def keep_previous_plan(
@@ -384,8 +444,9 @@ def plan_one(
     tolerance: float = DEFAULT_DURATION_TOLERANCE,
     check_timestamps: bool = True,
     pick: str | None = None,
+    force: bool = False,
 ) -> PlanResult:
-    if track.has_lyrics:
+    if track.has_lyrics and not force:
         return PlanResult(track, "skip_existing", "已有歌词，默认不覆盖")
     if pick:
         return plan_with_pick(track, sources, pick, allow_plain, check_timestamps)
@@ -403,7 +464,15 @@ def plan_one(
             synced=lyric_kind(sidecar.lyrics) == "lrc",
         )
         return plan_from_lyrics(
-            track, candidate, sidecar.lyrics, 100, 0.0, "同名 LRC", check_timestamps
+            track,
+            candidate,
+            sidecar.lyrics,
+            100,
+            0.0,
+            "同名 LRC",
+            check_timestamps,
+            sidecar.lyrics,
+            lyric_kind(sidecar.lyrics),
         )
 
     notes: list[str] = []
@@ -428,7 +497,7 @@ def plan_one(
             continue
         candidate, score, diff, reason = choose_candidate(track, candidates, tolerance)
         partial = best_partial_candidate(track, candidates, tolerance)
-        origin.append(f"{label} {partial[0][0] if partial else 0}")
+        origin.append(f"{label} {partial[0][1] if partial else 0}")
         if not candidate:
             if partial and (
                 best_partial_key is None or partial[0] > best_partial_key
@@ -453,9 +522,9 @@ def plan_one(
             notes.append(f"{label}: 仅纯文本，已按 --no-plain 跳过")
             continue
         note = match_note(track, candidate, tolerance)
-        reason = candidate.artist_text
-        if note:
-            reason = f"{reason}；{note}" if reason else note
+        reason = "；".join(
+            part for part in (candidate.artist_text, fetched.note, note) if part
+        )
         return plan_from_lyrics(
             track,
             candidate,
@@ -464,17 +533,27 @@ def plan_one(
             diff,
             reason,
             check_timestamps,
+            fetched.native_lyrics,
+            fetched.native_kind,
         )
 
     if best_partial:
         candidate, score, diff, _reason = best_partial
+        # Say what would decide it: the album (a live record is a different
+        # recording) and the duration gap, not just the score.
+        detail = [
+            candidate.title,
+            candidate.artist_text,
+            candidate.album,
+            f"{candidate.duration:.0f}s",
+        ]
+        if diff < 900:
+            detail.append(f"Δ{diff:.1f}s")
         return PlanResult(
             track,
             "ambiguous",
             f"{' · '.join(origin)}；最佳 {source_label(candidate.source)}:"
-            f"{candidate.source_id} "
-            f"{candidate.title} / {candidate.artist_text} / "
-            f"{candidate.duration:.0f}s",
+            f"{candidate.source_id} " + " / ".join(part for part in detail if part),
             candidate,
             "",
             score,

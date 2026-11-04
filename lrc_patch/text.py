@@ -36,6 +36,10 @@ _TTML_RE = re.compile(
 _WORD_TIME_RE = re.compile(r"<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>")
 # ESLyric/SPL: a line whose body still carries square-bracket timestamps.
 _SQ_WORD_TIME_RE = re.compile(r"\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]")
+# One or more line timestamps *at the head* of a line.  A plain LRC may write
+# a repeated chorus as ``[00:26.22][01:10.69][02:18.93]Rose``: several stamps,
+# still one line-timed lyric, not word timing.
+_LEAD_STAMPS_RE = re.compile(r"^(?:\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\])+")
 # YRC/QRC line head: [lineStart,lineDur] where both are integer milliseconds.
 _YRC_LINE_RE = re.compile(r"^\[\d{1,7},\d{1,7}\]", re.MULTILINE)
 # YRC word marker: (start,dur,0)text — timestamp first, three fields.
@@ -205,6 +209,11 @@ def looks_translated(base: str, decoration: str) -> str:
         return ""
     if "kana" in deco_scripts and "kana" not in base_scripts:
         return "读音"
+    # A Japanese title annotated with pure Chinese characters is a translation
+    # ("歩く (漫步)"), even though both sides use Han script; treating it as a
+    # generic decoration cost the candidate 15 points for no reason.
+    if "kana" in base_scripts and deco_scripts == {"han"}:
+        return "译名"
     if deco_scripts & base_scripts:
         return ""
     if "latin" in deco_scripts:
@@ -415,12 +424,12 @@ def lyric_kind(text: str) -> str:
       * ``a2``    — LRC A2, word stamps in angle brackets ``<00:12.34>``
       * ``eslrc`` — ESLyric/SPL, word stamps in square brackets ``[00:12.34]``
       * ``yrc``   — netease ``[start,dur](start,dur,0)text``
-      * ``qrc``   — QQ ``[start,dur]text(start,dur)``
+      * ``qrc``   — QQ ``[start,dur](start,dur)text``
       * ``ttml``  — Apple Music XML
 
-    YRC and QRC share the ``[lineStart,lineDur]`` head but differ in the body:
-    YRC puts ``(start,dur,0)`` *before* the text, QRC puts ``(start,dur)``
-    *after* it.  Only ``lrc`` and ``a2`` share the line-timestamp checks.
+    YRC and QRC share the ``[lineStart,lineDur]`` head and both put the word
+    marker before its text; the marker itself differs (three numbers for YRC,
+    two for QRC).  Only ``lrc`` and ``a2`` share the line-timestamp checks.
     """
     body = (text or "").lstrip("\ufeff")
     if not body.strip():
@@ -434,18 +443,18 @@ def lyric_kind(text: str) -> str:
             return "yrc"
         return "qrc"
     if TIMESTAMP_RE.search(body):
-        # Line-timed.  Angle brackets → LRC A2; more square timestamps than
-        # the line head → ESLyric; otherwise plain LRC.
+        # Line-timed.  Angle brackets → LRC A2; square stamps *inside* the
+        # text → ESLyric; otherwise plain LRC.  The leading run of stamps is
+        # stripped first: ``[00:26.22][01:10.69]Rose`` is a repeated line, and
+        # counting its stamps as word markers used to mislabel plain LRC as
+        # ESLRC (which also changed the export suffix).
         if _WORD_TIME_RE.search(body):
             return "a2"
-        # A line head timestamp plus a second square timestamp in the body
-        # (e.g. ``[00:12.34]词[00:12.80]语``) marks ESLyric word timing.
-        lines = [ln for ln in body.splitlines() if _SQ_WORD_TIME_RE.search(ln)]
-        if any(ln.count("[") >= 2 for ln in lines if ln.strip()):
-            # Count square timestamps: more than one on a line → verbatim.
-            for ln in lines:
-                if len(_SQ_WORD_TIME_RE.findall(ln)) >= 2:
-                    return "eslrc"
+        for line in body.splitlines():
+            if not _SQ_WORD_TIME_RE.search(line):
+                continue
+            if _SQ_WORD_TIME_RE.search(_LEAD_STAMPS_RE.sub("", line)):
+                return "eslrc"
         return "lrc"
     return "plain"
 

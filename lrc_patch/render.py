@@ -19,6 +19,7 @@ from pathlib import Path
 from .config import APP_VERSION, source_label
 from .models import Track, TreeEntry
 from .sorting import name_key, sort_paths
+from .state import row_get
 from .text import lyric_kind, lyric_line_count, lyric_tag, write_text_atomic
 
 
@@ -44,6 +45,7 @@ def write_plan_report(rows: list[sqlite3.Row], path: Path) -> None:
         "duration_diff",
         "score",
         "lyric_kind",
+        "native_kind",
         "lyric_lines",
         "lyric_sha",
         "planned_at",
@@ -408,22 +410,27 @@ NOTE_STYLE = {
 }
 
 def align_note_numbers(notes: list[str]) -> list[str]:
-    """Right-align ``LRC 6行`` under ``LRC 23行`` within one album group."""
-    widths: dict[str, int] = {}
-    for note in notes:
-        for match in _NOTE_LINES_RE.finditer(note):
-            tag = match.group(1)
-            widths[tag] = max(widths.get(tag, 0), len(match.group(2)))
-    if not widths:
-        return notes
-    aligned: list[str] = []
-    for note in notes:
-        def replace(match: re.Match) -> str:
-            tag, number, suffix = match.group(1), match.group(2), match.group(3)
-            return f"{tag} {number.rjust(widths[tag])}{suffix}"
+    """Line up ``TAG n 行`` as two right-aligned fields within one group.
 
-        aligned.append(_NOTE_LINES_RE.sub(replace, note))
-    return aligned
+    Tag lengths differ (``LRC`` vs ``ESLRC``), so right-aligning only the
+    number left the 行 column ragged: ``LRC  66 行`` above ``ESLRC  48 行``.
+    """
+    matches = [match for note in notes for match in _NOTE_LINES_RE.finditer(note)]
+    if not matches:
+        return notes
+    tag_width = max(disp_width(match.group(1)) for match in matches)
+    number_width = max(len(match.group(2)) for match in matches)
+
+    def replace(match: re.Match) -> str:
+        tag, number, suffix = match.group(1), match.group(2), match.group(3)
+        return (
+            pad_display(tag, tag_width)
+            + " "
+            + number.rjust(number_width)
+            + suffix
+        )
+
+    return [_NOTE_LINES_RE.sub(replace, note) for note in notes]
 
 
 # Cells that read as a number are right-aligned, so ``7分`` sits under ``100分``
@@ -685,14 +692,29 @@ def print_scan_list(
         count_of[id(track)] = lyric_line_count(track.existing_lyrics, kind) if kind else 0
 
     digits_all = max((len(str(value)) for value in count_of.values()), default=0)
+    tag_width = max(
+        (disp_width(tag_of[id(track)]) for track in tracks if kind_of[id(track)]),
+        default=0,
+    )
+    # One shape for every row: tag left-aligned, line count right-aligned, so
+    # the 行 column is straight across the whole listing, not per album.
+    lyric_texts: dict[int, str] = {}
+    for track in tracks:
+        kind = kind_of[id(track)]
+        if kind:
+            lyric_texts[id(track)] = (
+                pad_display(tag_of[id(track)], tag_width)
+                + " "
+                + str(count_of[id(track)]).rjust(digits_all)
+                + " 行"
+            )
+        else:
+            lyric_texts[id(track)] = pad_display(
+                "无歌词", tag_width + 1 + digits_all
+            )
     lyric_width = max(
-        6,
-        max(
-            disp_width(f"{tag_of[id(track)]} {str(count_of[id(track)]).rjust(digits_all)} 行")
-            if kind_of[id(track)]
-            else disp_width("无歌词")
-            for track in tracks
-        ),
+        disp_width("无歌词"),
+        max((disp_width(text) for text in lyric_texts.values()), default=0),
     )
     formats = {id(track): track.fmt.upper() for track in tracks}
     durations = {id(track): format_duration(track.duration) for track in tracks}
@@ -749,18 +771,12 @@ def print_scan_list(
         )
         print(header)
 
-        # Align the line count against the widest one in this album only.
-        group_digits = max((len(str(count_of[id(track)])) for track in items), default=0)
         for index, track in enumerate(visible):
             branch = "    └─ " if index == len(visible) - 1 else "    ├─ "
             symbol, code = ("✓", "1;32") if track.has_lyrics else ("·", "90")
             kind = kind_of[id(track)]
-            if kind:
-                lyric = f"{tag_of[id(track)]} {str(count_of[id(track)]).rjust(group_digits)} 行"
-                tone = LYRIC_COLORS.get(kind, "32")
-            else:
-                lyric = "无歌词"
-                tone = "90"
+            tone = LYRIC_COLORS.get(kind, "32") if kind else "90"
+            lyric = lyric_texts[id(track)]
             line = (
                 style(branch, "90")
                 + style(symbol, code)
@@ -893,7 +909,13 @@ def plan_fields(row: sqlite3.Row) -> tuple[tuple[str, ...], str]:
             f"{tag} {lines} 行" if tag and lines else tag,
             artist,
         )
-        return cells, notes or ("匹配通过" if not any(cells) else "")
+        # The provider's own format is what apply would convert from, so say
+        # it whenever it is not what was written.
+        native = str(row_get(row, "native_kind", "") or "")
+        tail = [part for part in (notes,) if part]
+        if native and native != kind:
+            tail.append(f"原生 {lyric_tag(native)}")
+        return cells, "；".join(tail) or ("匹配通过" if not any(cells) else "")
     if status == "skip_existing":
         return (), "已有歌词，未覆盖"
     if status == "instrumental":

@@ -28,15 +28,18 @@ from lrc_patch.config import (
     write_config_template,
 )
 from lrc_patch.errors import SourceError, ToolError
+from lrc_patch.lyric_fmt import has_timing, lines_to_plain, parse_qrc, render_native
 from lrc_patch.matching import (
     assign_picks,
+    best_partial_candidate,
     keep_previous_plan,
     parse_pick,
+    plan_from_lyrics,
     plan_one,
     score_candidate,
 )
-from lrc_patch.models import Candidate, Track, TreeEntry
-from lrc_patch.state import State
+from lrc_patch.models import Candidate, FetchResult, PlanResult, Track, TreeEntry
+from lrc_patch.state import State, read_plan_cache, row_get
 from lrc_patch.text import (
     album_points,
     artist_parts,
@@ -81,6 +84,43 @@ class FailingSource:
 
     def search(self, track: Track) -> list[Candidate]:
         raise SourceError("failing", "failing 连续 3 次失败：HTTP 503（服务繁忙）")
+
+
+def qq_encrypt(plaintext: str) -> str:
+    """Encrypt a QRC payload the way QQ Music serves it (zlib + DES variant)."""
+    import zlib
+
+    from lrc_patch.qrc import QRC_KEY, _ENCRYPT, _tripledes_crypt, _tripledes_key_setup
+
+    data = bytearray(zlib.compress(plaintext.encode()))
+    schedule = _tripledes_key_setup(QRC_KEY, _ENCRYPT)
+    out = bytearray()
+    for offset in range(0, len(data), 8):
+        block = data[offset : offset + 8]
+        out += _tripledes_crypt(block, schedule) if len(block) == 8 else block
+    return bytes(out).hex()
+
+
+def qq_lyric_payload(plain, *, encryption=True) -> tuple[int, dict]:
+    """A ``GetPlayLyricInfo`` answer holding one QRC payload."""
+    cipher = qq_encrypt(plain) if encryption else plain
+    return 200, {"code": 0, "request": {"code": 0, "data": {"lyric": cipher}}}
+
+
+class RecordingQqClient:
+    """QQ stand-in: answers the session call, then replays canned payloads."""
+
+    def __init__(self, payloads: list[dict]) -> None:
+        self.payloads = list(payloads)
+        self.cache_keys: list[str] = []
+
+    def request(self, source, url, min_interval=0.0, **kwargs):
+        self.cache_keys.append(str(kwargs.get("cache_extra", "")))
+        if kwargs.get("kind") == "session":
+            data = {"session": {"uid": "1", "sid": "s", "userip": "ip"}}
+        else:
+            data = self.payloads.pop(0)
+        return 200, {"code": 0, "request": {"code": 0, "data": data}}
 
 
 class DefaultsTests(unittest.TestCase):
@@ -621,6 +661,37 @@ class StateMigrationTests(unittest.TestCase):
             self.assertEqual(state.get_plan("/legacy.m4a")["status"], "error")
             self.assertEqual(state.get_plan("/genuine.m4a")["status"], "no_match")
 
+    def test_legacy_database_gains_the_new_columns(self) -> None:
+        """2.10 databases must keep working without a manual migration."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE plans (path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,"
+                " planned_at TEXT NOT NULL, status TEXT NOT NULL,"
+                " reason TEXT NOT NULL DEFAULT '', source TEXT, source_id TEXT,"
+                " match_title TEXT, match_artist TEXT, match_album TEXT,"
+                " match_duration REAL, duration_diff REAL,"
+                " score INTEGER NOT NULL DEFAULT 0, lyric TEXT, lyric_sha TEXT,"
+                " lyric_kind TEXT, lyric_lines INTEGER NOT NULL DEFAULT 0)"
+            )
+            conn.execute(
+                "INSERT INTO plans(path,fingerprint,planned_at,status,reason,"
+                "score,lyric,lyric_kind,lyric_lines) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("/old.m4a", "fp", "2026-01-01T00:00:00+00:00", "ready", "Artist",
+                 100, "[00:01.00]x\n", "lrc", 1),
+            )
+            conn.commit()
+            conn.close()
+
+            state = State(path)
+            row = state.get_plan("/old.m4a")
+            self.assertEqual(row["status"], "ready")
+            self.assertEqual(row_get(row, "src_set", ""), "")
+            self.assertEqual(row_get(row, "native_kind", ""), "")
+            with self.assertRaises(ToolError):
+                commands.lyric_for_target(row, "a2")
+
 
 class JsonClientTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -898,7 +969,7 @@ class LyricFormatTests(unittest.TestCase):
             lyric_kind("[00:12.34]你好[00:13.00]世界"), "eslrc"
         )
         self.assertEqual(lyric_kind("[1234,567](1234,567,0)word"), "yrc")
-        self.assertEqual(lyric_kind("[1234,567]word(1234,567)"), "qrc")
+        self.assertEqual(lyric_kind("[1234,567](1234,567)word"), "qrc")
         self.assertEqual(
             lyric_kind('<?xml version="1.0"?><tt xmlns="http://www.w3.org/ns/ttml">'),
             "ttml",
@@ -1159,20 +1230,9 @@ class QqSourceTests(unittest.TestCase):
         self.assertEqual(found[0].duration, 289.0)
 
     def test_fetch_default_flattens_to_line_lrc(self) -> None:
-        import zlib
-
-        from lrc_patch.qrc import QRC_KEY, _tripledes_crypt, _tripledes_key_setup, _ENCRYPT
-
         qrc_plain = '<Lyric_1 LyricType="1" LyricContent="[0,5000](0,200)我(200,300)爱"/>'
-        data = bytearray(zlib.compress(qrc_plain.encode()))
-        schedule = _tripledes_key_setup(QRC_KEY, _ENCRYPT)
-        out = bytearray()
-        for off in range(0, len(data), 8):
-            block = data[off : off + 8]
-            out += _tripledes_crypt(block, schedule) if len(block) == 8 else block
-        encrypted = bytes(out).hex()
+        lyric_resp = qq_lyric_payload(qrc_plain)
 
-        lyric_resp = (200, {"code": 0, "request": {"code": 0, "data": {"lyric": encrypted}}})
         client = self._client(
             [
                 (200, {"code": 0, "request": {"code": 0, "data": {"session": {"uid": "1", "sid": "s", "userip": "ip"}}}}),
@@ -1185,23 +1245,17 @@ class QqSourceTests(unittest.TestCase):
         )
         self.assertTrue(result.lyrics)
         self.assertEqual(lyric_kind(result.lyrics), "lrc")
-        self.assertIn("我爱", result.lyrics)
+        # The word markers are timing, not text: no "(0,200)" may survive.
+        self.assertEqual(result.lyrics.strip(), "[00:00.00]我爱")
+        # The native QRC is kept next to the flattened one, so apply can still
+        # write --qrc/--a2 later without asking the network again.
+        self.assertEqual(result.native_kind, "qrc")
+        self.assertIn("(200,300)爱", result.native_lyrics)
 
     def test_fetch_qrc_target_keeps_native_qrc(self) -> None:
-        import zlib
-
-        from lrc_patch.qrc import QRC_KEY, _tripledes_crypt, _tripledes_key_setup, _ENCRYPT
-
         qrc_plain = '<Lyric_1 LyricType="1" LyricContent="[0,5000](0,200)我(200,300)爱"/>'
-        data = bytearray(zlib.compress(qrc_plain.encode()))
-        schedule = _tripledes_key_setup(QRC_KEY, _ENCRYPT)
-        out = bytearray()
-        for off in range(0, len(data), 8):
-            block = data[off : off + 8]
-            out += _tripledes_crypt(block, schedule) if len(block) == 8 else block
-        encrypted = bytes(out).hex()
+        lyric_resp = qq_lyric_payload(qrc_plain)
 
-        lyric_resp = (200, {"code": 0, "request": {"code": 0, "data": {"lyric": encrypted}}})
         client = self._client(
             [
                 (200, {"code": 0, "request": {"code": 0, "data": {"session": {"uid": "1", "sid": "s", "userip": "ip"}}}}),
@@ -1250,9 +1304,17 @@ class ScoreComponentTests(unittest.TestCase):
 class _FixedSource:
     """A provider stub that returns prepared candidates and nothing else."""
 
-    def __init__(self, name: str, candidates: list[Candidate]) -> None:
+    def __init__(
+        self,
+        name: str,
+        candidates: list[Candidate],
+        lyrics: str = "[00:01.00]第一句\n[03:10.00]第二句\n",
+        native_kind: str = "lrc",
+    ) -> None:
         self.name = name
         self._candidates = candidates
+        self._lyrics = lyrics
+        self._native_kind = native_kind
 
     def search(self, track: Track, exhaustive: bool = False) -> list[Candidate]:
         return list(self._candidates)
@@ -1260,6 +1322,13 @@ class _FixedSource:
     def lookup(self, ids: list[str]) -> list[Candidate]:
         wanted = set(ids)
         return [item for item in self._candidates if item.source_id in wanted]
+
+    def fetch(self, candidate: Candidate) -> FetchResult:
+        return FetchResult(
+            lyrics=self._lyrics,
+            native_lyrics=self._lyrics,
+            native_kind=self._native_kind,
+        )
 
 
 class AmbiguousReasonTests(unittest.TestCase):
@@ -1282,6 +1351,9 @@ class AmbiguousReasonTests(unittest.TestCase):
         self.assertNotIn("netease", result.reason)
         self.assertIn("qq 87", result.reason)
         self.assertIn("qq:244115386", result.reason)
+        # The album and the real gap are what a human needs to decide.
+        self.assertIn("Jay", result.reason)
+        self.assertIn("Δ97.0s", result.reason)
 
     def test_empty_source_is_named_as_such(self) -> None:
         track = make_track(title="Track", artist="Artist", album="Album", duration=200.0)
@@ -1345,6 +1417,56 @@ class PickAssignmentTests(unittest.TestCase):
         with self.assertRaises(ToolError):
             assign_picks(self._tracks(), ["netease:1"], [_FixedSource("qq", [])], 2.0)
 
+    def test_short_source_names_are_not_reported_as_unresolved(self) -> None:
+        """`--pick ne:1` paired with `netease:1`; the flag spelling must not matter."""
+        alpha = Candidate("netease", "101", "Alpha", ["A"], "X", 200.0)
+        beta = Candidate("netease", "202", "Beta", ["B"], "Y", 180.0)
+        source = _FixedSource("netease", [alpha, beta])
+        for spelling in ("ne", "netease"):
+            assignments, unresolved, _ = assign_picks(
+                self._tracks(), [f"{spelling}:101", f"{spelling}:202"], [source], 2.0
+            )
+            self.assertEqual(unresolved, [], spelling)
+            self.assertEqual(len(assignments), 2, spelling)
+
+    def test_force_makes_tracks_with_lyrics_eligible(self) -> None:
+        """`plan --force --pick a b` must pair files that already have lyrics."""
+        tracks = [
+            make_track(
+                path=Path("/lib/Album/01 Alpha.m4a"),
+                title="Alpha",
+                artist="A",
+                album="X",
+                duration=200.0,
+                existing_lyrics="[00:01.00]旧",
+            ),
+            make_track(
+                path=Path("/lib/Album/02 Beta.m4a"),
+                title="Beta",
+                artist="B",
+                album="Y",
+                duration=180.0,
+                existing_lyrics="[00:01.00]旧",
+            ),
+        ]
+        source = _FixedSource(
+            "qq",
+            [
+                Candidate("qq", "101", "Alpha", ["A"], "X", 200.0),
+                Candidate("qq", "202", "Beta", ["B"], "Y", 180.0),
+            ],
+        )
+        self.assertEqual(
+            assign_picks(tracks, ["qq:101", "qq:202"], [source], 2.0),
+            ({}, ["qq:101", "qq:202"], []),
+        )
+        assignments, unresolved, _ = assign_picks(
+            tracks, ["qq:101", "qq:202"], [source], 2.0, force=True
+        )
+        self.assertEqual(unresolved, [])
+        self.assertEqual(assignments[str(tracks[0].path)], "qq:101")
+        self.assertEqual(assignments[str(tracks[1].path)], "qq:202")
+
 
 class MultiPickArgvTests(unittest.TestCase):
     def test_one_flag_accepts_several_ids(self) -> None:
@@ -1405,6 +1527,23 @@ class CleanTests(unittest.TestCase):
             count, _ = clean_mod._clean_files(root, _time.time() - 30 * 86400, True)
             self.assertEqual(count, 1)
             self.assertTrue(item.exists())
+
+    def test_all_ignores_the_age_of_every_file(self) -> None:
+        import time as _time
+
+        from lrc_patch import clean as clean_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fresh = root / "today.csv"
+            fresh.write_text("x")
+            count, size = clean_mod._clean_files(root, None, False)
+            self.assertEqual(count, 1)
+            self.assertGreater(size, 0)
+            self.assertFalse(fresh.exists())
+            # The age limit still applies when a cutoff is given.
+            fresh.write_text("y")
+            self.assertEqual(clean_mod._clean_files(root, _time.time() - 86400, False), (0, 0))
 
     def test_http_cache_drops_only_expired_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1567,6 +1706,15 @@ class CandidateScopeTests(unittest.TestCase):
         self.assertEqual([item.path for item in wanted], [changed.path])
         self.assertEqual(settled, 0)
 
+    def test_refresh_lists_settled_tracks_again(self) -> None:
+        track = make_track()
+        state_dir = self._state_dir(
+            [(str(track.path), "ready", "netease", 100, track.fingerprint())]
+        )
+        wanted, settled, _ = commands.open_tracks([track], state_dir, refresh=True)
+        self.assertEqual(wanted, [track])
+        self.assertEqual(settled, 0)
+
     def test_all_ignores_the_cache_and_existing_lyrics(self) -> None:
         track = make_track(existing_lyrics="[00:01]x")
         state_dir = self._state_dir(
@@ -1586,6 +1734,279 @@ class ApplyFormatGuardTests(unittest.TestCase):
         self.assertEqual(
             len(commands.format_mismatch([{"lyric_kind": None, "path": "x"}], "a2")), 1
         )
+
+
+class RepeatedLineStampTests(unittest.TestCase):
+    """A chorus line carries several stamps: that is still plain LRC."""
+
+    def test_repeated_stamps_stay_line_timing(self) -> None:
+        text = "[00:26.22][01:10.69][02:18.93]Rose\n[00:30.00]another line"
+        self.assertEqual(lyric_kind(text), "lrc")
+
+    def test_a_stamp_after_the_text_is_still_word_timing(self) -> None:
+        self.assertEqual(lyric_kind("[00:12.34]你好[00:13.00]世界"), "eslrc")
+        # The leading stamp is the line's own; the one after the text is a word.
+        self.assertEqual(lyric_kind("[00:12.34][00:12.34]你[00:13.00]世界"), "eslrc")
+
+    def test_a_repeated_line_exports_as_plain_lrc(self) -> None:
+        kind = lyric_kind("[00:26.22][01:10.69]Rose")
+        dest = lrc_dest(Path("/lib/Album/01 Rose.m4a"), Path("/lib"), Path("/cache"), kind=kind)
+        self.assertEqual(dest.suffix, ".lrc")
+
+
+class QqTimelineTests(unittest.TestCase):
+    """QQ sometimes answers one ``[0,0]`` block: plain text, not a bad timeline."""
+
+    def _fetch(self, payload: str, target: str | None = None):
+        qq = sources.QqSource(
+            RecordingQqClient([{"lyric": qq_encrypt(payload)}]), target_format=target
+        )
+        candidate = Candidate("qq", "1", "Track", ["Artist"], "Album", 200.0)
+        return qq.fetch(candidate)
+
+    def test_a_single_untimed_block_is_plain_text(self) -> None:
+        payload = '<Lyric_1 LyricType="1" LyricContent="[0,0]第一句\n第二句"/>'
+        result = self._fetch(payload)
+        self.assertEqual(result.native_kind, "plain")
+        self.assertEqual(lyric_kind(result.lyrics), "plain")
+        self.assertIn("第一句", result.lyrics)
+        self.assertIn("第二句", result.lyrics)
+        self.assertNotIn("[00:00.00]", result.lyrics)
+
+    def test_a_timed_block_stays_qrc(self) -> None:
+        payload = '<Lyric_1 LyricType="1" LyricContent="[1000,500](1000,200)我"/>'
+        result = self._fetch(payload)
+        self.assertEqual(result.native_kind, "qrc")
+
+    def test_a_plain_lyric_needs_force_to_be_written(self) -> None:
+        track = make_track()
+        candidate = Candidate("qq", "1", "Track", ["Artist"], "Album", 200.0)
+        result = plan_from_lyrics(track, candidate, "第一句\n第二句", 100, 0.2, "qq", True)
+        self.assertEqual(result.status, "suspect")
+        self.assertIn("没有时间轴", result.reason)
+
+
+class QqCacheKeyTests(unittest.TestCase):
+    """QQ answers must be cacheable: the random ``search_id`` is not the key."""
+
+    def test_two_searches_share_one_cache_key(self) -> None:
+        client = RecordingQqClient([{"body": {"item_song": []}} for _ in range(3)])
+        qq = sources.QqSource(client)
+        qq.search(make_track(title="Track"))
+        qq.search(make_track(title="Track"))
+        qq.search(make_track(title="Another"))
+        searches = [
+            key for key in client.cache_keys if "DoSearchForQQMusicLite" in key
+        ]
+        self.assertEqual(len(searches), 3)
+        self.assertEqual(searches[0], searches[1])
+        self.assertNotEqual(searches[0], searches[2])
+        self.assertNotIn("search_id", searches[0])
+
+
+class ForcePlanTests(unittest.TestCase):
+    """``--force`` re-plans a file that already carries lyrics (TXT, wrong LRC)."""
+
+    def _source(self) -> _FixedSource:
+        return _FixedSource("qq", [Candidate("qq", "7", "Track", ["Artist"], "Album", 200.0)])
+
+    def test_existing_lyrics_are_skipped_by_default(self) -> None:
+        track = make_track(existing_lyrics="[00:01.00]旧歌词")
+        self.assertEqual(plan_one(track, [self._source()], True).status, "skip_existing")
+
+    def test_force_replans_over_existing_lyrics(self) -> None:
+        track = make_track(existing_lyrics="[00:01.00]旧歌词")
+        result = plan_one(track, [self._source()], True, force=True)
+        self.assertEqual(result.status, "ready")
+        self.assertIsNotNone(result.candidate)
+        self.assertEqual(result.candidate.source_id, "7")
+
+    def test_force_also_reaches_the_candidate_list(self) -> None:
+        track = make_track(existing_lyrics="[00:01.00]旧歌词")
+        wanted, settled, written = commands.open_tracks(
+            [track], Path(tempfile.mkdtemp()), force=True
+        )
+        self.assertEqual(wanted, [track])
+        self.assertEqual((settled, written), (0, 1))
+
+
+class SourceScopeTests(unittest.TestCase):
+    """``--src qq`` must not be blocked by a ✓ plan that came from netease."""
+
+    def _planned(self, root: Path, track: Track) -> Path:
+        state = State(root / "lyrics.sqlite3")
+        candidate = Candidate("netease", "11", "Track", ["Artist"], "Album", 200.0)
+        state.upsert_plan(
+            PlanResult(
+                track,
+                "ready",
+                "Artist",
+                candidate,
+                "[00:01.00]x\n",
+                100,
+                0.0,
+                native_lyrics="[1000,500](1000,200,0)x",
+                native_kind="yrc",
+            ),
+            track.fingerprint(),
+            src_set="netease,qq",
+        )
+        return root
+
+    def test_a_ready_plan_from_another_source_is_offered_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            track = make_track()
+            state_dir = self._planned(Path(tmp), track)
+            wanted, settled, _ = commands.open_tracks([track], state_dir, sources=["qq"])
+            self.assertEqual([item.path for item in wanted], [track.path])
+            self.assertEqual(settled, 0)
+            kept, settled, _ = commands.open_tracks(
+                [track], state_dir, sources=["netease"]
+            )
+            self.assertEqual(kept, [])
+            self.assertEqual(settled, 1)
+
+    def test_the_native_lyric_and_src_set_survive_a_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            track = make_track()
+            state_dir = self._planned(Path(tmp), track)
+            row = read_plan_cache(state_dir / "lyrics.sqlite3")[str(track.path)]
+            self.assertEqual(row["src_set"], "netease,qq")
+            self.assertEqual(row["native_kind"], "yrc")
+            self.assertEqual(commands.lyric_for_target(row, "a2")[1], "a2")
+
+    def test_skip_existing_rows_belong_to_no_source(self) -> None:
+        self.assertTrue(commands.plan_uses_source({"source": None}, ["qq"]))
+        self.assertFalse(commands.plan_uses_source({"source": "netease"}, ["qq"]))
+        self.assertTrue(commands.plan_uses_source({"source": "netease"}, None))
+
+
+class NativeFormatTests(unittest.TestCase):
+    """The format is chosen at apply time, from the native text plan stored."""
+
+    def _row(self, **overrides) -> dict:
+        row = {
+            "path": "/lib/A/01.m4a",
+            "lyric": "[00:00.00]我爱\n",
+            "lyric_kind": "lrc",
+            "native_lyric": "[0,5000](0,200)我(400,200)爱\n",
+            "native_kind": "qrc",
+        }
+        row.update(overrides)
+        return row
+
+    def test_apply_converts_the_stored_native_lyric(self) -> None:
+        lyrics, kind = commands.lyric_for_target(self._row(), "a2")
+        self.assertEqual(kind, "a2")
+        self.assertIn("<00:00.40>爱", lyrics)
+
+    def test_the_native_format_itself_is_written_verbatim(self) -> None:
+        lyrics, kind = commands.lyric_for_target(self._row(), "qrc")
+        self.assertEqual(kind, "qrc")
+        self.assertEqual(lyrics.strip(), "[0,5000](0,200)我(400,200)爱")
+
+    def test_no_target_reuses_the_planned_lyric(self) -> None:
+        lyrics, kind = commands.lyric_for_target(self._row(), None)
+        self.assertEqual((lyrics.strip(), kind), ("[00:00.00]我爱", "lrc"))
+
+    def test_an_old_plan_without_native_text_is_refused(self) -> None:
+        row = self._row(native_lyric=None, native_kind=None)
+        with self.assertRaises(ToolError) as caught:
+            commands.lyric_for_target(row, "a2")
+        self.assertIn("重新取词", str(caught.exception))
+
+    def test_a_format_the_native_cannot_reach_is_refused(self) -> None:
+        row = self._row(
+            lyric="第一句\n", lyric_kind="plain", native_lyric="第一句\n", native_kind="plain"
+        )
+        with self.assertRaises(ToolError):
+            commands.lyric_for_target(row, "a2")
+
+
+class CandidateRankingTests(unittest.TestCase):
+    """A candidate inside the tolerance outranks a better-looking live take."""
+
+    def test_a_translated_title_inside_the_tolerance_wins(self) -> None:
+        track = make_track(title="歩く", artist="Aimer", album="Open α", duration=240.0)
+        live = Candidate("qq", "1", "歩く (LIVE)", ["Aimer"], "月光", 253.2)
+        translated = Candidate("qq", "2", "歩く (漫步)", ["Aimer"], "Open α", 240.8)
+        result = plan_one(track, [_FixedSource("qq", [live, translated])], True)
+        self.assertEqual(result.status, "ready")
+        self.assertIsNotNone(result.candidate)
+        self.assertEqual(result.candidate.source_id, "2")
+        self.assertGreaterEqual(result.score, 85)
+
+    def test_the_partial_pick_prefers_a_candidate_inside_the_tolerance(self) -> None:
+        track = make_track(title="X", artist="A", album="B", duration=240.0)
+        far = Candidate("qq", "1", "X", ["A"], "B", 260.0)
+        near = Candidate("qq", "2", "X (譯名)", ["Nobody"], "Elsewhere", 241.0)
+        best = best_partial_candidate(track, [far, near], 2.0)
+        self.assertIsNotNone(best)
+        self.assertEqual(best[1].source_id, "2")
+
+    def test_the_ambiguous_note_names_the_album_and_the_gap(self) -> None:
+        track = make_track(title="歩く", artist="Aimer", album="Open α", duration=240.0)
+        live = Candidate("qq", "1", "歩く (LIVE)", ["Aimer"], "月光", 253.2)
+        result = plan_one(track, [_FixedSource("qq", [live])], True)
+        self.assertEqual(result.status, "ambiguous")
+        self.assertIn("月光", result.reason)
+        self.assertIn("Δ", result.reason)
+
+
+class ScanPlansTests(unittest.TestCase):
+    """``scan --plans`` answers "which 14 tracks?", not just "14".."""
+
+    def _args(self, **overrides) -> object:
+        import argparse
+
+        values = {
+            "library": Path("/lib"),
+            "album": None,
+            "limit": None,
+            "path": [],
+            "summary": False,
+            "tree_limit": 0,
+            "plans": True,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_only_tracks_with_a_plan_are_listed(self) -> None:
+        planned = make_track(
+            path=Path("/lib/A/01 planned.m4a"), relpath="A/01 planned.m4a"
+        )
+        loose = make_track(path=Path("/lib/A/02 loose.m4a"), relpath="A/02 loose.m4a")
+        cache = {
+            str(planned.path): {
+                "fingerprint": planned.fingerprint(),
+                "source": "netease",
+                "score": 100,
+                "status": "ready",
+            }
+        }
+        buffer = io.StringIO()
+        with mock.patch.object(
+            commands, "load_tracks", return_value=([planned, loose], [])
+        ), mock.patch.object(commands, "read_plan_cache", return_value=cache):
+            with redirect_stdout(buffer):
+                code = commands.cmd_scan(self._args(), Path("/state"))
+        out = render.strip_ansi(buffer.getvalue())
+        self.assertEqual(code, 0)
+        self.assertIn("planned.m4a", out)
+        self.assertNotIn("loose.m4a", out)
+        self.assertIn("只看有计划", out)
+
+    def test_without_the_flag_every_track_is_listed(self) -> None:
+        loose = make_track(path=Path("/lib/A/02 loose.m4a"), relpath="A/02 loose.m4a")
+        buffer = io.StringIO()
+        with mock.patch.object(
+            commands, "load_tracks", return_value=([loose], [])
+        ), mock.patch.object(commands, "read_plan_cache", return_value={}):
+            with redirect_stdout(buffer):
+                commands.cmd_scan(self._args(plans=False), Path("/state"))
+        out = render.strip_ansi(buffer.getvalue())
+        self.assertIn("loose.m4a", out)
+        self.assertNotIn("只看有计划", out)
 
 
 if __name__ == "__main__":

@@ -334,6 +334,8 @@ def stage_copy(path: Path) -> Path:
 def apply_one(
     row: sqlite3.Row,
     library: Path,
+    lyrics: str | None = None,
+    allow_overwrite: bool = False,
 ) -> dict[str, Any]:
     path = Path(row["path"])
     try:
@@ -347,17 +349,20 @@ def apply_one(
     before = read_track(path, library)
     if before.fingerprint() != row["fingerprint"]:
         raise ToolError("计划生成后文件已变化，请重新 plan")
-    if before.has_lyrics:
+    if before.has_lyrics and not allow_overwrite:
         raise ToolError("文件已有歌词，拒绝覆盖")
+    text = row["lyric"] if lyrics is None else lyrics
+    if not (text or "").strip():
+        raise ToolError("计划里没有歌词文本")
 
     pre_tags = non_lyrics_tags_hash(path)
     pre_cover = cover_hash(path)
     pre_audio = audio_hash(path)
     staged = stage_copy(path)
     try:
-        write_lyrics_only(staged, row["lyric"])
+        write_lyrics_only(staged, text)
         after = read_track(staged, library)
-        if after.existing_lyrics.strip() != row["lyric"].strip():
+        if after.existing_lyrics.strip() != text.strip():
             raise VerificationError("歌词回读不一致")
         post_tags = non_lyrics_tags_hash(staged)
         post_cover = cover_hash(staged)
@@ -378,7 +383,7 @@ def apply_one(
         "applied_at": utc_now(),
         "source": row["source"],
         "source_id": row["source_id"],
-        "written_lyrics_sha": lyric_hash(row["lyric"]),
+        "written_lyrics_sha": lyric_hash(text),
         "pre_lyrics_present": int(before.has_lyrics),
         "pre_lyrics": before.existing_lyrics or None,
         "pre_tags_sha": pre_tags,

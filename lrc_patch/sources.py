@@ -29,12 +29,19 @@ from typing import Any, Callable
 
 from .config import HTTP_UA
 from .errors import SourceError
-from .lyric_fmt import check_target_source, lines_to_lrc, parse_qrc, verbatim_to_target
+from .lyric_fmt import (
+    has_timing,
+    lines_to_lrc,
+    lines_to_plain,
+    parse_native,
+    parse_qrc,
+    render_native,
+)
 from .matching import score_candidate
 from .models import Candidate, FetchResult, Track
 from .qrc import qrc_decrypt, qrc_lyric_text
 from .state import State
-from .text import is_placeholder, sanitize_lyrics, sha256_text
+from .text import TIMESTAMP_RE, is_placeholder, sanitize_lyrics, sha256_text
 
 
 class _Retryable(Exception):
@@ -141,6 +148,10 @@ RATE_LIMIT_STATUS = {403, 405, 406, 429}
 BUSY_STATUS = {500, 502, 503, 504}
 RATE_LIMIT_CODES = {"405", "406", "429"}
 BUSY_CODES = {"500", "502", "503", "504"}
+
+# QQ request fields that change on every call; they must stay out of the cache
+# key or the answer can never be reused.
+_QQ_VOLATILE = {"search_id"}
 
 
 class JsonClient:
@@ -593,24 +604,37 @@ class NeteaseSource:
         )
         if code != 200 or not data:
             return FetchResult(note=f"歌词接口 HTTP {code}")
-        # Verbatin YRC lives under ``data.yrc.lyric`` (word-timed); the plain
-        # line-timed LRC is ``data.lrc.lyric``.
-        if self.target_format:
-            raw = (data.get("yrc") or {}).get("lyric") or ""
-            if not raw:
-                # No verbatim track: fall back to line LRC and let the caller
-                # decide (it is still a valid lyric, just not word-timed).
-                raw = (data.get("lrc") or {}).get("lyric") or ""
-        else:
-            raw = (data.get("lrc") or {}).get("lyric") or ""
-        lyrics = sanitize_lyrics(raw)
-        if not lyrics or is_placeholder(lyrics):
+        # One request carries both forms: the verbatim YRC lives under
+        # ``data.yrc.lyric`` and the line-timed LRC under ``data.lrc.lyric``.
+        # Both are kept, so a format change later is a conversion, not a
+        # re-fetch.
+        yrc_text = sanitize_lyrics((data.get("yrc") or {}).get("lyric") or "")
+        lrc_text = sanitize_lyrics((data.get("lrc") or {}).get("lyric") or "")
+        if yrc_text and is_placeholder(yrc_text):
+            yrc_text = ""
+        if lrc_text and is_placeholder(lrc_text):
+            lrc_text = ""
+        if not yrc_text and not lrc_text:
             instrumental = bool(data.get("nolyric") or data.get("pureMusic"))
             return FetchResult(instrumental=instrumental, note="无可用歌词")
-        if self.target_format:
-            check_target_source(self.target_format, self.name)
-            lyrics = verbatim_to_target(lyrics, self.name, self.target_format)
-        return FetchResult(lyrics=lyrics)
+        native_kind = "yrc" if yrc_text else "lrc"
+        native = yrc_text or lrc_text
+        note = ""
+        if self.target_format in (None, "lrc"):
+            # Prefer netease's own line-timed text over a flattened YRC: it is
+            # what the provider intends players without word timing to show.
+            lyrics = lrc_text or lines_to_lrc(parse_native(native, native_kind))
+        else:
+            lyrics, note = render_native(native, native_kind, self.target_format)
+        lyrics = sanitize_lyrics(lyrics)
+        if not lyrics:
+            return FetchResult(note=note or "无可用歌词")
+        return FetchResult(
+            lyrics=lyrics,
+            note=note,
+            native_lyrics=native,
+            native_kind=native_kind,
+        )
 
 
 class LrclibSource:
@@ -712,13 +736,25 @@ class QqSource:
         self._sid = ""
         self._userip = ""
 
-    def _rpc(self, method: str, module: str, param: dict[str, Any]) -> Any:
+    def _rpc(
+        self, method: str, module: str, param: dict[str, Any], kind: str = "request"
+    ) -> Any:
         """POST one musicu.fcg request; returns the inner ``request.data``."""
         body = {
             "comm": {**self._comm, "uid": self._uid, "sid": self._sid, "userip": self._userip},
             "request": {"method": method, "module": module, "param": param},
         }
         raw = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        # The cache key must not contain anything that changes per call: the
+        # session (uid/sid) is new every run, and search_id is randomised on
+        # purpose.  Using the raw body as the key made QQ answers uncacheable,
+        # so `candidates --src qq` re-searched everything plan had just asked.
+        stable = {
+            key: value for key, value in param.items() if key not in _QQ_VOLATILE
+        }
+        cache_extra = json.dumps(
+            {"method": method, "param": stable}, ensure_ascii=False, sort_keys=True
+        )
         code, data = self.client.request(
             self.name,
             self._endpoint,
@@ -726,14 +762,11 @@ class QqSource:
             method="POST",
             raw_body=raw,
             expect_code="0",
-            # Every RPC shares one URL, so the body is what tells search,
-            # lyric and detail apart; without it they would all hit the same
-            # cache entry (and GetSession would answer every later call).
-            cache_extra=raw,
+            cache_extra=cache_extra,
             cache_predicate=lambda payload: 30 * 86400
             if isinstance(payload, dict) and (payload.get("request") or {}).get("data")
             else 86400,
-            kind="request",
+            kind=kind,
         )
         if code != 200 or not isinstance(data, dict):
             raise SourceError(self.name, f"qq 请求失败（HTTP {code}）")
@@ -745,7 +778,10 @@ class QqSource:
     def _init(self) -> None:
         if self._sid:
             return
-        data = self._rpc("GetSession", "music.getSession.session", {"caller": 0, "uid": "0", "vkey": 0})
+        data = self._rpc(
+            "GetSession", "music.getSession.session", {"caller": 0, "uid": "0", "vkey": 0},
+            kind="session",
+        )
         session = data.get("session") or {}
         self._uid = str(session.get("uid") or "0")
         self._sid = str(session.get("sid") or "")
@@ -769,7 +805,12 @@ class QqSource:
             "page_id": 1,
             "grp": 1,
         }
-        data = self._rpc("DoSearchForQQMusicLite", "music.search.SearchCgiService", param)
+        data = self._rpc(
+            "DoSearchForQQMusicLite",
+            "music.search.SearchCgiService",
+            param,
+            kind="search",
+        )
         songs = (data or {}).get("body", {}).get("item_song") or []
         seen: set[str] = set()
         out: list[Candidate] = []
@@ -803,6 +844,7 @@ class QqSource:
                     "get_song_detail",
                     "music.pf_song_detail_svr",
                     {"song_id": int(sid)},
+                    kind="detail",
                 )
             except SourceError:
                 raise
@@ -850,7 +892,12 @@ class QqSource:
             "trans_t": 0,
             "type": 0,
         }
-        data = self._rpc("GetPlayLyricInfo", "music.musichallSong.PlayLyricInfo", param)
+        data = self._rpc(
+            "GetPlayLyricInfo",
+            "music.musichallSong.PlayLyricInfo",
+            param,
+            kind="lyric",
+        )
         if not isinstance(data, dict):
             return FetchResult(note="无可用歌词")
         encrypted = data.get("lyric") or ""
@@ -861,18 +908,36 @@ class QqSource:
         except ValueError as exc:
             return FetchResult(note=f"QRC 解密失败：{exc}")
         qrc_text = qrc_lyric_text(decrypted)
-        if not qrc_text:
+        if not qrc_text.strip():
             return FetchResult(instrumental=False, note="无可用歌词")
-        if self.target_format:
-            check_target_source(self.target_format, self.name)
-            lyrics = verbatim_to_target(qrc_text, self.name, self.target_format)
+
+        # Keep the native QRC and say honestly what it is: QQ sometimes ships a
+        # single ``[0,0]`` block with the whole lyric and no line timing, which
+        # used to be flattened into one ``[00:00.00]`` line and then judged a
+        # "suspicious timeline" instead of a plain-text lyric.
+        native = sanitize_lyrics(qrc_text)
+        parsed = parse_qrc(native)
+        if has_timing(parsed):
+            native_kind = "qrc"
+        elif TIMESTAMP_RE.search(native):
+            native_kind = "lrc"
         else:
-            # Default: flatten the verbatim QRC to plain line-timed LRC.
-            lyrics = lines_to_lrc(parse_qrc(qrc_text))
-        lyrics = sanitize_lyrics(lyrics)
-        if not lyrics or is_placeholder(lyrics):
+            native_kind = "plain"
+            native = sanitize_lyrics(lines_to_plain(parsed))
+        if not native:
             return FetchResult(instrumental=False, note="无可用歌词")
-        return FetchResult(lyrics=lyrics)
+        if is_placeholder(native):
+            return FetchResult(instrumental=False, note="无可用歌词")
+        lyrics, note = render_native(native, native_kind, self.target_format)
+        lyrics = sanitize_lyrics(lyrics)
+        if not lyrics:
+            return FetchResult(instrumental=False, note=note or "无可用歌词")
+        return FetchResult(
+            lyrics=lyrics,
+            note=note,
+            native_lyrics=native,
+            native_kind=native_kind,
+        )
 
     def fetch_plain(self, candidate: Candidate) -> FetchResult:
         """Fallback: prefer the plain LRC when the verbatim track is absent."""

@@ -54,6 +54,15 @@ def state_lock(state_dir: Path, timeout: float = 3.0) -> Iterable[None]:
         finally:
             handle.close()
 
+def row_get(row: Any, key: str, default: Any = None) -> Any:
+    """Read a column that may not exist yet (old database, plain dict row)."""
+    try:
+        value = row[key]
+    except (IndexError, KeyError, TypeError):
+        return default
+    return default if value is None else value
+
+
 def read_plan_cache(path: Path) -> dict[str, sqlite3.Row]:
     """Read plan rows without taking the run lock or creating the database.
 
@@ -69,9 +78,7 @@ def read_plan_cache(path: Path) -> dict[str, sqlite3.Row]:
         return {}
     try:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT path,status,source,score,fingerprint FROM plans"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM plans").fetchall()
         return {row["path"]: row for row in rows}
     except sqlite3.Error:
         return {}
@@ -150,6 +157,15 @@ class State:
                 );
                 """
             )
+            # Columns added later; ALTER keeps an existing database usable
+            # without a migration step the user has to run.
+            #   native_lyric/native_kind — the provider's own text and format,
+            #     so apply can convert instead of re-fetching.
+            #   src_set — which --src list produced this plan, so `--src qq`
+            #     does not silently reuse a netease verdict.
+            self._add_column(conn, "plans", "native_lyric", "TEXT")
+            self._add_column(conn, "plans", "native_kind", "TEXT")
+            self._add_column(conn, "plans", "src_set", "TEXT")
             # 1.6 and earlier stored provider failures as no_match. Reclassify
             # them once so the 2.x retry policy actually picks them up instead
             # of reusing a stale "no match" forever.
@@ -204,23 +220,33 @@ class State:
                 (key, time.time(), ttl, json.dumps(payload, ensure_ascii=False)),
             )
 
+    @staticmethod
+    def _add_column(conn: sqlite3.Connection, table: str, name: str, decl: str) -> None:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
     def get_plan(self, path: str) -> sqlite3.Row | None:
         with self.connection() as conn:
             return conn.execute(
                 "SELECT * FROM plans WHERE path=?", (path,)
             ).fetchone()
 
-    def upsert_plan(self, result: PlanResult, fingerprint: str) -> None:
+    def upsert_plan(
+        self, result: PlanResult, fingerprint: str, src_set: str = ""
+    ) -> None:
         c = result.candidate
         lyric = result.lyrics or None
+        native = result.native_lyrics or None
         with self.connection() as conn:
             conn.execute(
                 """
                 INSERT INTO plans(
                     path,fingerprint,planned_at,status,reason,source,source_id,
                     match_title,match_artist,match_album,match_duration,
-                    duration_diff,score,lyric,lyric_sha,lyric_kind,lyric_lines
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    duration_diff,score,lyric,lyric_sha,lyric_kind,lyric_lines,
+                    native_lyric,native_kind,src_set
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(path) DO UPDATE SET
                     fingerprint=excluded.fingerprint,
                     planned_at=excluded.planned_at,
@@ -237,7 +263,10 @@ class State:
                     lyric=excluded.lyric,
                     lyric_sha=excluded.lyric_sha,
                     lyric_kind=excluded.lyric_kind,
-                    lyric_lines=excluded.lyric_lines
+                    lyric_lines=excluded.lyric_lines,
+                    native_lyric=excluded.native_lyric,
+                    native_kind=excluded.native_kind,
+                    src_set=excluded.src_set
                 """,
                 (
                     str(result.track.path),
@@ -257,6 +286,9 @@ class State:
                     lyric_hash(lyric) if lyric else None,
                     lyric_kind(lyric) if lyric else None,
                     lyrics_line_count(lyric),
+                    native,
+                    result.native_kind or (lyric_kind(lyric) if lyric else None),
+                    src_set,
                 ),
             )
 
@@ -323,7 +355,9 @@ class State:
         args: tuple[Any, ...] = (before,) if before else ()
         with self.connection() as conn:
             row = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(LENGTH(COALESCE(lyric,''))),0) "
+                "SELECT COUNT(*), COALESCE(SUM("
+                "LENGTH(COALESCE(lyric,'')) + LENGTH(COALESCE(native_lyric,''))"
+                "),0) "
                 f"FROM plans {where}",
                 args,
             ).fetchone()

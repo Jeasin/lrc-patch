@@ -22,13 +22,6 @@ QRC_KEY = b"!@#)(*$%123ZXC!@!@#)(NHL"
 _QRC_CONTENT_RE = re.compile(
     r'<Lyric_1 LyricType="1" LyricContent="(?P<content>.*?)"/>', re.DOTALL
 )
-# A QRC line: [start,duration]content, where content carries per-word
-# (start,duration) markers, e.g. "[1234,567](1234,56)词(1290,78)语".
-_QRC_LINE_RE = re.compile(r"^\[(\d+),(\d+)\](.*)$")
-_QRC_TAG_RE = re.compile(r"^\[(\w+):([^\]]*)\]$")
-# Per-word marker, with the word text captured greedily-until the next marker.
-_QRC_WORD_RE = re.compile(r"\((\d+),(\d+)\)([^(]*)")
-_QRC_WORD_ONLY_RE = re.compile(r"^\(\d+,\d+\)$")
 
 
 def qrc_decrypt(encrypted: str) -> str:
@@ -78,53 +71,19 @@ def qrc_to_enhanced(qrc_text: str) -> str:
 
         [mm:ss.xx]<mm:ss.xx>词<mm:ss.xx>语
 
-    Metadata tags (``[ti:…]`` etc.) are preserved verbatim.  Lines with no
-    per-word markers fall back to a plain ``[mm:ss.xx]`` line so no text is
-    lost.
+    Metadata tags (``[ti:…]`` etc.) are preserved verbatim.  The conversion
+    itself lives in :mod:`lrc_patch.lyric_fmt` — the one place that knows how
+    a native timeline maps to every target format — so this stays a thin
+    compatibility wrapper instead of a second parser that can drift.
     """
-    out: list[str] = []
-    for raw_line in (qrc_text or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        line_match = _QRC_LINE_RE.match(line)
-        if line_match:
-            start_ms = int(line_match.group(1))
-            content = line_match.group(3)
-            # A bare word-only marker means an empty/pause line.
-            if _QRC_WORD_ONLY_RE.match(content):
-                out.append(f"[{_fmt_ms(start_ms)}]")
-                continue
-            words = _QRC_WORD_RE.findall(content)
-            if not words:
-                # No verbatim markers: emit a plain line.
-                out.append(f"[{_fmt_ms(start_ms)}]{content}")
-                continue
-            parts = [f"[{_fmt_ms(start_ms)}]"]
-            for ws, _wd, word in words:
-                if not word:
-                    continue
-                parts.append(f"<{_fmt_ms(int(ws))}>{word}")
-            out.append("".join(parts))
-            continue
-        if _QRC_TAG_RE.match(line):
-            out.append(line)
-            continue
-        out.append(line)
-    return "\n".join(out) + ("\n" if out else "")
+    from .lyric_fmt import lines_to_a2, parse_qrc
+
+    return lines_to_a2(parse_qrc(qrc_text))
 
 
 def qrc_decrypt_to_enhanced(encrypted: str) -> str:
     """Decrypt a QRC payload and return enhanced LRC text in one step."""
     return qrc_to_enhanced(qrc_lyric_text(qrc_decrypt(encrypted)))
-
-
-def _fmt_ms(ms: int) -> str:
-    """Milliseconds → ``mm:ss.xx`` (hundredths, the LRC convention)."""
-    ms = max(0, int(ms))
-    minutes, remainder = divmod(ms, 60000)
-    seconds, hundredths = divmod(remainder, 1000)
-    return f"{minutes:02d}:{seconds:02d}.{hundredths // 10:02d}"
 
 
 # ---------------------------------------------------------------------------

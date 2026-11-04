@@ -3,7 +3,7 @@
 The providers serve two native verbatim formats:
 
 * netease serves **YRC**  — ``[lineStart,lineDur](sylStart,sylDur,0)text``
-* QQ serves **QRC**      — ``[lineStart,lineDur]text(sylStart,sylDur)``
+* QQ serves **QRC**      — ``[lineStart,lineDur](sylStart,sylDur)text``
 
 The user picks a *target* with a CLI flag.  Private formats (``--yrc``,
 ``--qrc``) are only ever served straight from their native source and error
@@ -36,10 +36,13 @@ _TARGET_NATIVE = {
 
 _YRC_LINE_RE = re.compile(r"^\[(\d+),(\d+)\](.*)$")
 _YRC_WORD_RE = re.compile(r"\((\d+),(\d+),0\)([^(]*)")
-# QRC word: text immediately followed by (start,dur).  The text may itself
-# contain no parentheses (QQ leaves literal parens in text, but they are rare
-# and the marker always follows the word).
-_QRC_PAIR_RE = re.compile(r"([^(]+?)\((\d+),(\d+)\)")
+# QRC word: ``(start,dur)text`` — the marker *precedes* the word, exactly as
+# ``qrc.py`` decodes and re-renders it (``[0,5000](0,200)我(200,300)爱``).
+# Reading the text first turned the marker digits into part of the lyric and
+# glued "0,200)" in front of every word.
+_QRC_WORD_RE = re.compile(r"\((\d+),(\d+)\)([^(]*)")
+# Any word marker, whichever provider wrote it (YRC has a third field).
+_WORD_MARK_RE = re.compile(r"\(\d+,\d+(?:,0)?\)")
 
 
 @dataclass
@@ -79,7 +82,7 @@ def parse_yrc(text: str) -> list[Line]:
 
 
 def parse_qrc(text: str) -> list[Line]:
-    """Parse QRC into lines (word markers follow the text)."""
+    """Parse QRC into lines (the word marker precedes its text)."""
     return _parse_bracketed(text, word_first=False)
 
 
@@ -97,29 +100,33 @@ def _parse_bracketed(text: str, *, word_first: bool) -> list[Line]:
         content = m.group(3)
         words: list[Word] = []
         if word_first:
-            for ws, wd, wtext in _YRC_WORD_RE.findall(content):
-                if wtext:
-                    words.append(Word(int(ws), int(wd), wtext))
+            words = [
+                Word(int(ws), int(wd), wtext)
+                for ws, wd, wtext in _YRC_WORD_RE.findall(content)
+                if wtext
+            ]
         else:
-            # QRC: text(start,dur)text(start,dur)…  Match each word with its
-            # trailing marker; any trailing text without a marker is appended
-            # to the last word (or kept as the line's raw text).
-            pos = 0
-            for m in _QRC_PAIR_RE.finditer(content):
-                ws, wd, wtext = int(m.group(2)), int(m.group(3)), m.group(1)
-                if wtext.strip():
-                    words.append(Word(ws, wd, wtext.strip()))
-                pos = m.end()
-            trailing = content[pos:].strip()
-            if trailing and words:
-                # Text after the last marker: fold it into the last word.
-                words[-1] = Word(words[-1].start, words[-1].dur, words[-1].text + trailing)
-            elif trailing:
-                words = [Word(0, 0, trailing)]
-        if not words:
-            lines.append(Line(start, dur, [], text=content))
-        else:
+            # QRC: (start,dur)text(start,dur)text…  Each marker owns the text
+            # up to the next marker; any text before the first marker is folded
+            # into the first word so nothing is dropped.
+            matches = list(_QRC_WORD_RE.finditer(content))
+            if matches:
+                lead = content[: matches[0].start()].strip()
+                words = [
+                    Word(int(match.group(1)), int(match.group(2)), match.group(3))
+                    for match in matches
+                ]
+                if lead and words:
+                    words[0] = Word(words[0].start, words[0].dur, lead + words[0].text)
+                words = [word for word in words if word.text]
+        if words:
             lines.append(Line(start, dur, words))
+        elif _WORD_MARK_RE.search(content):
+            # Timed but wordless: an instrumental/pause line.  Keep the stamp
+            # and drop the marker, instead of printing "(0,200)" as lyrics.
+            lines.append(Line(start, dur, [], text=""))
+        else:
+            lines.append(Line(start, dur, [], text=content))
     return lines
 
 
@@ -223,3 +230,60 @@ def verbatim_to_target(native_text: str, source_name: str, target: str) -> str:
         return lines_to_ttml(lines)
     # Default (line LRC) is handled by the caller via lines_to_lrc.
     return lines_to_lrc(lines)
+
+
+def has_timing(lines: list[Line]) -> bool:
+    """True when the parsed lyric carries any real time information.
+
+    QQ sometimes answers with a single ``[0,0]`` block holding the whole lyric
+    and no per-line timing.  Flattening that to LRC used to emit one
+    ``[00:00.00]`` line containing the entire song, which then looked like a
+    suspicious timeline instead of a plain-text lyric.
+    """
+    return any(line.words or line.start or line.dur for line in lines)
+
+
+def lines_to_plain(lines: list[Line]) -> str:
+    """Render lines as plain text, dropping whatever timing they carry."""
+    out: list[str] = []
+    for line in lines:
+        text = "".join(w.text for w in line.words) if line.words else line.text
+        if text.strip():
+            out.append(text.rstrip())
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def render_native(
+    native_text: str, native_kind: str, target: str | None
+) -> tuple[str, str]:
+    """Produce the requested target from the provider's native lyric.
+
+    Returns ``(lyrics, note)``.  A request the native format cannot satisfy
+    falls back to line-timed LRC and explains itself in ``note`` instead of
+    failing the whole track: the format is now stored per plan (and shown in
+    plan/candidates), so apply can still convert later when that is possible.
+    """
+    want = (target or "lrc").lower()
+    kind = (native_kind or "plain").lower()
+    if want == kind:
+        return native_text, ""
+    if kind in ("yrc", "qrc"):
+        if want in ("a2", "eslrc", "ttml", "lrc"):
+            source = "netease" if kind == "yrc" else "qq"
+            return verbatim_to_target(native_text, source, want), ""
+        return lines_to_lrc(parse_native(native_text, kind)), (
+            f"原生是 {kind.upper()}，无法生成 {want.upper()}，已按逐行 LRC 取词"
+        )
+    if kind == "plain":
+        if want in ("plain", "txt"):
+            return native_text, ""
+        return native_text, f"原生只有纯文本，无法生成 {want.upper()}，已按纯文本取词"
+    # Native is a line-timed lyric: word-level targets cannot be invented.
+    if want in ("lrc", "plain", "txt"):
+        return native_text, ""
+    return native_text, f"原生是逐行 LRC，无法生成 {want.upper()}，已按逐行 LRC 取词"
+
+
+def parse_native(text: str, kind: str) -> list[Line]:
+    """Parse a native lyric by the kind that produced it."""
+    return parse_yrc(text) if kind == "yrc" else parse_qrc(text)
