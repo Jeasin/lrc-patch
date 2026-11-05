@@ -5,7 +5,8 @@ Every artefact this tool creates lives in one of two places:
 * ``$XDG_STATE_HOME/lrc-patch`` — ``lyrics.sqlite3`` (plans, journal, HTTP
   cache), ``reports/`` (plan CSVs and HTML review pages) and ``picks/``
   (generated pick templates);
-* ``$XDG_CACHE_HOME/lrc-patch/lrc`` — the ``--lrc`` export mirror.
+* ``$XDG_CACHE_HOME/lrc-patch/lyr`` — the ``lrcpatch output`` export mirror
+  (the pre-2.15 name ``lrc`` is still cleaned up if it is lying around).
 
 Like ``brew cleanup`` this is a *safe* cleanup: by default it only drops what
 is clearly stale (expired HTTP cache, reports/templates/exports older than
