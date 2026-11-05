@@ -5,8 +5,9 @@ Every artefact this tool creates lives in one of two places:
 * ``$XDG_STATE_HOME/lrc-patch`` — ``lyrics.sqlite3`` (plans, journal, HTTP
   cache), ``reports/`` (plan CSVs and HTML review pages) and ``picks/``
   (generated pick templates);
-* ``$XDG_CACHE_HOME/lrc-patch/lyr`` — the ``lrcpatch output`` export mirror
-  (the pre-2.15 name ``lrc`` is still cleaned up if it is lying around).
+* ``$XDG_CACHE_HOME/lrc-patch/lyr`` — the lyric store: the provider text every
+  plan points at and ``apply`` reads (files a plan still needs are kept; the
+  pre-2.15 name ``lrc`` is cleaned up too if it is lying around).
 
 Like ``brew cleanup`` this is a *safe* cleanup: by default it only drops what
 is clearly stale (expired HTTP cache, reports/templates/exports older than
@@ -20,15 +21,15 @@ import argparse
 import datetime as dt
 from pathlib import Path
 
-from .config import default_lyr_dir, legacy_lyr_dir
+from .config import legacy_lyr_dir
 from .errors import ToolError
 from .render import format_size, pad_display, print_header, print_meta, rule, short_path, style
-from .state import State
+from .state import State, row_get
 
 TARGETS: dict[str, str] = {
     "http": "HTTP 缓存",
     "reports": "报告",
-    "lyr": "导出歌词",
+    "lyr": "歌词库",
     "picks": "pick 模板",
     "plans": "计划状态",
     "journal": "回滚记录",
@@ -64,14 +65,22 @@ def _roots(value: Path | list[Path]) -> list[Path]:
 
 
 def _clean_files(
-    root: Path, cutoff: float | None, dry_run: bool
+    root: Path, cutoff: float | None, dry_run: bool, keep: set[str] | None = None
 ) -> tuple[int, int]:
-    """Delete files under ``root`` older than ``cutoff`` (all when None)."""
+    """Delete files under ``root`` older than ``cutoff`` (all when None).
+
+    ``keep`` names files a plan still points at: the lyric store is where
+    ``apply`` reads from now, so cleaning it out from under a plan would make
+    the plan unusable.
+    """
     if not root.is_dir():
         return 0, 0
+    protected = keep or set()
     count = size = 0
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.is_symlink():
+            continue
+        if path.name in protected:
             continue
         try:
             stat = path.stat()
@@ -114,7 +123,7 @@ def cmd_clean(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     cutoff = None if everything else _cutoff(days)
     before_size = state.size()
 
-    lyr_dir = (getattr(args, "out", None) or default_lyr_dir()).expanduser()
+    lyr_dir = (getattr(args, "out", None) or state.lyr_root).expanduser()
     paths = {
         "reports": state_dir / "reports",
         "lyr": lyr_dir,
@@ -150,14 +159,23 @@ def cmd_clean(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                 left = _left_http(state, expired_only)
                 tail = style(f"   保留 {left} 条", "90")
         elif name in paths:
+            # A plan points at its native file by name; never clean that one.
+            keep: set[str] = set()
+            if name == "lyr":
+                keep = {
+                    str(row_get(row, "native_path", "") or "")
+                    for row in state.list_plans()
+                } - {""}
             count = size = 0
             for root in _roots(paths[name]):
-                got, freed_bytes = _clean_files(root, cutoff, dry_run)
+                got, freed_bytes = _clean_files(root, cutoff, dry_run, keep)
                 count += got
                 size += freed_bytes
             tail = ""
+            if keep and count:
+                tail = style(f"   保留 {len(keep)} 个计划在用的", "90")
             if count:
-                tail = style(
+                tail += style(
                     "   全部" if everything else f"   {days} 天前", "90"
                 )
             elif not everything:

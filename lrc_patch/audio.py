@@ -454,33 +454,3 @@ _LYRIC_SUFFIX = {
     "qrc": ".qrc",
     "ttml": ".ttml",
 }
-
-def export_lrc(
-    library: Path,
-    rows: Iterable[sqlite3.Row],
-    tracks_by_path: dict[str, Track],
-    lrc_dir: Path,
-) -> tuple[int, int]:
-    """Write .lrc copies; falls back to existing lyrics when plan has none.
-
-    Verbatim lyrics keep their native extension (``.alrc``/``.eslrc``/
-    ``.yrc``/``.qrc``/``.ttml``) to preserve word-level timing instead of
-    flattening them into a plain ``.lrc``.
-    """
-    written = 0
-    failed = 0
-    for row in rows:
-        lyric = row["lyric"]
-        if not lyric:
-            track = tracks_by_path.get(row["path"])
-            lyric = track.existing_lyrics if track else ""
-        if not lyric or not lyric.strip():
-            continue
-        kind = lyric_kind(lyric)
-        try:
-            write_text_atomic(lrc_dest(Path(row["path"]), library, lrc_dir, kind), lyric)
-            written += 1
-        except OSError as exc:
-            failed += 1
-            print(f"WARN LRC 写入失败 {Path(row['path']).name}: {exc}")
-    return written, failed

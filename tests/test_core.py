@@ -11,7 +11,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from lrc_patch import commands, render, sorting, sources
+from lrc_patch import commands, render, sorting, sources, store
 from lrc_patch import qrc as qrc_mod
 from lrc_patch.audio import lrc_dest
 from lrc_patch.cli_args import (
@@ -662,8 +662,8 @@ class StateMigrationTests(unittest.TestCase):
     def test_legacy_network_no_match_becomes_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.sqlite3"
-            State(path)
-            with State(path).connection() as conn:
+            State(path, Path(tmp) / "lyr")
+            with State(path, Path(tmp) / "lyr").connection() as conn:
                 conn.executemany(
                     "INSERT INTO plans(path,fingerprint,planned_at,status,reason) "
                     "VALUES(?,?,?,?,?)",
@@ -678,7 +678,7 @@ class StateMigrationTests(unittest.TestCase):
                         ("/genuine.m4a", "fp", "now", "no_match", "netease: 无搜索结果"),
                     ],
                 )
-            state = State(path)
+            state = State(path, Path(tmp) / "lyr")
             self.assertEqual(state.get_plan("/legacy.m4a")["status"], "error")
             self.assertEqual(state.get_plan("/genuine.m4a")["status"], "no_match")
 
@@ -705,7 +705,7 @@ class StateMigrationTests(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            state = State(path)
+            state = State(path, Path(tmp) / "lyr")
             row = state.get_plan("/old.m4a")
             self.assertEqual(row["status"], "ready")
             self.assertEqual(row_get(row, "src_set", ""), "")
@@ -717,7 +717,10 @@ class StateMigrationTests(unittest.TestCase):
 class JsonClientTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
-        self.state = State(Path(self.tempdir.name) / "state.sqlite3")
+        self.state = State(
+            Path(self.tempdir.name) / "state.sqlite3",
+            Path(self.tempdir.name) / "lyr",
+        )
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -1587,7 +1590,7 @@ class CleanTests(unittest.TestCase):
 
     def test_http_cache_drops_only_expired_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            state = State(Path(tmp) / "s.sqlite3")
+            state = State(Path(tmp) / "s.sqlite3", Path(tmp) / "lyr")
             state.cache_http("expired", {"a": 1}, 0)
             state.cache_http("live", {"b": 2}, 3600)
             removed, _ = state.purge_http_cache(expired_only=True)
@@ -1815,7 +1818,13 @@ class CandidateScopeTests(unittest.TestCase):
 
 class ApplyFormatGuardTests(unittest.TestCase):
     def test_only_the_requested_format_is_accepted(self) -> None:
-        rows = [{"lyric_kind": "lrc", "path": "/lib/a.m4a"}]
+        rows = [
+            {
+                "lyric_kind": "lrc",
+                "lyric": "[00:00.00]a\n",
+                "path": "/lib/a.m4a",
+            }
+        ]
         self.assertEqual(len(commands.format_mismatch(rows, "qrc")), 1)
         self.assertEqual(commands.format_mismatch(rows, "lrc"), [])
         # Old rows may have no kind at all; those need a re-plan too.
@@ -1922,7 +1931,7 @@ class SourceScopeTests(unittest.TestCase):
     """``--src qq`` must not be blocked by a ✓ plan that came from netease."""
 
     def _planned(self, root: Path, track: Track) -> Path:
-        state = State(root / "lyrics.sqlite3")
+        state = State(root / "lyrics.sqlite3", root / "lyr")
         candidate = Candidate("netease", "11", "Track", ["Artist"], "Album", 200.0)
         state.upsert_plan(
             PlanResult(
@@ -1960,7 +1969,9 @@ class SourceScopeTests(unittest.TestCase):
             row = read_plan_cache(state_dir / "lyrics.sqlite3")[str(track.path)]
             self.assertEqual(row["src_set"], "netease,qq")
             self.assertEqual(row["native_kind"], "yrc")
-            self.assertEqual(commands.lyric_for_target(row, "a2")[1], "a2")
+            self.assertEqual(
+                commands.lyric_for_target(row, "a2", state_dir / "lyr")[1], "a2"
+            )
 
     def test_skip_existing_rows_belong_to_no_source(self) -> None:
         self.assertTrue(commands.plan_uses_source({"source": None}, ["qq"]))
@@ -2147,7 +2158,7 @@ class StatusCommandTests(unittest.TestCase):
 
     def _planned_dir(self, root: Path) -> Track:
         track = make_track()
-        state = State(root / "lyrics.sqlite3")
+        state = State(root / "lyrics.sqlite3", root / "lyr")
         state.upsert_plan(
             PlanResult(
                 track,
@@ -2206,7 +2217,7 @@ class StateSummaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             track = make_track()
-            state = State(root / "lyrics.sqlite3")
+            state = State(root / "lyrics.sqlite3", root / "lyr")
             state.upsert_plan(
                 PlanResult(track, "ambiguous", "q", score=72),
                 track.fingerprint(),
@@ -2475,10 +2486,20 @@ class CandidatesNativeKindTests(unittest.TestCase):
         rows = self._rows(make_track(), {("netease", "1810759765"): "yrc,lrc"})
         self.assertEqual(rows[0].kind, "YRC/LRC")
 
+    def test_a_checked_verbatim_format_is_marked(self) -> None:
+        # Bold means "verified to carry word timing", not "this source is a
+        # QRC endpoint" — QQ also ships QRC containers with no timeline.
+        rows = self._rows(make_track(), {("netease", "1810759765"): "yrc,lrc"})
+        self.assertTrue(rows[0].verbatim)
+
+    def test_a_line_timed_answer_is_not_marked(self) -> None:
+        rows = self._rows(make_track(), {("netease", "1810759765"): "lrc"})
+        self.assertFalse(rows[0].verbatim)
+
     def test_known_native_kinds_reads_the_plan_table(self) -> None:
         track = make_track()
         state_dir = Path(tempfile.mkdtemp())
-        state = State(state_dir / "lyrics.sqlite3")
+        state = State(state_dir / "lyrics.sqlite3", state_dir / "lyr")
         state.upsert_plan(
             PlanResult(
                 track,
@@ -2559,7 +2580,10 @@ class CandidateProbeTests(unittest.TestCase):
             )
 
     def _args(self, *extra: str):
-        return build_parser().parse_args(["candidates", "--library", "/lib", *extra])
+        # Probing is opt-in now: `candidates` alone must stay offline.
+        return build_parser().parse_args(
+            ["candidates", "--library", "/lib", "--probe", "1", *extra]
+        )
 
     def _results(self, track: Track) -> dict[str, list]:
         candidate = Candidate(
@@ -2610,7 +2634,7 @@ class CandidatesCommandTests(unittest.TestCase):
         # of the empty-scope branch, so every listing that had rows crashed.
         track = make_track(path=Path("/lib/A/01.m4a"), relpath="A/01.m4a")
         state_dir = Path(tempfile.mkdtemp())
-        state = State(state_dir / "lyrics.sqlite3")
+        state = State(state_dir / "lyrics.sqlite3", state_dir / "lyr")
         args = build_parser().parse_args(["candidates", "--library", "/lib"])
         # cli.main normalises the positional list into `path`; do the same.
         args.paths = args.path = [str(track.path)]
@@ -2692,6 +2716,145 @@ class _OutputSource:
         )
 
 
+class NativeLyricStoreTests(unittest.TestCase):
+    """The provider's text lives in `lyr/` as a file, not in a column."""
+
+    def _state(self) -> tuple[State, Path, Path]:
+        root = Path(tempfile.mkdtemp())
+        return State(root / "lyrics.sqlite3", root / "lyr"), root, root / "lyr"
+
+    def _plan(self, state: State, track: Track) -> None:
+        state.upsert_plan(
+            PlanResult(
+                track,
+                "ready",
+                "Artist",
+                Candidate(
+                    source="netease",
+                    source_id="7",
+                    title=track.title,
+                    artists=["Artist"],
+                    album=track.album,
+                    duration=track.duration,
+                ),
+                lyrics="[00:00.00]あ\n",
+                score=100,
+                duration_diff=0.0,
+                native_lyrics="[1000,2000](1000,200,0)あ\n",
+                native_kind="yrc",
+                native_kinds=("yrc", "lrc"),
+            ),
+            track.fingerprint(),
+        )
+
+    def test_both_texts_land_on_disk_and_leave_the_columns_empty(self) -> None:
+        state, _root, lyr = self._state()
+        track = make_track()
+        self._plan(state, track)
+        row = state.get_plan(str(track.path))
+        self.assertIsNone(row["native_lyric"])
+        self.assertIsNone(row["lyric"])
+        self.assertEqual(row["native_path"], "Artist - Track [ne:7].yrc")
+        self.assertEqual(
+            sorted(path.suffix for path in lyr.iterdir()), [".lrc", ".yrc"]
+        )
+        self.assertIn("(1000,200,0)あ", (lyr / "Artist - Track [ne:7].yrc").read_text())
+
+    def test_apply_reads_the_file_rather_than_the_database(self) -> None:
+        state, _root, lyr = self._state()
+        track = make_track()
+        self._plan(state, track)
+        row = state.get_plan(str(track.path))
+        # The served LRC is its own file, and a conversion is still local.
+        self.assertEqual(commands.lyric_for_target(row, None, lyr)[0], "[00:00.00]あ\n")
+        self.assertEqual(commands.lyric_for_target(row, "a2", lyr)[1], "a2")
+        # A cleaned store must say so instead of writing an empty lyric.
+        for path in lyr.iterdir():
+            path.unlink()
+        with self.assertRaises(ToolError):
+            commands.lyric_for_target(row, "a2", lyr)
+
+    def test_a_rerun_replaces_the_files_it_made_obsolete(self) -> None:
+        state, _root, lyr = self._state()
+        self._plan(state, make_track())
+        stem = "Artist - Track [ne:7]"
+        # The source stops serving YRC: only .lrc survives.
+        store.save(
+            lyr,
+            "Artist",
+            "Track",
+            "ne:7",
+            {"lrc": "[00:00.00]い\n"},
+        )
+        self.assertEqual(sorted(path.suffix for path in lyr.iterdir()), [".lrc"])
+        self.assertEqual(store.load(lyr, f"{stem}.lrc"), "[00:00.00]い\n")
+
+    def test_locate_prefers_the_most_detailed_file(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        store.save(
+            root,
+            "Artist",
+            "Track",
+            "ne:7",
+            {"lrc": "[00:00.00]あ\n", "yrc": "[1000,2000](1000,200,0)あ\n"},
+        )
+        self.assertEqual(store.locate(root, "ne:7")[1], "yrc")
+
+    def test_a_legacy_row_is_moved_to_a_file_on_startup(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        path = root / "lyrics.sqlite3"
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE plans (path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,"
+            " planned_at TEXT NOT NULL, status TEXT NOT NULL,"
+            " reason TEXT NOT NULL DEFAULT '', source TEXT, source_id TEXT,"
+            " match_title TEXT, match_artist TEXT, match_album TEXT,"
+            " match_duration REAL, duration_diff REAL,"
+            " score INTEGER NOT NULL DEFAULT 0, lyric TEXT, lyric_sha TEXT,"
+            " lyric_kind TEXT, lyric_lines INTEGER NOT NULL DEFAULT 0,"
+            " native_lyric TEXT, native_kind TEXT, native_kinds TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO plans(path,fingerprint,planned_at,status,reason,source,"
+            "source_id,match_title,match_artist,score,lyric,lyric_kind,lyric_lines,"
+            "native_lyric,native_kind,native_kinds)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "/legacy.m4a",
+                "fp",
+                "now",
+                "ready",
+                "Artist",
+                "netease",
+                "9",
+                "春泥棒",
+                "ヨルシカ",
+                100,
+                "[00:00.00]あ\n",
+                "lrc",
+                1,
+                "[1000,2000](1000,200,0)あ\n",
+                "yrc",
+                "yrc,lrc",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        state = State(path, root / "lyr")
+        row = state.get_plan("/legacy.m4a")
+        self.assertIsNone(row["native_lyric"])
+        self.assertIsNone(row["lyric"])
+        self.assertEqual(row["native_path"], "ヨルシカ - 春泥棒 [ne:9].yrc")
+        self.assertEqual(
+            sorted(item.suffix for item in (root / "lyr").iterdir()),
+            [".lrc", ".yrc"],
+        )
+        self.assertEqual(
+            state.native_text(row), "[1000,2000](1000,200,0)あ\n"
+        )
+
+
 class OutputCommandTests(unittest.TestCase):
     """`output` writes files and nothing else; apply writes the audio."""
 
@@ -2703,7 +2866,7 @@ class OutputCommandTests(unittest.TestCase):
             if getattr(args, name, False)
         ]
         args.path = list(args.paths)
-        state = State(state_dir / "lyrics.sqlite3")
+        state = State(state_dir / "lyrics.sqlite3", state_dir / "lyr")
         buffer = io.StringIO()
         with mock.patch.object(commands, "build_sources", return_value=[source]):
             with redirect_stdout(buffer):
@@ -2721,6 +2884,17 @@ class OutputCommandTests(unittest.TestCase):
         written = list(out_dir.iterdir())
         self.assertEqual([path.suffix for path in written], [".yrc"])
         self.assertIn("[ne:1]", written[0].name)
+
+    def test_pick_is_the_documented_way_in(self) -> None:
+        # `--pick ne:1 --pick qq:2` matches plan/apply; a bare position works too.
+        out_dir = Path(tempfile.mkdtemp())
+        out = self._run(
+            _OutputSource(("yrc", "lrc")),
+            ["--pick", "ne:1", "--out", str(out_dir)],
+            Path(tempfile.mkdtemp()),
+        )
+        self.assertIn("ne:1", out)
+        self.assertEqual([path.suffix for path in out_dir.iterdir()], [".yrc"])
 
     def test_several_formats_are_written_at_once(self) -> None:
         out_dir = Path(tempfile.mkdtemp())
@@ -2750,13 +2924,22 @@ class OutputCommandTests(unittest.TestCase):
         state_dir = Path(tempfile.mkdtemp())
         source = _OutputSource(("yrc", "lrc"))
         self._run(source, ["ne:1", "--out", str(out_dir)], state_dir)
+        # Same text again: the store already holds it, so say so.
         out = self._run(source, ["ne:1", "--out", str(out_dir)], state_dir)
-        self.assertIn("已存在", out)
+        self.assertIn("已是最新", out)
+        # A file holding something else is left alone unless --force.
+        target = next(out_dir.iterdir())
+        target.write_text("[00:00.00]別人\n", encoding="utf-8")
+        out = self._run(source, ["ne:1", "--out", str(out_dir)], state_dir)
+        self.assertIn("已存在（--force 覆盖）", out)
+        self.assertIn("[00:00.00]別人", target.read_text(encoding="utf-8"))
+        out = self._run(source, ["ne:1", "--out", str(out_dir), "--force"], state_dir)
+        self.assertIn("写入 1 个文件", out)
 
     def test_a_planned_id_never_touches_the_network(self) -> None:
         track = make_track()
         state_dir = Path(tempfile.mkdtemp())
-        state = State(state_dir / "lyrics.sqlite3")
+        state = State(state_dir / "lyrics.sqlite3", state_dir / "lyr")
         state.upsert_plan(
             PlanResult(
                 track,
@@ -2791,7 +2974,7 @@ class OutputCommandTests(unittest.TestCase):
         # gives a slightly different file than the one apply would write.
         track = make_track()
         state_dir = Path(tempfile.mkdtemp())
-        state = State(state_dir / "lyrics.sqlite3")
+        state = State(state_dir / "lyrics.sqlite3", state_dir / "lyr")
         state.upsert_plan(
             PlanResult(
                 track,
@@ -2837,9 +3020,10 @@ class OutputCommandTests(unittest.TestCase):
         args = build_parser().parse_args(["output", "A/01.m4a"])
         args.path = list(args.paths)
         args.formats = []
-        state = State(Path(tempfile.mkdtemp()) / "lyrics.sqlite3")
+        root = Path(tempfile.mkdtemp())
+        state = State(root / "lyrics.sqlite3", root / "lyr")
         with self.assertRaises(ToolError) as caught:
-            commands.cmd_output(args, state, Path(tempfile.mkdtemp()))
+            commands.cmd_output(args, state, root)
         self.assertIn("candidates", str(caught.exception))
 
 

@@ -970,7 +970,7 @@ class QqSource:
             label = (self.target_format or "lrc").upper()
             dropped = (
                 f"注音（kana）{ruby} 行放不进 {label}，已丢弃；"
-                "原生 QRC 仍在状态库，apply --qrc 可取回"
+                "原生 QRC 仍在歌词库（lyr/），apply --qrc 可取回"
             )
             note = f"{note}；{dropped}" if note else dropped
         if not lyrics:

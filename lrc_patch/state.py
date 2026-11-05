@@ -10,9 +10,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import SCORING_VERSION
+from .config import SCORING_VERSION, default_lyr_dir, source_label
 from .errors import ToolError
 from .models import PlanResult
+from . import store
 from .text import lyric_hash, lyric_kind, lyrics_line_count, utc_now
 
 
@@ -149,10 +150,84 @@ def read_state_summary(path: Path, now: float | None = None) -> dict[str, Any] |
 
 
 class State:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, lyr_root: Path | None = None):
         self.path = path
+        # The native lyric files live beside the database on purpose, but in
+        # the *cache* directory: they are regenerable, and a cache can be
+        # cleared without losing the plans.
+        self.lyr_root = Path(lyr_root) if lyr_root else default_lyr_dir()
         path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self.migrate_native_files()
+
+    def native_text(self, row: Any) -> str:
+        """The provider's own text for a plan row (file first, column second)."""
+        return store.text_of(row, self.lyr_root)
+
+    def migrate_native_files(self) -> int:
+        """Move native text that older versions stored as a column into files.
+
+        2.16 and earlier kept it in ``native_lyric``, which made the database
+        the only place the text existed: unreadable without sqlite3, and
+        duplicated once ``output`` also wrote files.  One pass per start-up
+        moves it out and clears the column; a row whose file cannot be written
+        keeps its text so nothing is lost.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT path, source, source_id, match_artist, match_title,"
+                " native_lyric, native_kind, lyric, lyric_kind, native_path"
+                " FROM plans"
+                " WHERE (native_lyric IS NOT NULL AND native_lyric != '')"
+                "    OR (lyric IS NOT NULL AND lyric != '')"
+            ).fetchall()
+        moved = 0
+        for row in rows:
+            source = str(row_get(row, "source", "") or "")
+            source_id = str(row_get(row, "source_id", "") or "")
+            native = str(row_get(row, "native_lyric", "") or "")
+            lyric = str(row_get(row, "lyric", "") or "")
+            if not source or not source_id or not (native or lyric):
+                continue
+            texts: dict[str, str] = {}
+            if native:
+                texts[str(row_get(row, "native_kind", "") or lyric_kind(native))] = native
+            if lyric:
+                texts.setdefault(
+                    str(row_get(row, "lyric_kind", "") or lyric_kind(lyric)), lyric
+                )
+            # Same ident the rest of the tool prints: ``ne:123``, not
+            # ``netease:123`` — the file name has to match what `output` uses.
+            ident = f"{source_label(source)}:{source_id}"
+            try:
+                saved = store.save(
+                    self.lyr_root,
+                    str(row_get(row, "match_artist", "") or ""),
+                    str(row_get(row, "match_title", "") or ""),
+                    ident,
+                    texts,
+                )
+            except OSError:
+                continue
+            if not saved:
+                continue
+            native_path = saved.get(
+                str(row_get(row, "native_kind", "") or ""),
+                next(iter(saved.values())),
+            )
+            with self.connection() as conn:
+                conn.execute(
+                    "UPDATE plans SET native_path=?, native_lyric=NULL, lyric=NULL"
+                    " WHERE path=?",
+                    (native_path, row["path"]),
+                )
+            moved += 1
+        if moved:
+            # The text was most of the file; give the pages back now instead of
+            # leaving a database that is empty where the lyrics used to be.
+            with self.connection() as conn:
+                conn.execute("VACUUM")
+        return moved
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)
@@ -228,6 +303,10 @@ class State:
             #     does not silently reuse a netease verdict.
             self._add_column(conn, "plans", "native_lyric", "TEXT")
             self._add_column(conn, "plans", "native_kind", "TEXT")
+            #   native_path — file name (under ``lyr_root``) holding that text.
+            #     The column above stays for rows 2.16 and earlier wrote; they
+            #     are migrated to files on start-up and then emptied.
+            self._add_column(conn, "plans", "native_path", "TEXT")
             #   native_kinds — every format the provider served at once
             #     (``yrc,lrc``): one netease answer can carry both, and the
             #     table shows the set while apply writes one member of it.
@@ -321,7 +400,8 @@ class State:
         with self.connection() as conn:
             return conn.execute(
                 "SELECT * FROM plans WHERE source=? AND source_id=?"
-                " AND native_lyric IS NOT NULL AND native_lyric != ''"
+                " AND ((native_path IS NOT NULL AND native_path != '')"
+                "      OR (native_lyric IS NOT NULL AND native_lyric != ''))"
                 " ORDER BY planned_at DESC LIMIT 1",
                 (source, str(source_id)),
             ).fetchone()
@@ -330,8 +410,39 @@ class State:
         self, result: PlanResult, fingerprint: str, src_set: str = ""
     ) -> None:
         c = result.candidate
-        lyric = result.lyrics or None
-        native = result.native_lyrics or None
+        lyric = result.lyrics or ""
+        native = result.native_lyrics or ""
+        # Neither text goes into the database: both land in the lyric store as
+        # `lyr/歌手 - 标题 [ne:123].<ext>`, where they can be opened, diffed and
+        # edited, and `apply` reads them back from there.  Only a failure to
+        # write falls back to the columns, so a read-only cache never costs a
+        # plan.
+        texts: dict[str, str] = {}
+        native_kind = result.native_kind or (lyric_kind(native) if native else "")
+        if native:
+            texts[native_kind] = native
+        if lyric:
+            texts.setdefault(lyric_kind(lyric), lyric)
+        saved: dict[str, str] = {}
+        if texts:
+            try:
+                saved = store.save(
+                    self.lyr_root,
+                    c.artist_text if c else "",
+                    c.title if c else "",
+                    f"{source_label(c.source)}:{c.source_id}" if c else "",
+                    texts,
+                )
+            except OSError:
+                saved = {}
+        native_path = saved.get(native_kind, "")
+        if not native_path and saved and not native:
+            # Only a converted text exists (a local sidecar, an old plan):
+            # that file *is* the most detailed copy we have.
+            native_path = next(iter(saved.values()))
+        native_column = None if saved else (native or None)
+        lyric_column = None if saved else (lyric or None)
+        lyric = lyric or None
         with self.connection() as conn:
             conn.execute(
                 """
@@ -339,8 +450,8 @@ class State:
                     path,fingerprint,planned_at,status,reason,source,source_id,
                     match_title,match_artist,match_album,match_duration,
                     duration_diff,score,lyric,lyric_sha,lyric_kind,lyric_lines,
-                    native_lyric,native_kind,native_kinds,src_set
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    native_lyric,native_kind,native_kinds,native_path,src_set
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(path) DO UPDATE SET
                     fingerprint=excluded.fingerprint,
                     planned_at=excluded.planned_at,
@@ -361,6 +472,7 @@ class State:
                     native_lyric=excluded.native_lyric,
                     native_kind=excluded.native_kind,
                     native_kinds=excluded.native_kinds,
+                    native_path=excluded.native_path,
                     src_set=excluded.src_set
                 """,
                 (
@@ -377,15 +489,16 @@ class State:
                     c.duration if c else None,
                     result.duration_diff,
                     result.score,
-                    lyric,
+                    lyric_column,
                     lyric_hash(lyric) if lyric else None,
                     lyric_kind(lyric) if lyric else None,
                     lyrics_line_count(lyric),
-                    native,
+                    native_column,
                     result.native_kind or (lyric_kind(lyric) if lyric else None),
                     ",".join(result.native_kinds)
                     or result.native_kind
                     or (lyric_kind(lyric) if lyric else None),
+                    native_path,
                     src_set,
                 ),
             )

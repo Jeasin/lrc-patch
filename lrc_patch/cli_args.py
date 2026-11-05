@@ -67,7 +67,7 @@ _EXAMPLES = [
     ('lrcpatch plan --pick ne:123 "Ado/某首.m4a"', "人工指定候选"),
     ('lrcpatch plan --pick ne:123 --apply "Ado/某首.m4a"', "指定并直接写入"),
     ('lrcpatch apply "Ado"', "只写 ✓ 可写入"),
-    ('lrcpatch output ne:1815109506 --lrc --a2', "导出歌词文件（不动音频）"),
+    ('lrcpatch output --pick ne:1815109506 --lrc', "导出歌词文件（不动音频）"),
     ('lrcpatch verify "Ado"', "写入后复核"),
     ('lrcpatch status', "看状态库与缓存分布"),
     ('lrcpatch rollback --yes "Ado"', "回滚"),
@@ -166,7 +166,7 @@ def main_help(config: Config | None = None) -> str:
                 ("plan", "查询候选并生成计划（默认命令），不写音频"),
                 ("candidates", "列出候选 SOURCE:ID 与分数，供 --pick 使用"),
                 ("apply", "写入 ✓ 可写入，逐文件校验后原子替换"),
-                ("output", "导出歌词文件（可一次导多个格式，不动音频）"),
+                ("output", "导出歌词文件（--pick 指定，可一次导多个格式）"),
                 ("verify", "复核已写入的歌词、标签、封面、音频"),
                 ("rollback", "移除本工具写入且之后未被改动的歌词"),
                 ("status", "预览状态库里的计划、缓存与报告（只读）"),
@@ -217,7 +217,7 @@ def main_help(config: Config | None = None) -> str:
             ),
             (
                 "output",
-                "--out DIR  --lrc  --a2  --eslrc  --yrc  --qrc  --ttml  --force  --refresh",
+                "--pick SOURCE:ID  --out DIR  --lrc  --a2  --eslrc  --yrc  --qrc  --ttml  --force  --refresh",
             ),
             ("scan", "--summary  --plans"),
             ("status", "--json"),
@@ -335,8 +335,9 @@ def main_help(config: Config | None = None) -> str:
 
 {style("歌词格式", "1;36")}
 {formats}
-  plan 取词时把源的原生歌词一起存下，并记下源一次给了哪些格式：netease 常常同时给逐字 YRC 和逐行 LRC，
-  所以 plan 的格式列写 YRC/LRC 这样的集合（只给一种就只写一种），apply 从其中挑一种写进音频。
+  plan 取词时把源的原生歌词存成文件（$XDG_CACHE_HOME/lrc-patch/lyr/歌手 - 标题 [SOURCE:ID].yrc），
+  并记下源一次给了哪些格式：netease 常常同时给逐字 YRC 和逐行 LRC，所以 plan 的格式列写 YRC/LRC
+  这样的集合（只给一种就只写一种），apply 从这些文件里挑一种写进音频——数据库里只存路径，不存文本。
   apply 时再按 --a2 / --eslrc / --ttml / --qrc 转换，所以想换格式不必重新联网，`lrcpatch apply --a2` 就够。
   私有格式（--yrc / --qrc）只在原生就是它时才可能；原生是逐行 LRC 时无法凭空生成逐字，会明说而不是硬写。
   A2 / ESLRC 与普通 LRC 共用行时间轴校验；YRC / QRC / TTML 只识别不校验。
@@ -390,7 +391,8 @@ PLAN_EPILOG = """\
   --apply 会在 plan 之后直接写本次的 ✓；! 需确认、✗ 失败/无匹配仍不会写入。
   --refresh 只重新联网；--force 才忽略“已有歌词/已有计划”重排。两者可以一起给。
   每首通常 1 次搜索 + 1 次取词；搜索已经能确定结果时不再补发标题搜索。
-  取词时会把源的原生歌词一起存下（ne 多为 YRC、qq 为 QRC），所以之后 apply 换格式不用重查。
+  取词时把源的原生歌词写进歌词库（$XDG_CACHE_HOME/lrc-patch/lyr/歌手 - 标题 [SOURCE:ID].yrc），
+  数据库只记文件名；所以之后 apply 换格式是从文件现场转，不用重查。
   --src 换源会按新源重排：来自别的源的 ✓ 会被重查（答案通常已缓存，很快就回来）；只想看另一边的候选、
   不想动已有结论，用 candidates --src qq。
   打分规则见 lrcpatch -h 的「匹配与打分」。
@@ -410,7 +412,8 @@ APPLY_EPILOG = """\
   --force 把 ! 时间轴可疑也算进来，并允许覆盖已有歌词；原歌词会存进回滚记录，rollback 会把它还原而不是清空。
   范围是整个音乐库或你给出的路径；状态库是所有音乐库共用的，但属于其他 --library 的计划不会被写入。
   带 --pick / --pick-file 时先按人工指定重新 plan（指定的候选天然越过 85 分门槛，但仍检查时间轴），再写入，不需要先单独跑一次 plan。
-  --a2 / --eslrc / --ttml / --yrc / --qrc 在这里是“转换”：从计划存下的原生歌词生成，不联网。
+  --a2 / --eslrc / --ttml / --yrc / --qrc 在这里是“转换”：读歌词库里的原生文件现场转换，不联网。
+  歌词库被 clean 清空时会明说「库里没有」，重新 plan 一次即可恢复。
   转不出来的（原生只有逐行 LRC）会列在「跳过格式」里，其余照写；整批都转不出来才报错。
   先写临时副本，回读校验歌词/其他标签/封面/音频后再原子替换；失败则原文件不动。
   开始前会检查目标目录可写且空间足够；确实需要跳过时加 --no-preflight。
@@ -418,10 +421,11 @@ APPLY_EPILOG = """\
 
 OUTPUT_EPILOG = """\
 示例
-  lrcpatch output ne:1815109506                    源的原生格式，不转换
-  lrcpatch output ne:1815109506 --lrc --a2         同时导出 .lrc 与 .alrc
-  lrcpatch output ne:1815109735 qq:293055026 --ttml --yrc --qrc
-  lrcpatch output ne:1815109506 --out ~/Desktop/lyr
+  lrcpatch output --pick ne:1815109506                    源的原生格式，不转换
+  lrcpatch output --pick ne:1815109506 --lrc --a2         同时导出 .lrc 与 .alrc
+  lrcpatch output --pick ne:1815109735 --pick qq:293055026 --ttml
+  lrcpatch output --pick ne:1815109506 ne:1815109735      一个 --pick 带多个 ID
+  lrcpatch output --pick ne:1815109506 --out ~/Desktop/lyr
 
 说明
   output 只写歌词文件，不动音频；apply 才是写进音频。两者都从源的原生歌词出发，所以格式转换不联网。
@@ -429,9 +433,10 @@ OUTPUT_EPILOG = """\
   可以一次给多个格式，每个格式写一个文件，后缀按格式走：.lrc / .alrc / .eslrc / .yrc / .qrc / .ttml / .txt。
   转不出来的会明说原因而不是写一个错后缀的文件：私有格式（YRC/QRC）只能由源原样提供，
   逐字格式也要求原生带逐字时间轴；逐行 LRC 永远转得出来。
-  文件名是「歌手 - 标题 [SOURCE:ID]」，同一个 ID 重复导出会跳过，--force 才覆盖。
-  之前 plan 取过的 ID，原生歌词已经在状态库里，output 不会再去请求；--refresh 强制重查。
-  导出目录默认 $XDG_CACHE_HOME/lrc-patch/lyr，用 --out 改；lrcpatch clean --lyr 会清掉它。
+  默认目录就是歌词库 $XDG_CACHE_HOME/lrc-patch/lyr：plan 取到的原生歌词也存这里，apply 从这里读，
+  所以同一个 ID 重复导出会显示「已是最新」而不是再写一遍；--force 才覆盖。
+  文件名是「歌手 - 标题 [SOURCE:ID]」，plan 用过的名字在这里可以直接找到。
+  之前 plan 取过的 ID 直接从歌词库读，不会再请求；--refresh 强制重查。--out 只是导出到别处。
 """
 
 
@@ -465,7 +470,7 @@ CLEAN_EPILOG = """\
   lrcpatch clean --all                清全部，且不限天数
 
 说明
-  清理对象分三处：状态库（HTTP 缓存 / 计划 / 回滚记录）、reports/（CSV 与 HTML 复核页）、cache/lyr（output 导出的歌词）。
+  清理对象分三处：状态库（HTTP 缓存 / 计划 / 回滚记录）、reports/（CSV 与 HTML 复核页）、cache/lyr（歌词库：plan 取到的原生歌词与 output 导出都在这里，计划还在用的文件会保留）。
   默认只清可再生的内容：已过期缓存、超过 --days（默认 30 天）的报告、导出与 pick 模板。
   --all 不看时间：所有类别都清空，包括刚生成的报告和刚查好的计划。
   计划状态用于断点续跑，回滚记录用于 rollback，因此只在明确指定 --plans / --journal 或 --all 时才删除；删了就要重新查询、且无法回滚。
@@ -813,7 +818,9 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
             "状态库按文件路径逐条记录，每首取它自己最后一次 plan 的结果（文件大小或修改时间变了就不算数），不存在「整库最近一次」的快照；因此不同专辑可能来自不同次运行。用 status 看整体分布。\n\n"
             "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 原生 / 标题 / 歌手 / 专辑。分数是标题+歌手+专辑的总分（满分 100），时长差单独一列，超过容差显示红色。"
             "排序先看是否在容差内，容差外的不会排在可用的前面。\n\n"
-            "“原生”是源会给出的格式：qq 只从 QRC 容器里取词、lrclib 在搜索结果里就带同步标记，所以直接写 QRC / LRC；ne 同一首可能给逐字 YRC，也可能只有逐行 LRC，取词前无法判断，因此默认对每源前 --probe N 条候选取一次词，把实际格式写上去（取词走 HTTP 缓存，随后的 plan 直接复用），--probe 0 关闭取词、没查过的仍显示 ?。"
+            "“原生”是源会给出的格式：qq 的取词接口是个 QRC 容器、lrclib 在搜索结果里就带同步标记、ne 同一首可能给逐字 YRC 也可能只有逐行 LRC。"
+            "默认不取词（表里 `?` 表示还没问过），加 --probe N 才会为每源前 N 条真的取一次词，把实际格式写上去；取词走 HTTP 缓存，随后的 plan 直接复用。"
+            "取过词的行里，真正的逐字格式（YRC / QRC）用粗体——QQ 也会给出没有词时间轴的 QRC 容器，解析后其实是 LRC/纯文本，那种就不加粗。"
             "apply 时再决定转成什么。\n\n"
             "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
         ),
@@ -832,8 +839,8 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         "--probe",
         type=int,
         metavar="N",
-        default=3,
-        help="为每源前 N 条候选取一次词，把「原生」写成真实格式（0 = 不取，只标 ?）",
+        default=0,
+        help="取词确认每源前 N 条的真实格式（默认 0 = 不取；逐字为真的加粗）",
     )
     candidates.add_argument(
         "--all",
@@ -942,7 +949,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     output_cmd = sub.add_parser(
         "output",
         prog="lrcpatch output",
-        usage="lrcpatch output [--参数 …] SOURCE:ID …",
+        usage="lrcpatch output [--参数 …] --pick SOURCE:ID …",
         help="把歌词导出成文件，可一次导出多种格式",
         description="按 SOURCE:ID 导出歌词文件，不碰音频；可一次给出多个格式。",
         epilog=OUTPUT_EPILOG,
@@ -951,10 +958,16 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     )
     add_help_option(output_cmd)
     output_cmd.add_argument(
+        "--pick",
+        action="append",
+        metavar="SOURCE:ID",
+        help="要导出的候选 ID，例如 ne:1815109506；可重复，也可一次跟多个",
+    )
+    output_cmd.add_argument(
         "--out",
         type=Path,
         metavar="DIR",
-        help="导出目录（默认 $XDG_CACHE_HOME/lrc-patch/lyr）",
+        help="导出目录（默认歌词库 $XDG_CACHE_HOME/lrc-patch/lyr）",
     )
     output_cmd.add_argument(
         "--state-dir",
@@ -981,7 +994,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         "paths",
         nargs="*",
         metavar="SOURCE:ID",
-        help="要导出的候选 ID，例如 ne:1815109506；可给多个",
+        help="旧的写法（等价于 --pick），保留给已有命令历史",
     )
 
     verify = sub.add_parser(

@@ -82,6 +82,7 @@ from .render import (
 )
 from .sorting import name_key, path_key, sort_paths
 from .sources import JsonClient, build_sources
+from . import store
 from .state import State, read_plan_cache, read_state_summary, row_get
 from .text import (
     kind_set,
@@ -835,17 +836,6 @@ def cmd_plan(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         print_meta("标签", style(f"读取失败 {len(errors)} 首（详见 scan）", "33"))
 
     write_plan_report(rows, report)
-    writable = {"ready", "applied", "skip_existing"}
-    if getattr(args, "lrc", False):
-        lrc_dir = (args.lrc_dir or default_lrc_dir()).expanduser()
-        written, failed = export_lrc(
-            library,
-            [row for row in rows if row["status"] in writable],
-            {str(track.path): track for track in tracks},
-            lrc_dir,
-        )
-        suffix = style(f"（失败 {failed}）", "31") if failed else ""
-        print_meta("LRC", f"{written} 个 -> {short_path(lrc_dir)}{suffix}")
     if getattr(args, "html", False):
         html_file = getattr(args, "html_file", None)
         html_arg = getattr(args, "html", False)
@@ -957,6 +947,10 @@ class CandRow:
     score_value: int = 0
     diff_value: float = 0.0
     error: bool = False
+    # True when the format was verified by a fetch *and* carries a word
+    # timeline; the table prints those bold, so "QRC" never claims more than
+    # the text actually holds.
+    verbatim: bool = False
 
     @property
     def pick(self) -> str:
@@ -970,56 +964,61 @@ def probe_formats(
     args: argparse.Namespace,
     known: dict[tuple[str, str], str],
 ) -> dict[tuple[str, str], str]:
-    """Fetch the lyric for the shown candidates whose format is unknowable.
+    """Fetch the lyric for the shown candidates to learn what they really are.
 
-    Only netease needs this: QQ answers out of its QRC container and LRCLIB
-    says in the search result whether it has timing.  Each probe is one lyric
-    request that lands in the same HTTP cache ``plan`` reads, so the cost is
-    paid once and the following ``plan`` is free.
+    Off by default: ``plan`` fetches the one candidate it picked, but a table of
+    three per source is three requests per track.  With ``--probe N`` the answer
+    is checked *locally* — QQ's endpoint is a QRC container, yet a track without
+    word timing decrypts to a plain ``[0,0]`` block, which is LRC or bare text,
+    not 逐字.  Each probe lands in the same HTTP cache ``plan`` reads, so the
+    following ``plan`` is free.
     """
-    source = next((item for item in sources if item.name == "netease"), None)
-    if source is None:
-        return {}
     per_source = min(getattr(args, "top", 3), int(getattr(args, "probe", 0)))
     if per_source <= 0:
         return {}
-    work: list[Candidate] = []
+    by_name = {item.name: item for item in sources}
+    work: list[tuple[Any, Candidate]] = []
+    seen: set[tuple[str, str]] = set()
     for track in tracks:
         for name, candidates, error, skipped in results[str(track.path)]:
-            if name != "netease" or skipped or error is not None or not candidates:
+            source = by_name.get(name)
+            # LRCLIB answers in the search result itself (synced or not).
+            if source is None or name not in {"netease", "qq"}:
+                continue
+            if skipped or error is not None or not candidates:
                 continue
             ranked = ranked_candidates(track, candidates, args.duration_tolerance)
             for _within, _meta, _score, _diff, candidate in ranked[:per_source]:
-                if candidate.instrumental:
+                key = (candidate.source, candidate.source_id)
+                if candidate.instrumental or key in known or key in seen:
                     continue
-                if (candidate.source, candidate.source_id) in known:
-                    continue
-                work.append(candidate)
+                seen.add(key)
+                work.append((source, candidate))
     if not work:
         return {}
     found: dict[tuple[str, str], str] = {}
     guard = threading.Lock()
 
-    def probe(candidate: Candidate) -> None:
+    def probe(job: tuple[Any, Candidate]) -> None:
+        source, candidate = job
         try:
             fetched = source.fetch(candidate)
         except Exception:
             # A probe is a nicety: a failed one leaves the "?" in place.
             return
-        if not fetched.native_kinds:
+        kinds = fetched.native_kinds or ((fetched.native_kind,) if fetched.native_kind else ())
+        if not kinds:
             return
         with guard:
             # Same shape the plan table stores (``"yrc,lrc"``), so the row
             # renders through one code path either way.
-            found[(candidate.source, candidate.source_id)] = ",".join(
-                fetched.native_kinds
-            )
+            found[(candidate.source, candidate.source_id)] = ",".join(kinds)
 
     live = ProgressLine()
     live.start(f"取词确认 0/{len(work)}")
     done = 0
     with ThreadPoolExecutor(max_workers=max(1, getattr(args, "workers", 4))) as pool:
-        futures = [pool.submit(probe, candidate) for candidate in work]
+        futures = [pool.submit(probe, job) for job in work]
         for _future in as_completed(futures):
             done += 1
             live.update(f"取词确认 {done}/{len(work)}")
@@ -1104,6 +1103,9 @@ def candidate_rows(
             continue
         ranked = ranked_candidates(track, candidates, args.duration_tolerance)
         for within, metadata_score, score, diff, candidate in ranked[: args.top]:
+            known_kind = (known or {}).get(
+                (candidate.source, candidate.source_id), ""
+            )
             if candidate.instrumental:
                 # Adopting it yields ♪ 纯音乐, not a lyric: do not mark ✓.
                 symbol, code = "♪", "36"
@@ -1115,21 +1117,28 @@ def candidate_rows(
                 symbol, code = "·", "90"
             if candidate.instrumental:
                 kind = "纯音乐"
+                verbatim = False
             elif candidate.lyrics:
                 kind = lyric_tag(lyric_kind(candidate.lyrics))
+                verbatim = store.verbatim(lyric_kind(candidate.lyrics))
+            elif known_kind:
+                # Asked for (--probe) or learned from an earlier plan.  Bold
+                # means the answer was *checked*: a real word timeline, not a
+                # QRC container whose only block is [0,0].
+                kind = kind_set_label(known_kind)
+                verbatim = store.verbatim(known_kind)
             elif candidate.synced:
                 kind = "LRC"
+                verbatim = False
             elif candidate.source == "netease":
                 # netease serves YRC when the song has one and line-timed LRC
-                # otherwise.  Before fetching that is unknowable, so show the
-                # answer a previous plan already got and a bare "?" when there
-                # is none: "YRC/LRC" claimed both and delivered neither.
-                known_kind = (known or {}).get(
-                    (candidate.source, candidate.source_id), ""
-                )
-                kind = kind_set_label(known_kind) if known_kind else "?"
+                # otherwise.  Before fetching that is unknowable, so show a
+                # bare "?" instead of promising a format.
+                kind = "?"
+                verbatim = False
             else:
                 kind = lyric_tag(candidate.native_kind or "lrc")
+                verbatim = False
             notes = match_notes(track, candidate, args.duration_tolerance)
             rows.append(
                 CandRow(
@@ -1143,6 +1152,7 @@ def candidate_rows(
                     if diff < 900
                     else "Δ?",
                     kind=kind,
+                    verbatim=verbatim,
                     title=candidate.title,
                     artist=candidate.artist_text,
                     album=candidate.album,
@@ -1192,7 +1202,7 @@ def candidate_line(
         style(pad_display(row.ident, w_id), "36"),
         style(row.score.rjust(SCORE_WIDTH), "90"),
         style(pad_display(row.diff, w_diff), diff_code),
-        style(pad_display(row.kind, w_kind), "90"),
+        style(pad_display(row.kind, w_kind), "1" if row.verbatim else "90"),
         pad_display(title, w_title),
         style(pad_display(artist, w_artist), "90"),
         style(truncate_display(row.album, ALBUM_CAP) if row.album else "", "90"),
@@ -1599,35 +1609,18 @@ OUTPUT_FORMATS = ("lrc", "a2", "eslrc", "yrc", "qrc", "ttml")
 
 # Same taxonomy as the embedded lyric: the extension is how the next tool
 # knows a word-timed file from a line-timed one.
-OUTPUT_SUFFIX = {
-    "lrc": ".lrc",
-    "a2": ".alrc",
-    "eslrc": ".eslrc",
-    "yrc": ".yrc",
-    "qrc": ".qrc",
-    "ttml": ".ttml",
-    "plain": ".txt",
-}
+OUTPUT_SUFFIX = store.SUFFIX
 
-# ":" is legal on POSIX and is how an ID is written everywhere else in the
-# tool, so it stays in the filename; Windows has to lose it.
-_BAD_NAME_CHARS = '<>":/\\|?*' if os.name == "nt" else '<>/\\|?*'
 _AUDIO_SUFFIXES = (".m4a", ".mp3", ".dsf", ".flac", ".ogg", ".wav", ".aiff")
 
 
 def output_name(artist: str, title: str, ident: str) -> str:
     """``歌手 - 标题 [ne:123]``, safe on every filesystem.
 
-    The ID stays in the name because ``output`` addresses songs by ID, and two
-    uploads of the same song (a single and an album cut) would otherwise land
-    on the same file.
+    Same name the plan store uses, so ``output`` of a planned song lands on the
+    file ``apply`` reads instead of next to it.
     """
-    head = " - ".join(part for part in (artist.strip(), title.strip()) if part)
-    stem = f"{head} [{ident}]" if head else f"[{ident}]"
-    cleaned = "".join(
-        "_" if char in _BAD_NAME_CHARS or ord(char) < 0x20 else char for char in stem
-    )
-    return " ".join(cleaned.split())
+    return store.stem_for(artist, title, ident)
 
 
 @dataclass
@@ -1648,18 +1641,21 @@ class OutputJob:
     # would produce a slightly different file from the one `apply` writes, so
     # the served LRC is exported as-is when it is the format asked for.
     texts: dict[str, str] = field(default_factory=dict)
-    origin: str = ""  # 状态库 / 取词
+    origin: str = ""  # 歌词文件 / 状态库 / 取词
+    # Name the stored file already uses; exporting keeps the same stem instead
+    # of creating a second file for the same ID.
+    stem: str = ""
     error: str = ""
 
 
 def resolve_output_id(
     state: State, sources: dict[str, Any], source: str, source_id: str
 ) -> OutputJob:
-    """Prefer the native lyric already in the state database, then the network."""
+    """Prefer the lyric already in the store, then the one in the database."""
     job = OutputJob(source=source, source_id=source_id, ident=f"{source_label(source)}:{source_id}")
     row = state.find_native(source, source_id)
     if row is not None:
-        job.native = str(row_get(row, "native_lyric", "") or "")
+        job.native = state.native_text(row)
         job.native_kind = str(row_get(row, "native_kind", "") or "")
         job.native_kinds = kind_set(
             row_get(row, "native_kinds", "") or job.native_kind
@@ -1669,10 +1665,24 @@ def resolve_output_id(
         job.album = str(row_get(row, "match_album", "") or "")
         job.origin = "状态库"
         if job.native:
-            stored = str(row_get(row, "lyric", "") or "")
             stored_kind = str(row_get(row, "lyric_kind", "") or "")
+            stored = (
+                store.text_of(row, state.lyr_root, stored_kind) if stored_kind else ""
+            )
             if stored and stored_kind:
                 job.texts.setdefault(stored_kind, stored)
+            return job
+
+    # No plan, or its file was cleaned: the store may still have the text —
+    # a file dropped there by hand counts, and it knows its own name.
+    name, kind = store.locate(state.lyr_root, job.ident)
+    if name:
+        job.native = store.load(state.lyr_root, name)
+        if job.native:
+            job.stem = Path(name).stem
+            job.native_kind = kind
+            job.native_kinds = job.native_kinds or kind_set(kind)
+            job.origin = "歌词文件"
             return job
 
     provider = sources.get(source)
@@ -1738,14 +1748,17 @@ def cmd_output(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     """
     idents: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for token in args.path:
+    # `--pick ne:1 --pick qq:2` is how plan and apply already name a song, so
+    # `output` takes the same flag; a bare `ne:1` still works for old history.
+    tokens = [*(getattr(args, "pick", None) or []), *(args.path or [])]
+    for token in tokens:
         text = str(token).strip()
         if not text:
             continue
         looks_like_path = text.lower().endswith(_AUDIO_SUFFIXES) or os.sep in text
         if looks_like_path:
             raise ToolError(
-                f"output 只接受 SOURCE:ID（例如 ne:1815109506），不接文件路径：{text}\n"
+                f"output 只接受 SOURCE:ID（例如 --pick ne:1815109506），不接文件路径：{text}\n"
                 "  想导出某首歌的候选 ID，先跑 lrcpatch candidates <路径>"
             )
         item = parse_pick(text)
@@ -1755,13 +1768,16 @@ def cmd_output(args: argparse.Namespace, state: State, state_dir: Path) -> int:
         idents.append(item)
     if not idents:
         raise ToolError(
-            "output 需要至少一个 SOURCE:ID，例如 lrcpatch output ne:1815109506 --lrc --a2"
+            "output 需要至少一个 SOURCE:ID，"
+            "例如 lrcpatch output --pick ne:1815109506 --lrc --a2"
         )
 
     formats = [
         name for name in OUTPUT_FORMATS if getattr(args, name, False)
     ] or ["native"]
-    out_dir = (getattr(args, "out", None) or default_lyr_dir()).expanduser()
+    # The default target *is* the plan store: `output ne:1` puts the provider's
+    # text where `apply` reads it, and `--out` is for a copy elsewhere.
+    out_dir = (getattr(args, "out", None) or state.lyr_root).expanduser()
     overwrite = bool(getattr(args, "force", False))
 
     client = JsonClient(
@@ -1807,7 +1823,7 @@ def cmd_output(args: argparse.Namespace, state: State, state_dir: Path) -> int:
             # When nothing was asked for, that line would just repeat itself.
             detail += f"  ·  导出 {writing}"
         print(style("     ├─ ", "90") + style(detail, "90"))
-        stem = output_name(job.artist, job.title, job.ident)
+        stem = job.stem or output_name(job.artist, job.title, job.ident)
         for position, target in enumerate(asked):
             branch = "     └─ " if position == len(asked) - 1 else "     ├─ "
             text, kind, note = render_output(job, target)
@@ -1820,6 +1836,17 @@ def cmd_output(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                 skipped += 1
                 continue
             path = out_dir / f"{stem}{OUTPUT_SUFFIX.get(kind, '.txt')}"
+            existing = store.load(out_dir, path.name) if path.exists() else ""
+            if existing == text:
+                # The store already holds exactly this text — say so instead of
+                # asking for --force on a file that needs no work.
+                print(
+                    style(branch, "90")
+                    + style(f"{lyric_tag(kind):<5}", LYRIC_COLORS.get(kind, "32"))
+                    + style(f"{short_path(path)}  已是最新", "90")
+                )
+                skipped += 1
+                continue
             if path.exists() and not overwrite:
                 print(
                     style(branch, "90")
@@ -1945,31 +1972,37 @@ def _skip_text(counter: Counter) -> str:
 FORMAT_TAGS = {"a2": "A2", "eslrc": "ESLRC", "yrc": "YRC", "qrc": "QRC", "ttml": "TTML"}
 
 
-def lyric_for_target(row: Any, target: str | None) -> tuple[str, str]:
+def lyric_for_target(
+    row: Any, target: str | None, lyr_root: Path | None = None
+) -> tuple[str, str]:
     """``(lyrics, kind)`` to write for one row, converting when asked.
 
-    The plan keeps the provider's own text (``native_lyric``/``native_kind``)
-    next to the requested one, so ``--qrc``/``--a2``/… at apply time is a
-    conversion instead of a re-fetch.  Raises :class:`ToolError` when the
-    stored plan simply cannot produce that format.
+    The text is no longer stored in the database: it is read from the lyric
+    store (``lyr/歌手 - 标题 [ne:123].yrc``), so ``--qrc``/``--a2``/… at apply time
+    is a local conversion instead of a re-fetch.  Raises :class:`ToolError` when
+    the plan simply cannot produce that format.
     """
-    stored = row_get(row, "lyric", "") or ""
-    stored_kind = row_get(row, "lyric_kind", "") or (
-        lyric_kind(stored) if stored else ""
-    )
-    if not target or target == stored_kind:
-        # A plan stored before 2.13 still carries QQ's `[kana:…]` blob as a
-        # lyric line.  Cleaning it here means apply writes the file the user
-        # asked for without needing a re-plan (and without touching `--qrc`,
-        # where the tag belongs).
-        return strip_provider_tags(stored, stored_kind), stored_kind
+    root = lyr_root or default_lyr_dir()
+    stored_kind = str(row_get(row, "lyric_kind", "") or "")
+    if not target:
+        target = stored_kind or str(row_get(row, "native_kind", "") or "")
+    if not target:
+        raise ToolError("计划里没有歌词（旧版本生成的计划），请先 plan 重新取词")
+    stored = store.text_of(row, root, target)
+    if stored:
+        # Served by the source, or already converted and written to the store:
+        # use it as-is, minus a provider-private tag an old plan may still have.
+        kind = lyric_kind(stored) or target
+        return strip_provider_tags(stored, kind), kind
     tag = FORMAT_TAGS.get(target, target.upper())
-    native = row_get(row, "native_lyric", "") or ""
-    native_kind = row_get(row, "native_kind", "") or stored_kind
+    native = store.text_of(row, root)
+    native_kind = str(row_get(row, "native_kind", "") or "") or (
+        lyric_kind(native) if native else ""
+    )
     if not native:
         raise ToolError(
-            f"计划里没有原生歌词（旧版本生成的计划），无法转成 {tag}；"
-            f"请先 plan --{target} 重新取词"
+            f"歌词库里没有 {lyric_tag(native_kind) or '原生'} 文本"
+            f"（文件可能被 clean 清掉了），无法转成 {tag}；请先 plan --{target} 重新取词"
         )
     converted, note = render_native(native, native_kind, target)
     if note:
@@ -1983,12 +2016,12 @@ def lyric_for_target(row: Any, target: str | None) -> tuple[str, str]:
     return text, kind
 
 
-def format_mismatch(rows: list, target: str) -> list:
+def format_mismatch(rows: list, target: str, lyr_root: Path | None = None) -> list:
     """Rows that cannot produce the format ``--<target>`` asks for."""
     bad: list = []
     for row in rows:
         try:
-            lyric_for_target(row, target)
+            lyric_for_target(row, target, lyr_root)
         except ToolError:
             bad.append(row)
     return bad
@@ -2035,7 +2068,7 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     unusable: list[tuple[str, str]] = []
     for row in rows:
         try:
-            prepared[row["path"]] = lyric_for_target(row, target)
+            prepared[row["path"]] = lyric_for_target(row, target, state.lyr_root)
         except ToolError as exc:
             unusable.append((row["path"], str(exc)))
     if unusable and not prepared:
@@ -2193,21 +2226,6 @@ def cmd_apply(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     if failed and len(rows) > done:
         print_meta("未处理", f"{len(rows) - done} 首因失败停止而保持原样")
     print_meta("网络", "未发起请求，直接使用 plan 结果")
-    if getattr(args, "lrc", False):
-        lrc_dir = (args.lrc_dir or default_lrc_dir()).expanduser()
-        # Export what was actually written, conversions included.
-        written, failed_lrc = export_lrc(
-            library,
-            [
-                {"path": path, "lyric": prepared[path][0]}
-                for path in sorted(applied_paths)
-                if path in prepared
-            ],
-            {},
-            lrc_dir,
-        )
-        suffix = style(f"（失败 {failed_lrc}）", "31") if failed_lrc else ""
-        print_meta("LRC", f"{written} 个 -> {short_path(lrc_dir)}{suffix}")
     attempted = {row["path"] for row in rows}
     rows_after = [row for row in state.list_plans() if row["path"] in attempted]
     write_plan_report(rows_after, report)

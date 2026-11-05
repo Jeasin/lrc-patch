@@ -18,6 +18,7 @@ from .config import (
     APP_VERSION,
     SOURCE_NAMES,
     canonical_source,
+    default_lyr_dir,
     default_state_dir,
     load_config,
 )
@@ -141,7 +142,16 @@ def main() -> int:
         return commands.cmd_status(args, state_dir)
 
     with state_lock(state_dir):
-        state = State(state_dir / "lyrics.sqlite3")
+        # The native lyric files are the canonical copy, so they live in the
+        # cache directory and not beside the database.  A custom --state-dir is
+        # a separate sandbox (tests, a second library), so it gets its own
+        # store instead of writing into the user's real one.
+        lyr_root = (
+            default_lyr_dir()
+            if state_dir == default_state_dir().resolve()
+            else state_dir / "lyr"
+        )
+        state = State(state_dir / "lyrics.sqlite3", lyr_root)
         if args.command == "plan":
             code = commands.cmd_plan(args, state, state_dir)
             if code == 0 and getattr(args, "apply", False):

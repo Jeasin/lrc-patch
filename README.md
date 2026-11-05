@@ -47,7 +47,7 @@
 - **先计划后写入**：`plan` 是只读的，默认命令就是它，拖一堆文件夹进去也不会误写。
 - **双源 + 可换源**：默认先问网易云（`ne`），缺的再问 QQ（`qq`）；`lrclib` 需要显式 `--src lrclib`。
 - **打分而不是模糊搜索**：满分 100，≥85 且时长在容差内才自动写入，其余一律 `!` 等你确认。
-- **原生格式流水线**：取词时把源的原生歌词（YRC / QRC）一起存下，`apply --a2` / `--eslrc` / `--ttml` / `--qrc` 只是本地转换，**换格式不用重新联网**。
+- **原生格式流水线**：取词时把源的原生歌词（YRC / QRC）**存成文件**（`~/.cache/lrc-patch/lyr/歌手 - 标题 [ne:123].yrc`），数据库只记文件名；`apply --a2` / `--eslrc` / `--ttml` / `--qrc` 只是本地转换，**换格式不用重新联网**，歌词本身随时能打开看。
 - **导出是另外一条路**：`output` 只写歌词文件、不碰音频，一次可给多个格式（`--yrc --lrc --ttml`），默认就是源的原生格式。
 - **原子写入**：写临时副本 → 回读校验（歌词 / 其他标签 / 封面 / 音频数据逐项比对）→ `os.replace` 替换，失败则原文件一个字节都不变。
 - **断点续跑**：结论存在 SQLite 状态库里，1000 首中断后重跑只查没结论的那些。
@@ -171,7 +171,7 @@ lrcpatch apply
 --refresh           忽略 HTTP 缓存重新请求（只管网络）
 --force             忽略"已有歌词/已有计划"强制重排（只管现状）
 --pick SOURCE:ID    人工指定候选，可连写多个
---out DIR           output 的导出目录（默认 ~/.cache/lrc-patch/lyr）
+--out DIR           output 另存到别处（默认就是歌词库 ~/.cache/lrc-patch/lyr）
 ```
 
 每个命令的完整说明：`lrcpatch plan -h`。
@@ -243,7 +243,7 @@ lrcpatch apply
 | QRC | QQ 音乐逐字 | `[1200,5000]逐(1200,300)字(1500,300)` |
 | TTML | Apple Music | `<p begin="00:00:12.340" end="00:00:15.000"><span …>逐</span><span …>字</span></p>` |
 
-`plan` 取词时会把源的原生歌词一起存进状态库，`plan` 的格式列与 `candidates` 的"原生"列写的是**源给了哪些格式**：
+`plan` 取词时把源的原生歌词写进歌词库 `~/.cache/lrc-patch/lyr/`，状态库只记文件名——想看某一首的原生歌词，直接打开那个文件即可。`plan` 的格式列与 `candidates` 的"原生"列写的是**源给了哪些格式**：
 
 - 换成 `--a2` / `--eslrc` / `--ttml` / `--qrc` 是**本地转换**，不联网；
 - 换成原生格式本身则原样输出；
@@ -252,9 +252,9 @@ lrcpatch apply
 
 私有格式（`--yrc` / `--qrc`）只在原生就是它时才可能：YRC 只来自网易云，QRC 只来自 QQ。
 
-一次请求常常同时带回两种：netease 的 `song/lyric` 既给逐字 YRC 也给逐行 LRC。所以这一列可以是集合——`YRC/LRC` 表示两种都有，`LRC` 表示只有逐行。至于某首歌到底给不给 YRC，**要取一次词才知道**（实测「Lemon」有 YRC，「春泥棒」只有 LRC）。QQ 那列一定是 QRC：它的取词接口要的就是 `qrc=1` 的加密 QRC 容器。
+一次请求常常同时带回两种：netease 的 `song/lyric` 既给逐字 YRC 也给逐行 LRC。所以这一列可以是集合——`YRC/LRC` 表示两种都有，`LRC` 表示只有逐行。至于某首歌到底给不给 YRC，**要取一次词才知道**（实测「Lemon」有 YRC，「春泥棒」只有 LRC）。QQ 的取词接口是个 QRC 容器，但容器不等于逐字：没有词时间轴的歌解出来只有一个 `[0,0]` 块，那其实是 LRC 或纯文本。
 
-`candidates` 默认会为每源前 3 条候选真的取一次词（`--probe N`，`--probe 0` 关闭），把这一列写成实际格式——取词进 HTTP 缓存，随后的 `plan` 直接复用，不会重复请求；没取过的才显示 `?`。以前那列一律写 `YRC/LRC`，读起来像"这些歌词有逐字"，plan 一说 LRC 就像漏了什么。
+`candidates` **默认不取词**（`?` 就是"还没问过"）；加 `--probe N` 才会为每源前 N 条真的取一次词，把这一列写成实际格式，并且本地解析判断是不是真逐字：是就**加粗**（终端里 `YRC` / `QRC` 变粗体），只是逐行就不加粗。取词进 HTTP 缓存，随后的 `plan` 直接复用，不会重复请求。以前那列一律写 `YRC/LRC`，读起来像"这些歌词有逐字"，plan 一说 LRC 就像漏了什么。
 
 `apply` 默认仍写逐行 LRC（多数播放器认它）；要逐字就 `apply --yrc` / `--qrc`，那是本地转换，不重新联网。
 
@@ -268,7 +268,7 @@ lrcpatch apply
 | TTML | ✓ | ✓ | ✗ | ✗ XML 里没地方放 |
 | YRC / QRC | ✓ | ✓ | 仅 QRC | ✓ |
 
-**精度**：A2 / ESLRC 的时间戳是 `mm:ss.cc`，毫秒四舍五入到 10ms（`1203ms → 00:01.20`），所以把这两种文件读回来是"准到 10ms"，不是逐毫秒还原；TTML 写 `hh:mm:ss.mmm`，毫秒原样。原生文本一直在状态库里，切回 `--qrc` / `--yrc` 不受影响。
+**精度**：A2 / ESLRC 的时间戳是 `mm:ss.cc`，毫秒四舍五入到 10ms（`1203ms → 00:01.20`），所以把这两种文件读回来是"准到 10ms"，不是逐毫秒还原；TTML 写 `hh:mm:ss.mmm`，毫秒原样。原生文本一直在歌词库里，切回 `--qrc` / `--yrc` 不受影响。
 
 **注音**：QQ 把日文歌的假名注音塞在原生 QRC 的 `[kana:…]` 标签里——那是第二条按音节对齐的时间轴。A2 和 ESLRC 只有一条时间轴，TTML 的 ruby 又没有可依据的编码规范（硬猜会猜错），所以**转换时不写进文件**。原生 QRC 一直留在状态库，`apply --qrc` 就能取回带注音的原件；plan 的备注里会写「注音（kana）1 行放不进 A2，已丢弃」。以前这条标签会被当成一行 2KB 的歌词贴在 `00:00`，现在不会了。
 
@@ -378,9 +378,10 @@ lrcpatch apply --eslrc          # 或者计划之后再换格式，不重新联�
 **只想导出歌词文件，不动音频**
 
 ```bash
-lrcpatch output ne:1815109506 --out ~/Desktop/lyrics          # 源的原生格式（YRC）
-lrcpatch output ne:1815109506 --lrc --a2 --ttml               # 一次导三种
-lrcpatch candidates "米津玄師" --top 5                         # 不知道 ID 就先看候选
+lrcpatch output --pick ne:1815109506                          # 原生格式，写进歌词库
+lrcpatch output --pick ne:1815109506 --lrc --a2 --ttml        # 一次导三种
+lrcpatch output --pick ne:1815109506 --out ~/Desktop/lyrics   # 另存一份到桌面
+lrcpatch candidates "米津玄師" --top 5 --probe 3               # 不知道 ID 就先看候选
 ```
 
 **纯音乐被 `!` 挡住，但我就是想写**
@@ -410,7 +411,8 @@ workers = 4
 |---|---|
 | 状态库（计划 / journal / HTTP 缓存） | `~/.local/state/lrc-patch/lyrics.sqlite3` |
 | CSV 报告与 HTML 复核页 | 同上目录下的 `reports/` |
-| `output` 导出的歌词 | `~/.cache/lrc-patch/lyr/`（`--out` 可改） |
+| 歌词库：原生歌词 + `output` 导出 | `~/.cache/lrc-patch/lyr/`（`--out` 只影响导出） |
+| 文件命名 | `歌手 - 标题 [ne:123].<格式后缀>`；重新 plan 原地覆盖，同一首的其它格式文件随之清掉（`output` 随时再生成） |
 
 `clean` 像 `brew cleanup`：默认只清过期缓存与 30 天前的报告，逐类说明删了几项、释放多少；`clean --all` 才不限天数。计划状态与回滚记录只在明确指定 `--plans` / `--journal` / `--all` 时删除——删了就要重查，且无法回滚。
 
@@ -473,7 +475,7 @@ lrc_patch/
   qrc.py            # QQ QRC 解密（3DES + zlib）
   state.py          # SQLite 状态库
   render.py         # 终端表格与对齐
-tests/test_core.py  # 200 个用例，覆盖解析、格式转换往返、打分、写入、回滚与 CLI
+tests/test_core.py  # 208 个用例，覆盖解析、格式转换往返、打分、写入、回滚与 CLI
 ```
 
 CI 在 Python 3.9 / 3.11 / 3.13 上跑同一套测试。
