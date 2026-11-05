@@ -152,6 +152,7 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
     cached: dict[str, tuple[str, int, str]] = {}
     ready_cached = 0
     review_cached = 0
+    overwrite_cached = 0
     plan_rows = read_plan_cache(state_dir / "lyrics.sqlite3")
     for track in tracks:
         row = plan_rows.get(str(track.path))
@@ -162,8 +163,13 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
             int(row["score"] or 0),
             str(row["status"]),
         )
-        if row["status"] == "ready" and not track.has_lyrics:
-            ready_cached += 1
+        if row["status"] == "ready":
+            if track.has_lyrics:
+                # `plan --force` on a file that already has lyrics: the row is
+                # real, it just will not be written without --force.
+                overwrite_cached += 1
+            else:
+                ready_cached += 1
         if row["status"] in {"ambiguous", "suspect"} and not track.has_lyrics:
             review_cached += 1
 
@@ -177,6 +183,11 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
             1
             for track in tracks
             if cached[str(track.path)][2] == "ready" and not track.has_lyrics
+        )
+        overwrite_cached = sum(
+            1
+            for track in tracks
+            if cached[str(track.path)][2] == "ready" and track.has_lyrics
         )
         review_cached = sum(
             1
@@ -220,10 +231,15 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
             "90",
         ),
     )
-    if ready_cached or review_cached:
+    if ready_cached or review_cached or overwrite_cached:
         parts = []
         if ready_cached:
             parts.append(f"{ready_cached} 首已匹配" + style("，可直接 apply", "90"))
+        if overwrite_cached:
+            parts.append(
+                f"{overwrite_cached} 首已有歌词但有新结论"
+                + style("（写入要 apply --force）", "90")
+            )
         if review_cached:
             parts.append(f"{review_cached} 首需确认" + style("（带 ?）", "90"))
         if not getattr(args, "plans", False):
@@ -934,7 +950,31 @@ class CandRow:
         return self.ident
 
 
-def candidate_rows(track: Track, results: list, args: argparse.Namespace) -> list[CandRow]:
+def known_native_kinds(state_dir: Path) -> dict[tuple[str, str], str]:
+    """``(source, source_id) -> native format``, learned from earlier plans.
+
+    netease only decides between YRC and line-timed LRC when the lyric is
+    fetched, so the candidate table cannot know before then.  A previous plan
+    for the same song already recorded what came back, though — and repeating
+    the guess after the answer is on disk is how "YRC/LRC" started reading like
+    a promise.
+    """
+    out: dict[tuple[str, str], str] = {}
+    for row in read_plan_cache(state_dir / "lyrics.sqlite3").values():
+        source = str(row_get(row, "source", "") or "")
+        source_id = str(row_get(row, "source_id", "") or "")
+        kind = str(row_get(row, "native_kind", "") or "")
+        if source and source_id and kind:
+            out.setdefault((source, source_id), kind)
+    return out
+
+
+def candidate_rows(
+    track: Track,
+    results: list,
+    args: argparse.Namespace,
+    known: dict[tuple[str, str], str] | None = None,
+) -> list[CandRow]:
     """Score and format every candidate for one track."""
     rows: list[CandRow] = []
     for name, candidates, error, skipped in results:
@@ -992,9 +1032,14 @@ def candidate_rows(track: Track, results: list, args: argparse.Namespace) -> lis
             elif candidate.synced:
                 kind = "LRC"
             elif candidate.source == "netease":
-                # netease serves YRC when the track has one and line-timed LRC
-                # otherwise; which one it will be is only known after fetching.
-                kind = "YRC/LRC"
+                # netease serves YRC when the song has one and line-timed LRC
+                # otherwise.  Before fetching that is unknowable, so show the
+                # answer a previous plan already got and a bare "?" when there
+                # is none: "YRC/LRC" claimed both and delivered neither.
+                known_kind = (known or {}).get(
+                    (candidate.source, candidate.source_id), ""
+                )
+                kind = lyric_tag(known_kind) if known_kind else "?"
             else:
                 kind = lyric_tag(candidate.native_kind or "lrc")
             notes = match_notes(track, candidate, args.duration_tolerance)
@@ -1151,7 +1196,7 @@ class CandidateScope:
     """What ``candidates`` is about to list, and what it is leaving out."""
 
     tracks: list[Track]
-    mode: str  # questions | unplanned | all
+    mode: str  # questions | unplanned | named | all
     settled: int = 0
     unplanned: int = 0
     with_lyrics: int = 0
@@ -1163,6 +1208,7 @@ def open_tracks(
     state_dir: Path,
     everything: bool = False,
     sources: list[str] | None = None,
+    named: bool = False,
 ) -> CandidateScope:
     """Pick the tracks ``candidates`` should list.
 
@@ -1173,12 +1219,20 @@ def open_tracks(
     ``--all`` still lists everything, and a scope that has never been planned
     falls back to "everything without lyrics" so the first run is not empty.
 
-    The database is opened read-only (and not at all with ``--all``), so a
-    concurrent plan/apply is never disturbed.
+    ``named`` is what a path or ``--album`` means: the user already narrowed the
+    library, and typing a file name is a request to see *that file*.  Filtering
+    it out because its plan already says ✓ turned the command into "0 首" with
+    no way forward except ``--all`` — which then looked like the only way to
+    make ``--refresh`` do anything.
+
+    The database is opened read-only (and not at all with ``--all``/``named``),
+    so a concurrent plan/apply is never disturbed.
     """
     with_lyrics = sum(1 for track in tracks if track.has_lyrics)
     if everything:
         return CandidateScope(list(tracks), "all", with_lyrics=with_lyrics)
+    if named:
+        return CandidateScope(list(tracks), "named", with_lyrics=with_lyrics)
 
     cached = read_plan_cache(state_dir / "lyrics.sqlite3")
     questions: list[Track] = []
@@ -1220,6 +1274,13 @@ def scope_line(scope: CandidateScope) -> str:
     """One line saying what is listed and what is being left out."""
     if scope.mode == "all":
         return f"全部 {len(scope.tracks)} 首（含 ✓ 与已有歌词）"
+    if scope.mode == "named":
+        # Named tracks are listed whole; the only thing worth adding is how many
+        # of them already hold lyrics, and how to get back to the short list.
+        head = f"你点名的 {len(scope.tracks)} 首"
+        if scope.with_lyrics:
+            head += style(f"   其中 {scope.with_lyrics} 首已有歌词", "90")
+        return head + style("   去掉路径就只看上次 plan 的存疑项", "90")
     if scope.mode == "questions":
         head = f"上次 plan 的 ! 需确认 {len(scope.tracks)} 首"
         if scope.other_source:
@@ -1257,7 +1318,10 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         impersonate=not getattr(args, "no_impersonate", False),
     )
     sources = build_sources(args.src, client, getattr(args, "target_format", None))
-    scope = open_tracks(tracks, state_dir, args.all, sources=args.src)
+    # Naming a path or an album is the narrowing: list what was named.  Without
+    # it, "what is left to decide" is the question worth answering.
+    named = bool(args.path or args.album)
+    scope = open_tracks(tracks, state_dir, args.all, sources=args.src, named=named)
     wanted = scope.tracks
 
     if not args.tsv:
@@ -1269,7 +1333,7 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         if not wanted:
             if scope.mode == "questions":
                 # Nothing to decide: say what the library already has instead
-                # of an empty table, and name the flag that widens the scope.
+                # of an empty table, and name the option that widens the scope.
                 settled = f"{scope.settled} 首 ✓ 可写入" if scope.settled else ""
                 written = f"{scope.with_lyrics} 首已有歌词" if scope.with_lyrics else ""
                 facts = "，".join(part for part in (settled, written) if part)
@@ -1282,7 +1346,14 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
                         "32",
                     )
                 )
-                print("  " + style("要看库里其它曲目的候选，加 --all。", "90"))
+                print(
+                    "  "
+                    + style(
+                        "要看库里其它曲目加 --all；只想看某首歌就点名："
+                        "lrcpatch candidates <路径>",
+                        "90",
+                    )
+                )
             else:
                 print("  " + style("没有可查询的曲目。", "32"))
             print()
@@ -1330,8 +1401,9 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
                 live.update(f"查询 {done}/{len(wanted)}  ·  {rate:.1f} 首/秒")
     live.close()
 
+    known = known_native_kinds(state_dir)
     rows_by_track: dict[str, list[CandRow]] = {
-        str(track.path): candidate_rows(track, results[str(track.path)], args)
+        str(track.path): candidate_rows(track, results[str(track.path)], args, known)
         for track in wanted
     }
 
@@ -1385,7 +1457,9 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
                 print(candidate_line(row, widths, prefix, branch))
         print()
 
-    count_label = "首待确认" if settled and not args.all else "首"
+    # `settled` used to be a local of the empty-scope branch, so any listing
+    # that actually had rows crashed here (feedback 20261105-1925).
+    count_label = "首待确认" if scope.mode == "questions" and not args.all else "首"
     print(
         "  "
         + style(f"共 {len(wanted)} {count_label}。", "90")
@@ -1395,6 +1469,15 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         + style("--pick-file", "36")
         + "。"
     )
+    if any(row.kind == "?" for rows in rows_by_track.values() for row in rows):
+        print_meta(
+            "原生",
+            style(
+                "? = 还没取过这个词；网易云可能给逐字 YRC，也可能只有逐行 LRC，"
+                "plan 一次之后这里就写实际格式",
+                "90",
+            ),
+        )
     if getattr(args, "template", None):
         template_path = write_pick_template(
             template_target(args, state_dir), wanted, rows_by_track

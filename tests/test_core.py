@@ -959,7 +959,10 @@ class ScanListTests(unittest.TestCase):
         self.assertIn("无歌词", out)
         self.assertIn("qq:100", out)
 
-    def test_scan_does_not_show_a_plan_over_existing_lyrics(self) -> None:
+    def test_scan_shows_a_plan_over_existing_lyrics_too(self) -> None:
+        # `plan --force` on a file that already carries lyrics still leaves a
+        # verdict in the database; hiding it made the row look like the plan
+        # never happened (feedback 20261105-193209).
         track = self._track(
             "/lib/A/(2020)Album", "01 A.m4a", lyrics="[00:01.00]x"
         )
@@ -968,7 +971,9 @@ class ScanListTests(unittest.TestCase):
             render.print_scan_list(
                 [track], Path("/lib"), 0, {str(track.path): ("qq", 100, "ready")}
             )
-        self.assertNotIn("qq:100", render.strip_ansi(buffer.getvalue()))
+        out = render.strip_ansi(buffer.getvalue())
+        self.assertIn("LRC 1 行", out)
+        self.assertIn("qq:100", out)
 
     def test_scan_uses_finder_folder_order(self) -> None:
         tracks = [
@@ -1784,6 +1789,25 @@ class CandidateScopeTests(unittest.TestCase):
         self.assertEqual(scope.tracks, [track])
         self.assertEqual(scope.mode, "all")
 
+    def test_a_named_file_is_listed_whatever_its_plan_says(self) -> None:
+        # `candidates <路径>` used to answer "0 首" for a settled file, so the
+        # only way to see it was --all — which made --refresh look pointless
+        # (feedback 20261105-1925).
+        track = make_track(existing_lyrics="[00:01]x")
+        state_dir = self._state_dir(
+            [(str(track.path), "ready", "netease", 100, track.fingerprint())]
+        )
+        scope = commands.open_tracks([track], state_dir, named=True)
+        self.assertEqual(scope.tracks, [track])
+        self.assertEqual(scope.mode, "named")
+        self.assertIn("你点名的", commands.scope_line(scope))
+
+    def test_naming_a_file_does_not_need_the_database(self) -> None:
+        # Named scope must work even before the first plan ever ran.
+        track = make_track()
+        scope = commands.open_tracks([track], Path(tempfile.mkdtemp()), named=True)
+        self.assertEqual(scope.tracks, [track])
+
 
 class ApplyFormatGuardTests(unittest.TestCase):
     def test_only_the_requested_format_is_accepted(self) -> None:
@@ -2354,6 +2378,142 @@ class FormatColorTests(unittest.TestCase):
         for key in ("plain", "lrc", "a2", "eslrc", "yrc", "qrc", "ttml"):
             with self.subTest(format=key):
                 self.assertIn(f'LYRIC_COLORS["{key}"]', source)
+
+
+class PlanRowFieldsTests(unittest.TestCase):
+    """One plan line has to say which release, from whom, in what format."""
+
+    def _row(self, **overrides):
+        values = {
+            "path": "/lib/x.m4a",
+            "status": "ready",
+            "source": "netease",
+            "score": 85,
+            "duration_diff": 0.0,
+            "lyric_kind": "lrc",
+            "lyric_lines": 63,
+            "reason": "ヨルシカ",
+            "match_artist": "ヨルシカ",
+            "match_album": "創作",
+            "native_kind": "lrc",
+        }
+        values.update(overrides)
+        return values
+
+    def test_the_matched_album_is_a_column(self) -> None:
+        # 春泥棒 sits on three releases with three different uploads; the album
+        # is what tells an 85 from a 100 apart (feedback 20261105-1925).
+        cells, _ = render.plan_fields(self._row())
+        self.assertEqual(cells[-1], "創作")
+
+    def test_an_applied_row_shows_the_artist_not_the_verdict(self) -> None:
+        # apply overwrites `reason` with 写入并校验成功; the artist lives in
+        # match_artist and used to be replaced by that verdict.
+        cells, note = render.plan_fields(
+            self._row(status="applied", reason="写入并校验成功")
+        )
+        self.assertEqual(cells[4], "ヨルシカ")
+        self.assertIn("写入并校验成功", note)
+
+    def test_word_timing_upstream_names_the_flag_that_keeps_it(self) -> None:
+        cells, note = render.plan_fields(self._row(native_kind="yrc"))
+        self.assertIn("LRC", cells[3])
+        self.assertIn("原生 YRC", note)
+        self.assertIn("apply --yrc", note)
+
+    def test_the_native_notice_is_not_repeated(self) -> None:
+        reason = (
+            "ヨルシカ；注音（kana）1 行放不进 LRC，已丢弃；"
+            "原生 QRC 仍在状态库，apply --qrc 可取回"
+        )
+        _, note = render.plan_fields(self._row(native_kind="qrc", reason=reason))
+        self.assertEqual(note.count("原生 QRC"), 1)
+
+
+class CandidatesNativeKindTests(unittest.TestCase):
+    """Do not promise YRC: netease serves it only when the song has one."""
+
+    def _rows(self, track, known):
+        args = build_parser().parse_args(["candidates", "--library", "/lib"])
+        candidate = Candidate(
+            source="netease",
+            source_id="1810759765",
+            title=track.title,
+            artists=["Artist"],
+            album="Album",
+            duration=track.duration,
+        )
+        return commands.candidate_rows(
+            track, [("netease", [candidate], None, False)], args, known
+        )
+
+    def test_an_unfetched_candidate_is_marked_unknown(self) -> None:
+        # It used to read "YRC/LRC", which the user read as "the lyrics have
+        # word timing" — and plan then said LRC (feedback 20261105-1925).
+        rows = self._rows(make_track(), {})
+        self.assertEqual(rows[0].kind, "?")
+
+    def test_a_previous_plan_supplies_the_real_format(self) -> None:
+        rows = self._rows(make_track(), {("netease", "1810759765"): "yrc"})
+        self.assertEqual(rows[0].kind, "YRC")
+
+    def test_known_native_kinds_reads_the_plan_table(self) -> None:
+        track = make_track()
+        state_dir = Path(tempfile.mkdtemp())
+        state = State(state_dir / "lyrics.sqlite3")
+        state.upsert_plan(
+            PlanResult(
+                track,
+                "ready",
+                "Artist",
+                Candidate(
+                    source="netease",
+                    source_id="42",
+                    title="Track",
+                    artists=["Artist"],
+                    album="Album",
+                    duration=200.0,
+                ),
+                lyrics="[00:00.00]あ",
+                score=100,
+                duration_diff=0.0,
+                native_lyrics="[0,1000](0,10)あ",
+                native_kind="yrc",
+            ),
+            track.fingerprint(),
+        )
+        self.assertEqual(
+            commands.known_native_kinds(state_dir), {("netease", "42"): "yrc"}
+        )
+
+
+class CandidatesCommandTests(unittest.TestCase):
+    def test_listing_rows_does_not_crash(self) -> None:
+        # UnboundLocalError on `settled`: the count label was read off a local
+        # of the empty-scope branch, so every listing that had rows crashed.
+        track = make_track(path=Path("/lib/A/01.m4a"), relpath="A/01.m4a")
+        state_dir = Path(tempfile.mkdtemp())
+        state = State(state_dir / "lyrics.sqlite3")
+        args = build_parser().parse_args(["candidates", "--library", "/lib"])
+        # cli.main normalises the positional list into `path`; do the same.
+        args.paths = args.path = [str(track.path)]
+        candidate = Candidate(
+            source="netease",
+            source_id="7",
+            title="Track",
+            artists=["Artist"],
+            album="Album",
+            duration=200.0,
+        )
+        with mock.patch.object(commands, "load_tracks", return_value=([track], [])):
+            with mock.patch.object(
+                commands, "build_sources", return_value=[EmptySource()]
+            ):
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    code = commands.cmd_candidates(args, state, state_dir)
+        self.assertEqual(code, 0)
+        self.assertIn("共 1 首", render.strip_ansi(buffer.getvalue()))
 
 
 if __name__ == "__main__":

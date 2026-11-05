@@ -672,7 +672,9 @@ def print_scan_list(
     ``cached`` maps a track path to ``(source, score, status)`` from the plan
     database: a track that already has a usable plan shows ``qq:100`` in its
     own column, which is the difference between "no lyrics yet" and "no lyrics
-    yet, but apply will fix it".
+    yet, but apply will fix it".  Files that already carry lyrics show their
+    verdict too — dimmed, because there it is a comparison rather than an
+    instruction: writing it would take ``apply --force``.
     """
     if not tracks:
         print("  " + style("没有可列出的音频文件。", "90"))
@@ -730,14 +732,15 @@ def print_scan_list(
     dur_width = max(5, max(len(value) for value in durations.values()))
     size_width = max(8, max(len(value) for value in sizes.values()))
 
-    # A plan that is ready (or only needs a glance) is worth showing next to
-    # "无歌词": it answers "do I have to query again?" without opening the HTML.
+    # A plan in the database is worth showing whatever the file already holds:
+    # after `plan --force` a track with embedded lyrics still has a verdict, and
+    # hiding it made the row look like the database knew nothing about it.
     cache_labels: dict[int, str] = {}
     cache_tones: dict[int, str] = {}
     for track in tracks:
         info = (cached or {}).get(str(track.path))
         label = ""
-        if info and not track.has_lyrics:
+        if info:
             source, score, status = info
             if source and status in CACHE_TONE:
                 # "qq:100" is an invitation to apply; a cached but unready
@@ -746,7 +749,13 @@ def print_scan_list(
                 source = source_label(source)
                 label = f"{source}:{score}" if score else source
                 label += "" if status == "ready" else "?"
-                cache_tones[id(track)] = CACHE_TONE[status]
+                if track.has_lyrics and status == "ready":
+                    # A ready plan on a file that already has lyrics is a
+                    # comparison, not an instruction: apply would need --force.
+                    # Cyan says "known", green would say "will be written".
+                    cache_tones[id(track)] = "36"
+                else:
+                    cache_tones[id(track)] = CACHE_TONE[status]
         cache_labels[id(track)] = label
     cache_width = max((disp_width(label) for label in cache_labels.values()), default=0)
 
@@ -892,14 +901,23 @@ class ProgressLine:
                 self._stream.flush()
                 self._visible = False
 
+# Album titles run long ("TOKYO - GRADUATION -"), and the column exists to tell
+# one release from another, not to be read in full.
+ALBUM_CAP = 28
+
+
 def plan_fields(row: sqlite3.Row) -> tuple[tuple[str, ...], str]:
     """``(cells, trailing note)`` for one plan row.
 
-    Ready rows become five columns — source / score / duration gap / lyric /
-    artist — which :func:`print_tree` aligns per album.  Rows that carry an
-    explanation instead (ambiguous, suspect, failure) stay a single note: their
-    "source score" head is a list of attempts, not one value, so a fixed
-    column would only push the explanation to the right.
+    Ready rows become six columns — source / score / duration gap / lyric /
+    artist / album — which :func:`print_tree` aligns per album.  Rows that
+    carry an explanation instead (ambiguous, suspect, failure) stay a single
+    note: their "source score" head is a list of attempts, not one value, so a
+    fixed column would only push the explanation to the right.
+
+    The album is the matched candidate's, not the folder's: one song can sit on
+    three releases with three different lyric uploads, and "which one did you
+    pick" is exactly what decides a 85-point match from a 100-point one.
     """
     status = row["status"]
     if status in {"ready", "applied"}:
@@ -908,19 +926,38 @@ def plan_fields(row: sqlite3.Row) -> tuple[tuple[str, ...], str]:
         tag = lyric_tag(kind) if kind else ""
         lines = row["lyric_lines"] or 0
         artist, notes = _reason_parts(str(row["reason"] or ""))
+        # `match_artist` is the artist; `reason` is a message that *starts* with
+        # one.  apply overwrites the message ("写入并校验成功"), so trusting the
+        # reason put a verdict in the artist column.
+        matched = str(row_get(row, "match_artist", "") or "").strip()
+        if matched:
+            if artist and artist != matched and not notes:
+                notes = artist
+            artist = matched
+        album = str(row_get(row, "match_album", "") or "")
         cells = (
             source_label(str(row["source"] or "")),
             f"{row['score']}分" if row["score"] else "",
             format_diff(diff) if diff is not None and diff < 900 else "",
             f"{tag} {lines} 行" if tag and lines else tag,
             artist,
+            truncate_display(album, ALBUM_CAP) if album else "",
         )
         # The provider's own format is what apply would convert from, so say
-        # it whenever it is not what was written.
+        # it whenever it is not what was written — and name the flag that would
+        # have kept the word timing, since "LRC" alone looks like the upstream
+        # copy simply has none.  Skip it when the note already said so: the
+        # kana notice ends with "原生 QRC 仍在状态库", and printing both read
+        # like two different facts.
         native = str(row_get(row, "native_kind", "") or "")
         tail = [part for part in (notes,) if part]
-        if native and native != kind:
-            tail.append(f"原生 {lyric_tag(native)}")
+        if native and native != kind and not any(
+            f"原生 {lyric_tag(native)}" in part for part in tail
+        ):
+            label = f"原生 {lyric_tag(native)}"
+            if native in {"yrc", "qrc"}:
+                label += f"（逐字，apply --{native} 可取）"
+            tail.append(label)
         return cells, "；".join(tail) or ("匹配通过" if not any(cells) else "")
     if status == "skip_existing":
         return (), "已有歌词，未覆盖"

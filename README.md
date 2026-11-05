@@ -93,7 +93,7 @@ lrcpatch plan
 lrcpatch apply
 ```
 
-`plan` 的真实输出（`--no-color`，4 首演示曲目）：
+`plan` 的输出（`--no-color`，4 首演示曲目）：
 
 ```
   plan  整个音乐库  ·  4 首
@@ -103,12 +103,12 @@ lrcpatch apply
   查询 4/4 · 0.6 首/秒
 
   ▸ 米津玄師/STRAY SHEEP   2 首  ✓2
-    ├─ ✓ 01 Lemon.m4a   ne  100分  Δ0.1s  LRC 45 行  米津玄師；原生 YRC
-    └─ ✓ 02 馬と鹿.m4a  ne  100分  Δ0.3s  LRC 51 行  米津玄師
+    ├─ ✓ 01 Lemon.m4a   ne  100分  Δ0.1s  LRC 45 行  米津玄師  STRAY SHEEP；原生 YRC（逐字，apply --yrc 可取）
+    └─ ✓ 02 馬と鹿.m4a  ne  100分  Δ0.3s  LRC 51 行  米津玄師  STRAY SHEEP
 
   ▸ YOASOBI/THE BOOK   2 首  ✓2
-    ├─ ✓ 01 夜に駆ける.m4a  ne  100分  Δ0.8s  LRC 63 行  YOASOBI
-    └─ ✓ 02 群青.m4a        ne   85分  Δ0.4s  LRC 87 行  YOASOBI
+    ├─ ✓ 01 夜に駆ける.m4a  ne  100分  Δ0.8s  LRC 63 行  YOASOBI  THE BOOK
+    └─ ✓ 02 群青.m4a        ne   85分  Δ0.4s  LRC 87 行  YOASOBI  THE BOOK
 
   ────────────────────────────────────────────────────────────────────────────
   汇总  ✓ 可写入 4
@@ -248,6 +248,8 @@ lrcpatch apply
 
 私有格式（`--yrc` / `--qrc`）只在原生就是它时才可能：YRC 只来自网易云，QRC 只来自 QQ。
 
+网易云到底给逐字 YRC 还是逐行 LRC，**要取一次词才知道**，而且同一批歌里两种都有（实测「Lemon」有 YRC，「春泥棒」只有 LRC）。所以 `candidates` 里没查过的那条显示 `?`——以前写 `YRC/LRC`，读起来像"这些歌词有逐字"，plan 一说 LRC 就像漏了什么。plan 过之后这里写实际格式；如果原生是逐字而你是按 LRC 写的，plan 那行会补一句「原生 YRC（逐字，apply --yrc 可取）」。默认仍写 LRC：多数播放器认它。
+
 ### 转换时会丢什么
 
 三种公开逐字格式装得下的东西并不一样，先把这张表摆出来，省得转完才发现少了东西：
@@ -305,13 +307,22 @@ lrcpatch plan --pick ne:123 --apply "Aimer/某首.m4a"
 | 用法 | 列出的曲目 |
 |---|---|
 | `lrcpatch candidates` | 只有 `!` 需确认的（所在范围从没 plan 过时，退回列出这些没结论的） |
-| `lrcpatch candidates --all` | 该范围内**所有**缺歌词的曲目，含已经 ✓ 的与已有歌词的 |
+| `lrcpatch candidates 某路径` | **你点名的那几首，照单全列**，不管它的计划是不是已经 ✓；给了路径就不必再加 `--all` |
+| `lrcpatch candidates --all` | 该范围内**所有**曲目，含已经 ✓ 的与已有歌词的 |
 | `lrcpatch candidates --src qq` | 加上「计划来自 ne」的那些：换源就还没定论 |
-| `lrcpatch candidates --refresh` | 同样范围，但忽略 HTTP 缓存重新请求（不改范围） |
+| `lrcpatch candidates --refresh` | 同样范围，但忽略 HTTP 缓存重新请求（**只改网络，不改范围**） |
 
 `--all` 不带路径 = 整个音乐库里所有曲目（含已有歌词的），不是"上次 plan 那批"。
 
-存疑与否看的是**计划**，不是文件：`plan --force` 之后仍判为 `!` 的曲目，就算文件里原本有歌词，也照样留在默认列表里——那正是"重排过了，但还是要你拍板"的情况。
+`--refresh` 只负责网络，范围由你自己的写法决定。想看某首歌最新一轮候选（比如刚在别处补了歌词、或想确认网易云这一版有没有更新）：
+
+```bash
+lrcpatch candidates "ヨルシカ/(2021)創作/02 春泥棒.m4a" --refresh
+```
+
+以前这条会答"0 首"，因为那首歌的计划已经是 ✓，默认范围把它滤掉了，只剩 `--all` 一条路——于是 `--refresh` 看起来必须配 `--all` 才有意义。现在给了路径就按路径来。
+
+存疑与否看的是**计划**，不是文件：`plan --force` 之后仍判为 `!` 的曲目，就算文件里原本有歌词，也照样留在默认列表里——那正是"重排过了，但还是要你拍板"的情况。同理，`scan` 也会把「文件已有歌词、但状态库里有新结论」的曲目标出来（`ne:85`，青色），汇总行写明「写入要 apply --force」。
 
 一次 `--pick` 可连写多个 ID，程序先查每个 ID 的标题 / 歌手 / 时长，再按分数配对到范围内缺歌词的曲目，并把配对结果打印出来。整张专辑要批量指定时，用模板：
 
@@ -452,7 +463,7 @@ lrc_patch/
   qrc.py            # QQ QRC 解密（3DES + zlib）
   state.py          # SQLite 状态库
   render.py         # 终端表格与对齐
-tests/test_core.py  # 167 个用例，覆盖解析、格式转换往返、打分、写入、回滚与 CLI
+tests/test_core.py  # 178 个用例，覆盖解析、格式转换往返、打分、写入、回滚与 CLI
 ```
 
 CI 在 Python 3.9 / 3.11 / 3.13 上跑同一套测试。

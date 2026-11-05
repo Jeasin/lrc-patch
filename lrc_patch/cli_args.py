@@ -670,7 +670,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     scan.add_argument(
         "--plans",
         action="store_true",
-        help="只列出状态库里已有计划的曲目（apply 会写哪些）",
+        help="只列出状态库里已有计划的曲目（含 plan --force 重排过的、文件本来就有歌词的）",
     )
 
     plan = sub.add_parser(
@@ -765,14 +765,19 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
             "示例\n"
             '  lrcpatch candidates --top 3 "結束バンド"\n'
             '  lrcpatch candidates --template "Aimer"\n'
-            '  lrcpatch candidates --tsv "Ado" > picks.tsv\n\n'
-            "默认范围是上一次 plan 留下的 ! 需确认（含 ! 时间轴可疑）：plan 之后直接跑 candidates，看到的就是那几首真正需要你决定，而不是整个库。\n"
-            "库里还有没 plan 过的曲目时，会单独报一行「未 plan N」，要一起查加 --all；--all 连已有歌词、已经 ✓ 的曲目也列出来。\n"
-            "计划来自的源不在当前 --src 里时，那首也算未决：用 --src qq 就能看到 qq 那边的候选。--refresh 只作用于网络（忽略 HTTP 缓存重查），不改范围。\n\n"
-            "--all 不带路径 = 整个音乐库里所有缺歌词的曲目（含已经 ✓ 的），不是只查上次 plan 那批。\n\n"
+            '  lrcpatch candidates --tsv "Ado" > picks.tsv\n'
+            '  lrcpatch candidates "ヨルシカ/(2021)創作/02 春泥棒.m4a" --refresh\n\n'
+            "范围（决定列哪些曲目）\n"
+            "  给了路径或 --album  → 你点名的那些，照单全列，不管它的计划是不是已经 ✓；此时 --all 没有额外作用。\n"
+            "  什么都没给          → 上一次 plan 留下的 ! 需确认（含 ! 时间轴可疑）。plan 之后直接跑 candidates，看到的就是那几首真正需要你决定，而不是整个库。\n"
+            "  库里还有没 plan 过的曲目时，会单独报一行「未 plan N」，要一起查加 --all；--all 连已有歌词、已经 ✓ 的曲目也列出来。\n"
+            "  计划来自的源不在当前 --src 里时，那首也算未决：用 --src qq 就能看到 qq 那边的候选。\n\n"
+            "--refresh（只管网络）忽略 HTTP 缓存重新请求，不改范围：想看某首歌最新的候选就点名那个文件再加 --refresh，不必 --all。\n\n"
+            "--all 不带路径 = 整个音乐库里所有曲目（含已有歌词、已经 ✓ 的），不是只查上次 plan 那批。\n\n"
             "状态库按文件路径逐条记录，每首取它自己最后一次 plan 的结果（文件大小或修改时间变了就不算数），不存在「整库最近一次」的快照；因此不同专辑可能来自不同次运行。用 status 看整体分布。\n\n"
             "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 原生 / 标题 / 歌手 / 专辑。分数是标题+歌手+专辑的总分（满分 100），时长差单独一列，超过容差显示红色。"
-            "“原生”是源会给出的格式（qq=QRC、ne=YRC/LRC、lrclib=LRC/TXT），apply 时再决定转成什么。排序先看是否在容差内，容差外的不会排在可用的前面。\n\n"
+            "“原生”是源会给出的格式：qq=QRC、lrclib=LRC/TXT；ne 只有取词后才知道是逐字 YRC 还是逐行 LRC，所以之前没查过的那条显示 ?，查过一次（plan 过）就写实际格式。"
+            "apply 时再决定转成什么。排序先看是否在容差内，容差外的不会排在可用的前面。\n\n"
             "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
         ),
         formatter_class=HelpFormatter,
@@ -789,7 +794,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     candidates.add_argument(
         "--all",
         action="store_true",
-        help="列出整个音乐库所有缺歌词的曲目（含已 ✓、已有歌词），不只上次 plan 的存疑项",
+        help="全库所有曲目（含已 ✓、已有歌词），不只看上次 plan 的存疑项；给了路径就不需要它",
     )
     candidates.add_argument("--tsv", action="store_true", help="输出制表符分隔，便于做 pick-file")
     candidates.add_argument(
@@ -799,7 +804,11 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         metavar="FILE",
         help="同时生成 pick-file 模板：自动匹配项已填好，需确认项注释列出候选",
     )
-    candidates.add_argument("--refresh", action="store_true", help="忽略 HTTP 缓存并重查")
+    candidates.add_argument(
+        "--refresh",
+        action="store_true",
+        help="忽略 HTTP 缓存重新请求（只影响网络，不改列哪些曲目）",
+    )
     candidates.add_argument(
         "--workers",
         type=int,
