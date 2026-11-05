@@ -1127,6 +1127,12 @@ def candidate_rows(
                 # QRC container whose only block is [0,0].
                 kind = kind_set_label(known_kind)
                 verbatim = store.verbatim(known_kind)
+                if candidate.source == "qq" and "qrc" not in kind_set(known_kind):
+                    # QQ has exactly one lyric container and it is QRC; when it
+                    # decrypts without word timing the candidate is still the
+                    # QRC answer, just not a 逐字 one.  Say QRC, drop the bold.
+                    kind = "QRC"
+                    verbatim = False
             elif candidate.synced:
                 kind = "LRC"
                 verbatim = False

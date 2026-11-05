@@ -820,7 +820,9 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
             "排序先看是否在容差内，容差外的不会排在可用的前面。\n\n"
             "“原生”是源会给出的格式：qq 的取词接口是个 QRC 容器、lrclib 在搜索结果里就带同步标记、ne 同一首可能给逐字 YRC 也可能只有逐行 LRC。"
             "默认不取词（表里 `?` 表示还没问过），加 --probe N 才会为每源前 N 条真的取一次词，把实际格式写上去；取词走 HTTP 缓存，随后的 plan 直接复用。"
-            "取过词的行里，真正的逐字格式（YRC / QRC）用粗体——QQ 也会给出没有词时间轴的 QRC 容器，解析后其实是 LRC/纯文本，那种就不加粗。"
+            "qq 的行一律写 QRC——那是它唯一的容器——只有解码出词时间轴才用粗体；解出来是逐行或纯文本的不加粗，但仍然是 QRC。"
+            "TTML / A2 / ESLRC 这类分不出真假的格式也不加粗，粗细只回答一个问题：这份词有没有逐字时间轴。"
+            "纯文本写成 TXT，跟存下来的 .txt 一致。"
             "apply 时再决定转成什么。\n\n"
             "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
         ),
@@ -840,7 +842,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         type=int,
         metavar="N",
         default=0,
-        help="取词确认每源前 N 条的真实格式（默认 0 = 不取；逐字为真的加粗）",
+        help="取词确认每源前 N 条的真实格式（默认 0 = 不取；有逐字时间轴的加粗）",
     )
     candidates.add_argument(
         "--all",

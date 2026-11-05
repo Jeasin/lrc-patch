@@ -2458,10 +2458,10 @@ class PlanRowFieldsTests(unittest.TestCase):
 class CandidatesNativeKindTests(unittest.TestCase):
     """Do not promise YRC: netease serves it only when the song has one."""
 
-    def _rows(self, track, known):
+    def _rows(self, track, known, source="netease"):
         args = build_parser().parse_args(["candidates", "--library", "/lib"])
         candidate = Candidate(
-            source="netease",
+            source=source,
             source_id="1810759765",
             title=track.title,
             artists=["Artist"],
@@ -2469,7 +2469,7 @@ class CandidatesNativeKindTests(unittest.TestCase):
             duration=track.duration,
         )
         return commands.candidate_rows(
-            track, [("netease", [candidate], None, False)], args, known
+            track, [(source, [candidate], None, False)], args, known
         )
 
     def test_an_unfetched_candidate_is_marked_unknown(self) -> None:
@@ -2495,6 +2495,33 @@ class CandidatesNativeKindTests(unittest.TestCase):
     def test_a_line_timed_answer_is_not_marked(self) -> None:
         rows = self._rows(make_track(), {("netease", "1810759765"): "lrc"})
         self.assertFalse(rows[0].verbatim)
+
+    def test_a_fake_qrc_still_reads_qrc_but_is_not_marked(self) -> None:
+        # QQ has one lyric container and it is QRC; a track with no word
+        # timing decrypts to LRC, and calling it LRC in a QQ row contradicted
+        # the source itself (feedback 20261105-2133).  Plain QRC, no bold.
+        rows = self._rows(
+            make_track(), {("qq", "1810759765"): "lrc"}, source="qq"
+        )
+        self.assertEqual(rows[0].kind, "QRC")
+        self.assertFalse(rows[0].verbatim)
+
+    def test_a_qrc_that_is_only_text_also_reads_qrc(self) -> None:
+        rows = self._rows(
+            make_track(), {("qq", "1810759765"): "plain"}, source="qq"
+        )
+        self.assertEqual(rows[0].kind, "QRC")
+        self.assertFalse(rows[0].verbatim)
+
+    def test_a_real_qrc_is_marked(self) -> None:
+        rows = self._rows(make_track(), {("qq", "1810759765"): "qrc"}, source="qq")
+        self.assertEqual(rows[0].kind, "QRC")
+        self.assertTrue(rows[0].verbatim)
+
+    def test_plain_text_is_labelled_txt(self) -> None:
+        # "PLAIN" is a database word; the table says TXT, like the file suffix.
+        rows = self._rows(make_track(), {("netease", "1810759765"): "plain"})
+        self.assertEqual(rows[0].kind, "TXT")
 
     def test_known_native_kinds_reads_the_plan_table(self) -> None:
         track = make_track()
@@ -2747,6 +2774,32 @@ class NativeLyricStoreTests(unittest.TestCase):
             track.fingerprint(),
         )
 
+    def _plan_as(self, state: State, track: Track, source: str, source_id: str) -> None:
+        """Plan the same track again, matched to another source / ID."""
+        kind = "qrc" if source == "qq" else "yrc"
+        state.upsert_plan(
+            PlanResult(
+                track,
+                "ready",
+                "Artist",
+                Candidate(
+                    source=source,
+                    source_id=source_id,
+                    title=track.title,
+                    artists=["Artist"],
+                    album=track.album,
+                    duration=track.duration,
+                ),
+                lyrics="[00:00.00]あ\n",
+                score=100,
+                duration_diff=0.0,
+                native_lyrics="[1000,2000](1000,200,0)あ\n",
+                native_kind=kind,
+                native_kinds=(kind, "lrc"),
+            ),
+            track.fingerprint(),
+        )
+
     def test_both_texts_land_on_disk_and_leave_the_columns_empty(self) -> None:
         state, _root, lyr = self._state()
         track = make_track()
@@ -2788,6 +2841,37 @@ class NativeLyricStoreTests(unittest.TestCase):
         )
         self.assertEqual(sorted(path.suffix for path in lyr.iterdir()), [".lrc"])
         self.assertEqual(store.load(lyr, f"{stem}.lrc"), "[00:00.00]い\n")
+
+    def test_switching_source_drops_the_old_id_files(self) -> None:
+        # The ID is in the name, so nothing overwrites `[ne:7]` after the track
+        # re-matches to `[qq:9]`; before this the store kept both until a
+        # month-old `clean --lyr` (feedback 20261105-2133).
+        state, _root, lyr = self._state()
+        track = make_track()
+        self._plan(state, track)
+        self._plan_as(state, track, "qq", "9")
+        self.assertEqual(
+            sorted(path.name for path in lyr.iterdir()),
+            ["Artist - Track [qq:9].lrc", "Artist - Track [qq:9].qrc"],
+        )
+
+    def test_a_file_another_row_still_points_at_is_kept(self) -> None:
+        # The same recording can sit in two folders (single + compilation) as
+        # two rows sharing one store file; re-planning one must not delete the
+        # file the other row's apply still reads.
+        state, _root, lyr = self._state()
+        first = make_track()
+        second = make_track(
+            path=Path("/library/VA/Compilation/07 track.m4a"),
+            relpath="VA/Compilation/07 track.m4a",
+        )
+        self._plan(state, first)
+        self._plan(state, second)
+        self._plan_as(state, first, "qq", "9")
+        names = sorted(path.name for path in lyr.iterdir())
+        self.assertIn("Artist - Track [ne:7].yrc", names)
+        self.assertIn("Artist - Track [ne:7].lrc", names)
+        self.assertIn("Artist - Track [qq:9].qrc", names)
 
     def test_locate_prefers_the_most_detailed_file(self) -> None:
         root = Path(tempfile.mkdtemp())

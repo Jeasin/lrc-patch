@@ -28,14 +28,16 @@ Two consequences are stated here because they used to be silent:
 **Centisecond formats quantise.**  A millisecond timeline lands on the
 nearest 10 ms when written as A2/ESLRC, so re-importing those files is
 accurate to 10 ms rather than exact.  The untouched provider text stays in
-the plan database, so switching back to ``--qrc``/``--yrc`` loses nothing.
+the lyric store (``lrc-patch/lyr``, one file per format), so switching back to
+``--qrc``/``--yrc`` loses nothing.
 
 **Ruby (注音) has nowhere to live.**  QQ ships it inside the native QRC as a
 ``[kana:…]`` tag — a second, syllable-timed annotation for the whole song.
 A2 and ESLRC are single-timeline formats, and decoding ``[kana:…]`` into
 TTML's ruby structure has no published reference, so guessing would be worse
 than dropping.  The tag is therefore never written into a converted file; it
-survives in ``native_lyric``, which is what ``apply --qrc`` reads, and the
+survives in the native ``.qrc`` file of the lyric store, which is what
+``apply --qrc`` reads, and the
 plan note says how many lines were dropped.  (Before this rule the tag was
 emitted verbatim: a 2 KB line of kana and millisecond numbers appeared at
 ``00:00`` in every converted file.)
@@ -57,7 +59,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from .errors import ToolError
-from .text import scripts
+from .text import lyric_tag, scripts
 
 # Target formats the CLI accepts.
 TARGET_FORMATS = ("a2", "eslrc", "yrc", "qrc", "ttml")
@@ -676,13 +678,13 @@ def render_native(
             return native_text, ""
         return native_text, f"原生只有纯文本，无法生成 {want.upper()}，已按纯文本取词"
     if kind not in _PARSERS:
-        return native_text, f"原生是 {kind.upper()}，无法生成 {want.upper()}，已按原样取词"
+        return native_text, f"原生是 {lyric_tag(kind)}，无法生成 {want.upper()}，已按原样取词"
     parsed = parse_native(native_text, kind)
     if want in ("yrc", "qrc"):
         # The private formats are only ever served by their own source; a
         # conversion would have to re-encode the provider's own container.
         return lines_to_lrc(parsed), (
-            f"原生是 {kind.upper()}，无法生成 {want.upper()}"
+            f"原生是 {lyric_tag(kind)}，无法生成 {want.upper()}"
             f"（{want.upper()} 只能从源原样获取），已按逐行 LRC 取词"
         )
     if want in ("plain", "txt"):

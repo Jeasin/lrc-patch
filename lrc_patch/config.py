@@ -32,7 +32,7 @@ def legacy_lyr_dir() -> Path:
     root = Path(base).expanduser() if base else Path.home() / ".cache"
     return root / "lrc-patch" / "lrc"
 
-APP_VERSION = "2.17"
+APP_VERSION = "2.18"
 
 # Bump when the scoring rules change: old ambiguous/suspect plans are then
 # retried once instead of being reused with the previous rules.

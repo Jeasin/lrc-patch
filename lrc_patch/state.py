@@ -443,7 +443,11 @@ class State:
         native_column = None if saved else (native or None)
         lyric_column = None if saved else (lyric or None)
         lyric = lyric or None
+        track_path = str(result.track.path)
         with self.connection() as conn:
+            previous = conn.execute(
+                "SELECT native_path FROM plans WHERE path=?", (track_path,)
+            ).fetchone()
             conn.execute(
                 """
                 INSERT INTO plans(
@@ -476,7 +480,7 @@ class State:
                     src_set=excluded.src_set
                 """,
                 (
-                    str(result.track.path),
+                    track_path,
                     fingerprint,
                     utc_now(),
                     result.status,
@@ -502,6 +506,45 @@ class State:
                     src_set,
                 ),
             )
+            self._drop_replaced(self.lyr_root, conn, track_path, previous, saved)
+
+    @staticmethod
+    def _drop_replaced(
+        root: Path,
+        conn: sqlite3.Connection,
+        track_path: str,
+        previous: Any,
+        saved: dict[str, str],
+    ) -> None:
+        """Delete the files of the ID this track used to point at.
+
+        The name carries the ID, so switching sources (or re-matching to
+        another upload of the same song) leaves the old ``[qq:…]`` files
+        untouched by any later overwrite; ``clean --lyr`` would only get to
+        them after a month.  Only names no other plan row still points at are
+        removed — two copies of one album song are two rows and one store.
+        """
+        if not saved or previous is None:
+            return
+        old = str(previous["native_path"] or "")
+        if not old:
+            return
+        old_stem = Path(old).stem
+        if old_stem in {Path(name).stem for name in saved.values()}:
+            return
+        keep = {
+            str(row["native_path"])
+            for row in conn.execute(
+                "SELECT native_path FROM plans WHERE path<>?", (track_path,)
+            )
+            if row["native_path"]
+        }
+        # A whole stem, not just the referenced file: the row that still points
+        # at `[ne:7]` should keep its converted `.lrc` too, or apply would have
+        # to rebuild it from the native text every time.
+        if old_stem in {Path(name).stem for name in keep}:
+            return
+        store.drop_stem(root, old_stem, keep)
 
     def set_plan_status(self, path: str, status: str, reason: str = "") -> None:
         with self.connection() as conn:

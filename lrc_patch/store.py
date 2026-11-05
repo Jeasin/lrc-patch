@@ -97,9 +97,26 @@ def save(
     return written
 
 
+def drop_stem(root: Path, stem: str, keep: set[str] | None = None) -> None:
+    """Delete every stored format of one song, except the names in ``keep``.
+
+    Used when a track switches to another source ID: the old ``[qq:…]`` files
+    are another song as far as the store is concerned, so nothing else would
+    ever overwrite them.  The ID is part of the name, which is what makes this
+    exact — no guessing from artist/title, no chance of hitting a neighbour.
+    """
+    if not stem:
+        return
+    _drop_stale(Path(root), stem, set(keep or ()))
+
+
 def _drop_stale(root: Path, stem: str, keep: set[str]) -> None:
     prefix = f"{stem}."
-    for sibling in root.iterdir():
+    try:
+        siblings = list(root.iterdir())
+    except OSError:
+        return
+    for sibling in siblings:
         if sibling.name in keep or not sibling.name.startswith(prefix):
             continue
         if sibling.is_file():
