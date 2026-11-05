@@ -48,6 +48,7 @@
 - **双源 + 可换源**：默认先问网易云（`ne`），缺的再问 QQ（`qq`）；`lrclib` 需要显式 `--src lrclib`。
 - **打分而不是模糊搜索**：满分 100，≥85 且时长在容差内才自动写入，其余一律 `!` 等你确认。
 - **原生格式流水线**：取词时把源的原生歌词（YRC / QRC）一起存下，`apply --a2` / `--eslrc` / `--ttml` / `--qrc` 只是本地转换，**换格式不用重新联网**。
+- **导出是另外一条路**：`output` 只写歌词文件、不碰音频，一次可给多个格式（`--yrc --lrc --ttml`），默认就是源的原生格式。
 - **原子写入**：写临时副本 → 回读校验（歌词 / 其他标签 / 封面 / 音频数据逐项比对）→ `os.replace` 替换，失败则原文件一个字节都不变。
 - **断点续跑**：结论存在 SQLite 状态库里，1000 首中断后重跑只查没结论的那些。
 - **离线可重复**：HTTP 响应按稳定键缓存 30 天，同一首歌不会每跑一次就骚扰一次接口。
@@ -103,7 +104,7 @@ lrcpatch apply
   查询 4/4 · 0.6 首/秒
 
   ▸ 米津玄師/STRAY SHEEP   2 首  ✓2
-    ├─ ✓ 01 Lemon.m4a   ne  100分  Δ0.1s  LRC 45 行  米津玄師  STRAY SHEEP；原生 YRC（逐字，apply --yrc 可取）
+    ├─ ✓ 01 Lemon.m4a   ne  100分  Δ0.1s  YRC/LRC 45 行  米津玄師  STRAY SHEEP
     └─ ✓ 02 馬と鹿.m4a  ne  100分  Δ0.3s  LRC 51 行  米津玄師  STRAY SHEEP
 
   ▸ YOASOBI/THE BOOK   2 首  ✓2
@@ -151,6 +152,7 @@ lrcpatch apply
 | `plan` | 查询候选、打分、生成计划（默认命令） | 否 |
 | `candidates` | 列出候选 `SOURCE:ID` 与分数，供 `--pick` 用 | 否 |
 | `apply` | 写入 ✓ 可写入的曲目，逐文件校验后原子替换 | 是 |
+| `output` | 按 `SOURCE:ID` 导出歌词文件，可一次导多种格式 | 否 |
 | `verify` | 复核已写入的歌词、标签、封面与音频数据 | 否 |
 | `rollback` | 还原本工具写入的歌词（原歌词还在就还原，不在就移除） | 是 |
 | `status` | 预览状态库：计划分布、缓存、回滚记录与报告 | 否 |
@@ -169,7 +171,7 @@ lrcpatch apply
 --refresh           忽略 HTTP 缓存重新请求（只管网络）
 --force             忽略"已有歌词/已有计划"强制重排（只管现状）
 --pick SOURCE:ID    人工指定候选，可连写多个
---lrc / --lrc-dir   同时导出 .lrc 文件到目录
+--out DIR           output 的导出目录（默认 ~/.cache/lrc-patch/lyr）
 ```
 
 每个命令的完整说明：`lrcpatch plan -h`。
@@ -239,7 +241,7 @@ lrcpatch apply
 | QRC | QQ 音乐逐字 | `[1200,5000]逐(1200,300)字(1500,300)` |
 | TTML | Apple Music | `<p begin="00:00:12.340" end="00:00:15.000"><span …>逐</span><span …>字</span></p>` |
 
-`plan` 取词时会把源的原生歌词一起存进状态库，`plan` 与 `candidates` 的"原生"列标明源给的是什么：
+`plan` 取词时会把源的原生歌词一起存进状态库，`plan` 的格式列与 `candidates` 的"原生"列写的是**源给了哪些格式**：
 
 - 换成 `--a2` / `--eslrc` / `--ttml` / `--qrc` 是**本地转换**，不联网；
 - 换成原生格式本身则原样输出；
@@ -248,7 +250,9 @@ lrcpatch apply
 
 私有格式（`--yrc` / `--qrc`）只在原生就是它时才可能：YRC 只来自网易云，QRC 只来自 QQ。
 
-网易云到底给逐字 YRC 还是逐行 LRC，**要取一次词才知道**，而且同一批歌里两种都有（实测「Lemon」有 YRC，「春泥棒」只有 LRC）。所以 `candidates` 里没查过的那条显示 `?`——以前写 `YRC/LRC`，读起来像"这些歌词有逐字"，plan 一说 LRC 就像漏了什么。plan 过之后这里写实际格式；如果原生是逐字而你是按 LRC 写的，plan 那行会补一句「原生 YRC（逐字，apply --yrc 可取）」。默认仍写 LRC：多数播放器认它。
+一次请求常常同时带回两种：netease 的 `song/lyric` 既给逐字 YRC 也给逐行 LRC。所以这一列可以是集合——`YRC/LRC` 表示两种都有，`LRC` 表示只有逐行。至于某首歌到底给不给 YRC，**要取一次词才知道**（实测「Lemon」有 YRC，「春泥棒」只有 LRC），所以 `candidates` 里没取过词的那条显示 `?`：以前那列一律写 `YRC/LRC`，读起来像"这些歌词有逐字"，plan 一说 LRC 就像漏了什么。
+
+`apply` 默认仍写逐行 LRC（多数播放器认它）；要逐字就 `apply --yrc` / `--qrc`，那是本地转换，不重新联网。
 
 ### 转换时会丢什么
 
@@ -367,10 +371,12 @@ lrcpatch plan --a2 "Ado"        # 计划里就按 A2 生成
 lrcpatch apply --eslrc          # 或者计划之后再换格式，不重新联网
 ```
 
-**只想导出 .lrc，不动音频**
+**只想导出歌词文件，不动音频**
 
 ```bash
-lrcpatch plan --lrc --lrc-dir ~/Desktop/lyrics "米津玄師"
+lrcpatch output ne:1815109506 --out ~/Desktop/lyrics          # 源的原生格式（YRC）
+lrcpatch output ne:1815109506 --lrc --a2 --ttml               # 一次导三种
+lrcpatch candidates "米津玄師" --top 5                         # 不知道 ID 就先看候选
 ```
 
 **纯音乐被 `!` 挡住，但我就是想写**
@@ -400,7 +406,7 @@ workers = 4
 |---|---|
 | 状态库（计划 / journal / HTTP 缓存） | `~/.local/state/lrc-patch/lyrics.sqlite3` |
 | CSV 报告与 HTML 复核页 | 同上目录下的 `reports/` |
-| `--lrc` 导出镜像 | `~/.cache/lrc-patch/lrc/` |
+| `output` 导出的歌词 | `~/.cache/lrc-patch/lyr/`（`--out` 可改） |
 
 `clean` 像 `brew cleanup`：默认只清过期缓存与 30 天前的报告，逐类说明删了几项、释放多少；`clean --all` 才不限天数。计划状态与回滚记录只在明确指定 `--plans` / `--journal` / `--all` 时删除——删了就要重查，且无法回滚。
 
@@ -463,7 +469,7 @@ lrc_patch/
   qrc.py            # QQ QRC 解密（3DES + zlib）
   state.py          # SQLite 状态库
   render.py         # 终端表格与对齐
-tests/test_core.py  # 178 个用例，覆盖解析、格式转换往返、打分、写入、回滚与 CLI
+tests/test_core.py  # 195 个用例，覆盖解析、格式转换往返、打分、写入、回滚与 CLI
 ```
 
 CI 在 Python 3.9 / 3.11 / 3.13 上跑同一套测试。

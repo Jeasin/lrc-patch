@@ -10,6 +10,7 @@ from .cli_args import (
     build_parser,
     main_help,
     normalize_argv,
+    option_owners,
     option_specs,
     reject_unknown_options,
 )
@@ -63,7 +64,7 @@ def main() -> int:
     parser = build_parser(config)
     specs = option_specs(parser)
     command, options, paths = normalize_argv(argv, specs)
-    reject_unknown_options(options, specs)
+    reject_unknown_options(options, specs, command, option_owners(parser))
     normalized = [command or "plan", *options]
     if paths:
         normalized.extend(["--", *paths])
@@ -84,17 +85,32 @@ def main() -> int:
             f"未知歌词源: {', '.join(sorted(unknown))}（可用 ne / qq / lrclib）"
         )
     # Exactly one verbatim-format flag may be set (argparse enforces this);
-    # fold it into a single target-format string for the sources.
-    target = next(
-        (name for name in ("a2", "eslrc", "yrc", "qrc", "ttml") if getattr(args, name, False)),
-        None,
-    )
-    args.target_format = target
+    # fold it into a single target-format string for the sources.  `output` is
+    # the exception: it writes files, so several formats in one run is the
+    # point — it keeps them as a list and converts locally.
+    target = None
+    if args.command == "output":
+        args.formats = [
+            name
+            for name in ("lrc", "a2", "eslrc", "yrc", "qrc", "ttml")
+            if getattr(args, name, False)
+        ]
+        args.target_format = None
+    else:
+        target = next(
+            (
+                name
+                for name in ("a2", "eslrc", "yrc", "qrc", "ttml")
+                if getattr(args, name, False)
+            ),
+            None,
+        )
+        args.target_format = target
     # Private formats are native to exactly one source; refuse a source list
     # that cannot produce them instead of silently downgrading.  apply does not
     # query anything — it converts from the plan's native lyric — so the check
     # only applies when sources are actually asked (or a --pick chains a plan).
-    asks_network = args.command in {"plan", "candidates"} or bool(
+    asks_network = args.command in {"plan", "candidates", "output"} or bool(
         getattr(args, "pick", None) or getattr(args, "pick_file", None)
     )
     if asks_network and target == "qrc" and "qq" not in args.src:
@@ -138,6 +154,8 @@ def main() -> int:
             return code
         if args.command == "candidates":
             return commands.cmd_candidates(args, state, state_dir)
+        if args.command == "output":
+            return commands.cmd_output(args, state, state_dir)
         if args.command == "apply":
             if getattr(args, "pick", None) or getattr(args, "pick_file", None):
                 # "write these ones" — plan the explicit picks first (a pick is

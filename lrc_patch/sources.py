@@ -42,7 +42,13 @@ from .matching import score_candidate
 from .models import Candidate, FetchResult, Track
 from .qrc import qrc_decrypt, qrc_lyric_text
 from .state import State
-from .text import TIMESTAMP_RE, is_placeholder, sanitize_lyrics, sha256_text
+from .text import (
+    TIMESTAMP_RE,
+    is_placeholder,
+    lyric_kind,
+    sanitize_lyrics,
+    sha256_text,
+)
 
 
 class _Retryable(Exception):
@@ -628,7 +634,13 @@ class NeteaseSource:
         if not yrc_text and not lrc_text:
             instrumental = bool(data.get("nolyric") or data.get("pureMusic"))
             return FetchResult(instrumental=instrumental, note="无可用歌词")
-        native_kind = "yrc" if yrc_text else "lrc"
+        # Record *both* forms when both came back: the same request answered
+        # with a word-timed YRC and a line-timed LRC, and "which one is it" is
+        # then a set, not a single format.
+        native_kinds = tuple(
+            kind for kind, text in (("yrc", yrc_text), ("lrc", lrc_text)) if text
+        )
+        native_kind = native_kinds[0]
         native = yrc_text or lrc_text
         note = ""
         if self.target_format in (None, "lrc"):
@@ -645,6 +657,7 @@ class NeteaseSource:
             note=note,
             native_lyrics=native,
             native_kind=native_kind,
+            native_kinds=native_kinds,
         )
 
 
@@ -706,8 +719,15 @@ class LrclibSource:
     def fetch(self, candidate: Candidate) -> FetchResult:
         if candidate.instrumental:
             return FetchResult(instrumental=True, note="纯音乐")
-        if candidate.lyrics and not is_placeholder(candidate.lyrics):
-            return FetchResult(lyrics=candidate.lyrics)
+        text = candidate.lyrics
+        if text and not is_placeholder(text):
+            kind = lyric_kind(text)
+            return FetchResult(
+                lyrics=text,
+                native_lyrics=text,
+                native_kind=kind,
+                native_kinds=(kind,),
+            )
         return FetchResult(note="无可用歌词")
 
 
@@ -960,6 +980,7 @@ class QqSource:
             note=note,
             native_lyrics=native,
             native_kind=native_kind,
+            native_kinds=(native_kind,),
         )
 
     def fetch_plain(self, candidate: Candidate) -> FetchResult:

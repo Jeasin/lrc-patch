@@ -17,6 +17,7 @@ from lrc_patch.audio import lrc_dest
 from lrc_patch.cli_args import (
     build_parser,
     normalize_argv,
+    option_owners,
     option_specs,
     reject_unknown_options,
 )
@@ -59,6 +60,8 @@ from lrc_patch.models import Candidate, FetchResult, PlanResult, Track, TreeEntr
 from lrc_patch.state import State, read_plan_cache, read_state_summary, row_get
 from lrc_patch.text import (
     album_points,
+    kind_set,
+    kind_set_label,
     artist_parts,
     enhanced_to_line_lrc,
     lrc_timestamp_issue,
@@ -953,7 +956,7 @@ class ScanListTests(unittest.TestCase):
         buffer = io.StringIO()
         with redirect_stdout(buffer):
             render.print_scan_list(
-                [track], Path("/lib"), 0, {str(track.path): ("qq", 100, "ready")}
+                [track], Path("/lib"), 0, {str(track.path): ("qq", 100, "ready", "qrc")}
             )
         out = render.strip_ansi(buffer.getvalue())
         self.assertIn("无歌词", out)
@@ -969,7 +972,7 @@ class ScanListTests(unittest.TestCase):
         buffer = io.StringIO()
         with redirect_stdout(buffer):
             render.print_scan_list(
-                [track], Path("/lib"), 0, {str(track.path): ("qq", 100, "ready")}
+                [track], Path("/lib"), 0, {str(track.path): ("qq", 100, "ready", "qrc")}
             )
         out = render.strip_ansi(buffer.getvalue())
         self.assertIn("LRC 1 行", out)
@@ -2415,13 +2418,23 @@ class PlanRowFieldsTests(unittest.TestCase):
         self.assertEqual(cells[4], "ヨルシカ")
         self.assertIn("写入并校验成功", note)
 
-    def test_word_timing_upstream_names_the_flag_that_keeps_it(self) -> None:
-        cells, note = render.plan_fields(self._row(native_kind="yrc"))
-        self.assertIn("LRC", cells[3])
-        self.assertIn("原生 YRC", note)
-        self.assertIn("apply --yrc", note)
+    def test_the_lyric_column_is_the_set_the_provider_serves(self) -> None:
+        # netease answers one request with YRC *and* LRC; printing "LRC 63 行"
+        # plus a trailing "原生 YRC（逐字…）" said it twice and made the table
+        # read like two different facts (feedback 20261105-1947).
+        cells, note = render.plan_fields(self._row(native_kinds="yrc,lrc"))
+        self.assertEqual(cells[3], "YRC/LRC 63 行")
+        self.assertNotIn("原生", note)
 
-    def test_the_native_notice_is_not_repeated(self) -> None:
+    def test_one_served_format_needs_no_slash(self) -> None:
+        cells, _ = render.plan_fields(self._row(native_kinds="qrc"))
+        self.assertEqual(cells[3], "QRC 63 行")
+
+    def test_an_old_row_falls_back_to_its_single_native_kind(self) -> None:
+        cells, _ = render.plan_fields(self._row(native_kind="yrc"))
+        self.assertEqual(cells[3], "YRC 63 行")
+
+    def test_the_kana_notice_survives_once(self) -> None:
         reason = (
             "ヨルシカ；注音（kana）1 行放不进 LRC，已丢弃；"
             "原生 QRC 仍在状态库，apply --qrc 可取回"
@@ -2457,6 +2470,10 @@ class CandidatesNativeKindTests(unittest.TestCase):
         rows = self._rows(make_track(), {("netease", "1810759765"): "yrc"})
         self.assertEqual(rows[0].kind, "YRC")
 
+    def test_a_previous_plan_can_name_more_than_one_format(self) -> None:
+        rows = self._rows(make_track(), {("netease", "1810759765"): "yrc,lrc"})
+        self.assertEqual(rows[0].kind, "YRC/LRC")
+
     def test_known_native_kinds_reads_the_plan_table(self) -> None:
         track = make_track()
         state_dir = Path(tempfile.mkdtemp())
@@ -2483,7 +2500,7 @@ class CandidatesNativeKindTests(unittest.TestCase):
             track.fingerprint(),
         )
         self.assertEqual(
-            commands.known_native_kinds(state_dir), {("netease", "42"): "yrc"}
+            commands.known_native_sets(state_dir), {("netease", "42"): "yrc"}
         )
 
 
@@ -2514,6 +2531,236 @@ class CandidatesCommandTests(unittest.TestCase):
                     code = commands.cmd_candidates(args, state, state_dir)
         self.assertEqual(code, 0)
         self.assertIn("共 1 首", render.strip_ansi(buffer.getvalue()))
+
+
+class KindSetTests(unittest.TestCase):
+    """A provider can serve two formats in one answer; say so, in order."""
+
+    def test_the_order_is_most_detailed_first(self) -> None:
+        self.assertEqual(kind_set("lrc,yrc"), ("yrc", "lrc"))
+        self.assertEqual(kind_set_label("lrc,yrc"), "YRC/LRC")
+
+    def test_tuples_and_nothing_are_both_accepted(self) -> None:
+        self.assertEqual(kind_set(("qrc",)), ("qrc",))
+        self.assertEqual(kind_set(""), ())
+        self.assertEqual(kind_set(None), ())
+
+    def test_duplicates_collapse(self) -> None:
+        self.assertEqual(kind_set_label("yrc,yrc,lrc"), "YRC/LRC")
+
+    def test_a_served_set_reaches_the_plan_table(self) -> None:
+        self.assertEqual(kind_set_label(kind_set("yrc,lrc")), "YRC/LRC")
+
+
+class _OutputSource:
+    """A source that answers from memory: one netease id, one bare one."""
+
+    name = "netease"
+    min_interval = 0.0
+
+    def __init__(self, kinds: tuple[str, ...]) -> None:
+        self.kinds = kinds
+        self.fetches = 0
+
+    def lookup(self, ids: list[str]) -> list[Candidate]:
+        return [
+            Candidate(
+                source="netease",
+                source_id=str(item),
+                title="春泥棒",
+                artists=["ヨルシカ"],
+                album="創作",
+                duration=290.0,
+            )
+            for item in ids
+        ]
+
+    def fetch(self, candidate: Candidate) -> FetchResult:
+        self.fetches += 1
+        if "yrc" in self.kinds:
+            return FetchResult(
+                lyrics="[1000,2000](1000,200,0)あ(1200,300,0)い\n",
+                native_lyrics="[1000,2000](1000,200,0)あ(1200,300,0)い\n",
+                native_kind="yrc",
+                native_kinds=self.kinds,
+            )
+        return FetchResult(
+            lyrics="[00:00.00]あ\n",
+            native_lyrics="[00:00.00]あ\n",
+            native_kind="lrc",
+            native_kinds=self.kinds,
+        )
+
+
+class OutputCommandTests(unittest.TestCase):
+    """`output` writes files and nothing else; apply writes the audio."""
+
+    def _run(self, source, argv: list[str], state_dir: Path) -> str:
+        args = build_parser().parse_args(["output", *argv])
+        args.formats = [
+            name
+            for name in ("lrc", "a2", "eslrc", "yrc", "qrc", "ttml")
+            if getattr(args, name, False)
+        ]
+        args.path = list(args.paths)
+        state = State(state_dir / "lyrics.sqlite3")
+        buffer = io.StringIO()
+        with mock.patch.object(commands, "build_sources", return_value=[source]):
+            with redirect_stdout(buffer):
+                commands.cmd_output(args, state, state_dir)
+        return render.strip_ansi(buffer.getvalue())
+
+    def test_no_format_flag_means_the_native_text(self) -> None:
+        out_dir = Path(tempfile.mkdtemp())
+        out = self._run(
+            _OutputSource(("yrc", "lrc")),
+            ["ne:1", "--out", str(out_dir)],
+            Path(tempfile.mkdtemp()),
+        )
+        self.assertIn("YRC", out)
+        written = list(out_dir.iterdir())
+        self.assertEqual([path.suffix for path in written], [".yrc"])
+        self.assertIn("[ne:1]", written[0].name)
+
+    def test_several_formats_are_written_at_once(self) -> None:
+        out_dir = Path(tempfile.mkdtemp())
+        self._run(
+            _OutputSource(("yrc", "lrc")),
+            ["ne:1", "--lrc", "--a2", "--ttml", "--out", str(out_dir)],
+            Path(tempfile.mkdtemp()),
+        )
+        self.assertEqual(
+            sorted(path.suffix for path in out_dir.iterdir()),
+            [".alrc", ".lrc", ".ttml"],
+        )
+
+    def test_a_private_format_is_refused_instead_of_faked(self) -> None:
+        # ne:1 only has LRC; asking for QRC must not write an .qrc full of LRC.
+        out_dir = Path(tempfile.mkdtemp())
+        out = self._run(
+            _OutputSource(("lrc",)),
+            ["ne:1", "--qrc", "--out", str(out_dir)],
+            Path(tempfile.mkdtemp()),
+        )
+        self.assertIn("只能由源原样提供", out)
+        self.assertEqual(list(out_dir.iterdir()), [])
+
+    def test_an_existing_file_is_skipped_until_forced(self) -> None:
+        out_dir = Path(tempfile.mkdtemp())
+        state_dir = Path(tempfile.mkdtemp())
+        source = _OutputSource(("yrc", "lrc"))
+        self._run(source, ["ne:1", "--out", str(out_dir)], state_dir)
+        out = self._run(source, ["ne:1", "--out", str(out_dir)], state_dir)
+        self.assertIn("已存在", out)
+
+    def test_a_planned_id_never_touches_the_network(self) -> None:
+        track = make_track()
+        state_dir = Path(tempfile.mkdtemp())
+        state = State(state_dir / "lyrics.sqlite3")
+        state.upsert_plan(
+            PlanResult(
+                track,
+                "ready",
+                "ヨルシカ",
+                Candidate(
+                    source="netease",
+                    source_id="9",
+                    title="春泥棒",
+                    artists=["ヨルシカ"],
+                    album="創作",
+                    duration=290.0,
+                ),
+                lyrics="[00:00.00]あ",
+                score=100,
+                duration_diff=0.0,
+                native_lyrics="[1000,2000](1000,200,0)あ",
+                native_kind="yrc",
+                native_kinds=("yrc", "lrc"),
+            ),
+            track.fingerprint(),
+        )
+        out_dir = Path(tempfile.mkdtemp())
+        source = _OutputSource(("yrc", "lrc"))
+        out = self._run(source, ["ne:9", "--out", str(out_dir)], state_dir)
+        self.assertEqual(source.fetches, 0)
+        self.assertIn("状态库", out)
+        self.assertIn("YRC/LRC", out)
+
+    def test_the_served_lrc_is_exported_instead_of_a_flattening(self) -> None:
+        # netease ships a hand-written LRC next to the YRC; flattening the YRC
+        # gives a slightly different file than the one apply would write.
+        track = make_track()
+        state_dir = Path(tempfile.mkdtemp())
+        state = State(state_dir / "lyrics.sqlite3")
+        state.upsert_plan(
+            PlanResult(
+                track,
+                "ready",
+                "ヨルシカ",
+                Candidate(
+                    source="netease",
+                    source_id="9",
+                    title="春泥棒",
+                    artists=["ヨルシカ"],
+                    album="創作",
+                    duration=290.0,
+                ),
+                lyrics="[00:00.00]源给的逐行\n",
+                score=100,
+                duration_diff=0.0,
+                native_lyrics="[1000,2000](1000,200,0)あ",
+                native_kind="yrc",
+                native_kinds=("yrc", "lrc"),
+            ),
+            track.fingerprint(),
+        )
+        out_dir = Path(tempfile.mkdtemp())
+        self._run(
+            _OutputSource(("yrc", "lrc")), ["ne:9", "--lrc", "--out", str(out_dir)],
+            state_dir,
+        )
+        written = next(out_dir.iterdir())
+        self.assertEqual(written.read_text(encoding="utf-8"), "[00:00.00]源给的逐行\n")
+
+    def test_a_bare_id_means_netease(self) -> None:
+        out_dir = Path(tempfile.mkdtemp())
+        self._run(
+            _OutputSource(("lrc",)), ["42", "--out", str(out_dir)],
+            Path(tempfile.mkdtemp()),
+        )
+        self.assertEqual(
+            [path.name for path in out_dir.iterdir()],
+            ["ヨルシカ - 春泥棒 [ne:42].lrc"],
+        )
+
+    def test_a_track_path_is_rejected_with_the_way_out(self) -> None:
+        args = build_parser().parse_args(["output", "A/01.m4a"])
+        args.path = list(args.paths)
+        args.formats = []
+        state = State(Path(tempfile.mkdtemp()) / "lyrics.sqlite3")
+        with self.assertRaises(ToolError) as caught:
+            commands.cmd_output(args, state, Path(tempfile.mkdtemp()))
+        self.assertIn("candidates", str(caught.exception))
+
+
+class WrongCommandOptionTests(unittest.TestCase):
+    def test_a_flag_from_another_command_is_named(self) -> None:
+        parser = build_parser()
+        specs = option_specs(parser)
+        with self.assertRaises(ToolError) as caught:
+            reject_unknown_options(
+                ["--tsv"], specs, "plan", option_owners(parser)
+            )
+        self.assertIn("candidates", str(caught.exception))
+
+    def test_the_removed_export_flag_points_at_output(self) -> None:
+        parser = build_parser()
+        specs = option_specs(parser)
+        with self.assertRaises(ToolError) as caught:
+            reject_unknown_options(
+                ["--lrc-dir"], specs, "apply", option_owners(parser)
+            )
+        self.assertIn("output", str(caught.exception))
 
 
 if __name__ == "__main__":

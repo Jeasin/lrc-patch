@@ -24,7 +24,6 @@ from .audio import (
     audio_hash,
     clear_lyrics_only,
     cover_hash,
-    export_lrc,
     load_tracks,
     non_lyrics_tags_hash,
     preflight_apply,
@@ -36,7 +35,8 @@ from .config import (
     DEFAULT_DURATION_TOLERANCE,
     DEFAULT_LIBRARY,
     DEFAULT_SOURCES,
-    default_lrc_dir,
+    canonical_source,
+    default_lyr_dir,
     load_config,
     source_label,
     write_config_template,
@@ -54,11 +54,13 @@ from .matching import (
 from .models import Candidate, PlanResult, Track, TreeEntry
 from .paths import resolve_selection, selection_matches
 from .render import (
+    LYRIC_COLORS,
     ProgressLine,
     default_report_path,
     disp_width,
     format_diff,
     format_duration,
+    format_size,
     pad_display,
     plan_fields,
     plan_html_path,
@@ -81,7 +83,17 @@ from .render import (
 from .sorting import name_key, path_key, sort_paths
 from .sources import JsonClient, build_sources
 from .state import State, read_plan_cache, read_state_summary, row_get
-from .text import lyric_hash, lyric_kind, lyric_tag, match_notes, sanitize_lyrics
+from .text import (
+    kind_set,
+    kind_set_label,
+    lyric_hash,
+    lyric_kind,
+    lyric_tag,
+    lyrics_line_count,
+    match_notes,
+    sanitize_lyrics,
+    write_text_atomic,
+)
 
 
 def summarize_plans(rows: list[sqlite3.Row]) -> Counter:
@@ -149,7 +161,7 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
 
     # Only plans that still describe this exact file count; a changed file
     # means the cached verdict is stale even if the row is still there.
-    cached: dict[str, tuple[str, int, str]] = {}
+    cached: dict[str, tuple[str, int, str, str]] = {}
     ready_cached = 0
     review_cached = 0
     overwrite_cached = 0
@@ -162,6 +174,7 @@ def cmd_scan(args: argparse.Namespace, state_dir: Path) -> int:
             source_label(str(row["source"] or "")),
             int(row["score"] or 0),
             str(row["status"]),
+            str(row_get(row, "native_kinds", "") or row_get(row, "native_kind", "") or ""),
         )
         if row["status"] == "ready":
             if track.has_lyrics:
@@ -950,22 +963,24 @@ class CandRow:
         return self.ident
 
 
-def known_native_kinds(state_dir: Path) -> dict[tuple[str, str], str]:
-    """``(source, source_id) -> native format``, learned from earlier plans.
+def known_native_sets(state_dir: Path) -> dict[tuple[str, str], str]:
+    """``(source, source_id) -> served formats``, learned from earlier plans.
 
-    netease only decides between YRC and line-timed LRC when the lyric is
-    fetched, so the candidate table cannot know before then.  A previous plan
-    for the same song already recorded what came back, though — and repeating
-    the guess after the answer is on disk is how "YRC/LRC" started reading like
-    a promise.
+    netease only says what it has when the lyric is fetched — a word-timed YRC,
+    a line-timed LRC, or both in the same answer — so the candidate table
+    cannot know before then.  A previous plan for the same song already
+    recorded what came back, though, and repeating a guess after the answer is
+    on disk is how "YRC/LRC" started reading like a promise.
     """
     out: dict[tuple[str, str], str] = {}
     for row in read_plan_cache(state_dir / "lyrics.sqlite3").values():
         source = str(row_get(row, "source", "") or "")
         source_id = str(row_get(row, "source_id", "") or "")
-        kind = str(row_get(row, "native_kind", "") or "")
-        if source and source_id and kind:
-            out.setdefault((source, source_id), kind)
+        kinds = str(
+            row_get(row, "native_kinds", "") or row_get(row, "native_kind", "") or ""
+        )
+        if source and source_id and kinds:
+            out.setdefault((source, source_id), kinds)
     return out
 
 
@@ -1039,7 +1054,7 @@ def candidate_rows(
                 known_kind = (known or {}).get(
                     (candidate.source, candidate.source_id), ""
                 )
-                kind = lyric_tag(known_kind) if known_kind else "?"
+                kind = kind_set_label(known_kind) if known_kind else "?"
             else:
                 kind = lyric_tag(candidate.native_kind or "lrc")
             notes = match_notes(track, candidate, args.duration_tolerance)
@@ -1401,7 +1416,7 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
                 live.update(f"查询 {done}/{len(wanted)}  ·  {rate:.1f} 首/秒")
     live.close()
 
-    known = known_native_kinds(state_dir)
+    known = known_native_sets(state_dir)
     rows_by_track: dict[str, list[CandRow]] = {
         str(track.path): candidate_rows(track, results[str(track.path)], args, known)
         for track in wanted
@@ -1473,8 +1488,8 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         print_meta(
             "原生",
             style(
-                "? = 还没取过这个词；网易云可能给逐字 YRC，也可能只有逐行 LRC，"
-                "plan 一次之后这里就写实际格式",
+                "? = 这一条只是搜索结果，还没取词（不联网就不知道）；"
+                "plan 或 output 取过之后，这里写真实格式（可能 YRC，可能只有 LRC）",
                 "90",
             ),
         )
@@ -1509,6 +1524,311 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         )
     print()
     return 0
+
+OUTPUT_FORMATS = ("lrc", "a2", "eslrc", "yrc", "qrc", "ttml")
+
+# Same taxonomy as the embedded lyric: the extension is how the next tool
+# knows a word-timed file from a line-timed one.
+OUTPUT_SUFFIX = {
+    "lrc": ".lrc",
+    "a2": ".alrc",
+    "eslrc": ".eslrc",
+    "yrc": ".yrc",
+    "qrc": ".qrc",
+    "ttml": ".ttml",
+    "plain": ".txt",
+}
+
+# ":" is legal on POSIX and is how an ID is written everywhere else in the
+# tool, so it stays in the filename; Windows has to lose it.
+_BAD_NAME_CHARS = '<>":/\\|?*' if os.name == "nt" else '<>/\\|?*'
+_AUDIO_SUFFIXES = (".m4a", ".mp3", ".dsf", ".flac", ".ogg", ".wav", ".aiff")
+
+
+def output_name(artist: str, title: str, ident: str) -> str:
+    """``歌手 - 标题 [ne:123]``, safe on every filesystem.
+
+    The ID stays in the name because ``output`` addresses songs by ID, and two
+    uploads of the same song (a single and an album cut) would otherwise land
+    on the same file.
+    """
+    head = " - ".join(part for part in (artist.strip(), title.strip()) if part)
+    stem = f"{head} [{ident}]" if head else f"[{ident}]"
+    cleaned = "".join(
+        "_" if char in _BAD_NAME_CHARS or ord(char) < 0x20 else char for char in stem
+    )
+    return " ".join(cleaned.split())
+
+
+@dataclass
+class OutputJob:
+    """One ``SOURCE:ID`` resolved to text, before any format is chosen."""
+
+    source: str
+    source_id: str
+    ident: str
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    native: str = ""
+    native_kind: str = ""
+    native_kinds: tuple[str, ...] = ()
+    # Text we already hold for a given format, other than the native one.  A
+    # netease answer carries a YRC *and* a hand-written LRC; flattening the YRC
+    # would produce a slightly different file from the one `apply` writes, so
+    # the served LRC is exported as-is when it is the format asked for.
+    texts: dict[str, str] = field(default_factory=dict)
+    origin: str = ""  # 状态库 / 取词
+    error: str = ""
+
+
+def resolve_output_id(
+    state: State, sources: dict[str, Any], source: str, source_id: str
+) -> OutputJob:
+    """Prefer the native lyric already in the state database, then the network."""
+    job = OutputJob(source=source, source_id=source_id, ident=f"{source_label(source)}:{source_id}")
+    row = state.find_native(source, source_id)
+    if row is not None:
+        job.native = str(row_get(row, "native_lyric", "") or "")
+        job.native_kind = str(row_get(row, "native_kind", "") or "")
+        job.native_kinds = kind_set(
+            row_get(row, "native_kinds", "") or job.native_kind
+        )
+        job.title = str(row_get(row, "match_title", "") or "")
+        job.artist = str(row_get(row, "match_artist", "") or "")
+        job.album = str(row_get(row, "match_album", "") or "")
+        job.origin = "状态库"
+        if job.native:
+            stored = str(row_get(row, "lyric", "") or "")
+            stored_kind = str(row_get(row, "lyric_kind", "") or "")
+            if stored and stored_kind:
+                job.texts.setdefault(stored_kind, stored)
+            return job
+
+    provider = sources.get(source)
+    if provider is None or source == "lrclib":
+        # LRCLIB indexes songs by name and artist, not by ID: there is nothing
+        # to ask it once all you have is an ID.
+        job.error = f"{source_label(source)} 没有按 ID 取词的接口，请用 ne / qq 的 ID"
+        return job
+    candidate = None
+    try:
+        found = provider.lookup([source_id])
+    except Exception as exc:  # a detail request must not kill the export
+        found = []
+        job.error = ""
+        detail_error = exc
+    else:
+        detail_error = None
+    candidate = next(
+        (item for item in found if str(item.source_id) == str(source_id)), None
+    )
+    if candidate is None:
+        if source != "netease":
+            job.error = (
+                f"查不到 {job.ident} 的标题/专辑"
+                + (f"（{type(detail_error).__name__}: {detail_error}）" if detail_error else "")
+                + "；这个源取词需要它们"
+            )
+            return job
+        # netease takes the lyric request by ID alone; metadata is only a label.
+        candidate = Candidate(
+            source=source, source_id=source_id, title="", artists=[], album="", duration=0.0
+        )
+    try:
+        fetched = provider.fetch(candidate)
+    except Exception as exc:
+        job.error = f"取词失败 {type(exc).__name__}: {exc}"
+        return job
+    if fetched.instrumental:
+        job.error = "标记为纯音乐"
+        return job
+    if not fetched.native_lyrics:
+        job.error = fetched.note or "无可用歌词"
+        return job
+    job.native = fetched.native_lyrics
+    job.native_kind = fetched.native_kind
+    rendered_kind = lyric_kind(fetched.lyrics)
+    if fetched.lyrics and rendered_kind:
+        job.texts.setdefault(rendered_kind, fetched.lyrics)
+    job.native_kinds = kind_set(fetched.native_kinds or fetched.native_kind)
+    job.title = job.title or candidate.title
+    job.artist = job.artist or candidate.artist_text
+    job.album = job.album or candidate.album
+    job.origin = "取词"
+    return job
+
+
+def cmd_output(args: argparse.Namespace, state: State, state_dir: Path) -> int:
+    """Export lyric files for ``SOURCE:ID`` — several formats at once.
+
+    ``apply`` writes *one* lyric into an audio file; this writes files and
+    nothing else, so ``--a2 --lrc --ttml`` in one run is a reasonable request
+    and the default is the provider's own text, unflattened.
+    """
+    idents: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for token in args.path:
+        text = str(token).strip()
+        if not text:
+            continue
+        looks_like_path = text.lower().endswith(_AUDIO_SUFFIXES) or os.sep in text
+        if looks_like_path:
+            raise ToolError(
+                f"output 只接受 SOURCE:ID（例如 ne:1815109506），不接文件路径：{text}\n"
+                "  想导出某首歌的候选 ID，先跑 lrcpatch candidates <路径>"
+            )
+        item = parse_pick(text)
+        if item in seen:
+            continue
+        seen.add(item)
+        idents.append(item)
+    if not idents:
+        raise ToolError(
+            "output 需要至少一个 SOURCE:ID，例如 lrcpatch output ne:1815109506 --lrc --a2"
+        )
+
+    formats = [
+        name for name in OUTPUT_FORMATS if getattr(args, name, False)
+    ] or ["native"]
+    out_dir = (getattr(args, "out", None) or default_lyr_dir()).expanduser()
+    overwrite = bool(getattr(args, "force", False))
+
+    client = JsonClient(
+        state,
+        refresh=getattr(args, "refresh", False),
+        impersonate=not getattr(args, "no_impersonate", False),
+    )
+    wanted_sources = [name for name in dict.fromkeys(source for source, _ in idents)]
+    sources = {
+        source.name: source
+        for source in build_sources(wanted_sources, client, None)
+    }
+
+    writing = "原生" if formats == ["native"] else " ".join(
+        lyric_tag(name) for name in formats
+    )
+    print_header(
+        "output",
+        f"{len(idents)} 个 ID  ·  {writing}  ·  {short_path(out_dir)}",
+    )
+
+    written = skipped = failed = 0
+    total_bytes = 0
+    for source, source_id in idents:
+        job = resolve_output_id(state, sources, source, source_id)
+        print(
+            "  "
+            + style("▸ ", "36")
+            + style(job.ident, "1;36")
+            + (style(f"   {job.title}", "1") if job.title else "")
+            + (style(f"   {job.artist}", "90") if job.artist else "")
+            + (style(f"   {job.origin}", "90") if job.origin else "")
+        )
+        if job.error:
+            failed += 1
+            print(style("     └─ ", "90") + style(f"✗ {job.error}", "1;31"))
+            print()
+            continue
+        served = kind_set_label(job.native_kinds) or lyric_tag(job.native_kind)
+        asked = [job.native_kind] if formats == ["native"] else formats
+        detail = f"格式  源提供 {served}"
+        if formats != ["native"]:
+            # When nothing was asked for, that line would just repeat itself.
+            detail += f"  ·  导出 {writing}"
+        print(style("     ├─ ", "90") + style(detail, "90"))
+        stem = output_name(job.artist, job.title, job.ident)
+        for position, target in enumerate(asked):
+            branch = "     └─ " if position == len(asked) - 1 else "     ├─ "
+            text, kind, note = render_output(job, target)
+            if text is None:
+                print(
+                    style(branch, "90")
+                    + style(f"{lyric_tag(target):<5}", "90")
+                    + style(note, "90")
+                )
+                skipped += 1
+                continue
+            path = out_dir / f"{stem}{OUTPUT_SUFFIX.get(kind, '.txt')}"
+            if path.exists() and not overwrite:
+                print(
+                    style(branch, "90")
+                    + style(f"{lyric_tag(kind):<5}", LYRIC_COLORS.get(kind, "32"))
+                    + style(f"{short_path(path)}  已存在（--force 覆盖）", "90")
+                )
+                skipped += 1
+                continue
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(path, text)
+            except OSError as exc:
+                failed += 1
+                print(
+                    style(branch, "90")
+                    + style(f"{lyric_tag(kind):<5}", "1;31")
+                    + style(f"写入失败 {exc}", "90")
+                )
+                continue
+            size = path.stat().st_size
+            total_bytes += size
+            written += 1
+            lines = lyrics_line_count(text)
+            print(
+                style(branch, "90")
+                + style(f"{lyric_tag(kind):<5}", LYRIC_COLORS.get(kind, "32"))
+                + style(f"{path.name}", "1")
+                + style(f"   {lines} 行 · {format_size(size)}", "90")
+            )
+        print()
+
+    print("  " + rule())
+    bits = [f"写入 {written} 个文件（{format_size(total_bytes)}）"]
+    if skipped:
+        bits.append(f"跳过 {skipped}")
+    if failed:
+        bits.append(f"失败 {failed}")
+    print_meta("导出", "  ·  ".join(bits))
+    print_meta("目录", short_path(out_dir))
+    line = network_line(client)
+    if line:
+        print_meta("请求", line)
+    elif client.cache_hits():
+        print_meta("网络", f"全部命中本地缓存（{client.cache_hits()} 次），未发起请求")
+    print()
+    return 0 if not failed else 1
+
+
+def render_output(
+    job: OutputJob, target: str
+) -> tuple[str | None, str, str]:
+    """``(text, kind, note)`` for one target; ``text`` is None when impossible."""
+    if target in ("native", job.native_kind):
+        return job.native, job.native_kind, ""
+    held = job.texts.get(target)
+    if held:
+        # Already the right shape: prefer it over re-deriving from the native.
+        return held, target, ""
+    if target in ("yrc", "qrc") and target not in job.native_kinds:
+        # Private containers cannot be re-encoded from someone else's text.
+        return (
+            None,
+            target,
+            f"{lyric_tag(target)} 只能由源原样提供；{job.ident} 给的是"
+            f" {kind_set_label(job.native_kinds) or lyric_tag(job.native_kind)}",
+        )
+    text, note = render_native(job.native, job.native_kind, target)
+    if note:
+        return None, target, note
+    kind = lyric_kind(text)
+    if kind != target:
+        # render_native fell back silently; do not save it under the wrong name.
+        return (
+            None,
+            target,
+            f"原生是 {lyric_tag(job.native_kind)}，转不出 {lyric_tag(target)}",
+        )
+    return text, kind, ""
+
 
 def select_plan_rows(
     state: State,

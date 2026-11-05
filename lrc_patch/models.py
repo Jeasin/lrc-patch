@@ -82,6 +82,10 @@ class FetchResult:
     # ``lyrics`` above is the *requested* target, converted from this.
     native_lyrics: str = ""
     native_kind: str = ""
+    # Everything the provider served for this one song, most detailed first:
+    # netease answers with a word-timed YRC *and* a line-timed LRC in the same
+    # response, so "which format is it" has more than one true answer.
+    native_kinds: tuple[str, ...] = ()
 
 @dataclass
 class PlanResult:
@@ -94,6 +98,9 @@ class PlanResult:
     duration_diff: float | None = None
     native_lyrics: str = ""
     native_kind: str = ""
+    # What the provider offered, e.g. ("yrc", "lrc"): the table shows the set,
+    # apply still writes one format.
+    native_kinds: tuple[str, ...] = ()
 
 @dataclass
 class TreeEntry:

@@ -19,7 +19,7 @@ import argparse
 import datetime as dt
 from pathlib import Path
 
-from .config import default_lrc_dir
+from .config import default_lyr_dir, legacy_lyr_dir
 from .errors import ToolError
 from .render import format_size, pad_display, print_header, print_meta, rule, short_path, style
 from .state import State
@@ -27,7 +27,7 @@ from .state import State
 TARGETS: dict[str, str] = {
     "http": "HTTP 缓存",
     "reports": "报告",
-    "lrc": "导出 LRC",
+    "lyr": "导出歌词",
     "picks": "pick 模板",
     "plans": "计划状态",
     "journal": "回滚记录",
@@ -36,7 +36,7 @@ TARGETS: dict[str, str] = {
 # What a bare ``lrcpatch clean`` may delete: regenerable, never the resume
 # state.  Reports and templates are the user's own review material, so they
 # only go once they are older than --days.
-DEFAULT_TARGETS = ("http", "reports", "lrc", "picks")
+DEFAULT_TARGETS = ("http", "reports", "lyr", "picks")
 
 _UNITS = {"http": "条", "plans": "条", "journal": "条"}
 
@@ -55,6 +55,11 @@ def _cutoff(days: int) -> float:
 def _iso_cutoff(days: int) -> str:
     moment = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     return moment.isoformat(timespec="seconds")
+
+
+def _roots(value: Path | list[Path]) -> list[Path]:
+    """One target may live in two places (the current and the legacy dir)."""
+    return list(value) if isinstance(value, list) else [value]
 
 
 def _clean_files(
@@ -108,12 +113,17 @@ def cmd_clean(args: argparse.Namespace, state: State, state_dir: Path) -> int:
     cutoff = None if everything else _cutoff(days)
     before_size = state.size()
 
-    lrc_dir = (getattr(args, "lrc_dir", None) or default_lrc_dir()).expanduser()
+    lyr_dir = (getattr(args, "out", None) or default_lyr_dir()).expanduser()
     paths = {
         "reports": state_dir / "reports",
-        "lrc": lrc_dir,
+        "lyr": lyr_dir,
         "picks": state_dir / "picks",
     }
+    # 2.14 and earlier exported into ``lrc-patch/lrc``; the folder may still
+    # hold files nobody will ever look at again.
+    legacy = legacy_lyr_dir()
+    if legacy != lyr_dir:
+        paths["lyr"] = [lyr_dir, legacy]
 
     print_header(
         "clean",
@@ -139,7 +149,11 @@ def cmd_clean(args: argparse.Namespace, state: State, state_dir: Path) -> int:
                 left = _left_http(state, expired_only)
                 tail = style(f"   保留 {left} 条", "90")
         elif name in paths:
-            count, size = _clean_files(paths[name], cutoff, dry_run)
+            count = size = 0
+            for root in _roots(paths[name]):
+                got, freed_bytes = _clean_files(root, cutoff, dry_run)
+                count += got
+                size += freed_bytes
             tail = ""
             if count:
                 tail = style(

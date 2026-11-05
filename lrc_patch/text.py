@@ -464,6 +464,34 @@ def lyric_tag(kind: str) -> str:
     return LYRIC_TAGS.get(kind, kind.upper())
 
 
+# A provider can serve more than one form of the same lyric in one answer:
+# netease returns both a word-timed YRC and a line-timed LRC, and says nothing
+# about which one the caller wants.  The order here is the order they are shown
+# in — most detailed first, so "YRC/LRC" reads as "逐字，同时也有逐行".
+KIND_ORDER = ("yrc", "qrc", "a2", "eslrc", "ttml", "lrc", "plain")
+
+
+def kind_set(kinds: Any) -> tuple[str, ...]:
+    """Normalise ``"yrc,lrc"`` / ``("lrc", "yrc")`` into a display order."""
+    if not kinds:
+        return ()
+    if isinstance(kinds, str):
+        items = [part.strip().lower() for part in kinds.split(",")]
+    else:
+        items = [str(part).strip().lower() for part in kinds]
+    seen: list[str] = []
+    for kind in items:
+        if kind and kind not in seen:
+            seen.append(kind)
+    rank = {kind: index for index, kind in enumerate(KIND_ORDER)}
+    return tuple(sorted(seen, key=lambda item: rank.get(item, len(rank))))
+
+
+def kind_set_label(kinds: Any) -> str:
+    """``yrc,lrc`` -> ``YRC/LRC``; what plan and candidates print."""
+    return "/".join(lyric_tag(kind) for kind in kind_set(kinds))
+
+
 _WORD_TIME_STRIP_RE = re.compile(r"<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>")
 _SQ_WORD_STRIP_RE = re.compile(r"\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]")
 

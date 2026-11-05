@@ -228,7 +228,23 @@ class State:
             #     does not silently reuse a netease verdict.
             self._add_column(conn, "plans", "native_lyric", "TEXT")
             self._add_column(conn, "plans", "native_kind", "TEXT")
+            #   native_kinds — every format the provider served at once
+            #     (``yrc,lrc``): one netease answer can carry both, and the
+            #     table shows the set while apply writes one member of it.
+            self._add_column(conn, "plans", "native_kinds", "TEXT")
             self._add_column(conn, "plans", "src_set", "TEXT")
+            # Rows written before native_kinds existed still describe the same
+            # answer: a netease plan whose native is YRC but whose stored lyric
+            # is LRC means the provider served both, which is exactly what the
+            # column would have recorded.  QQ is excluded on purpose — there the
+            # LRC is flattened from QRC, not served.
+            conn.execute(
+                """
+                UPDATE plans SET native_kinds = native_kind || ',lrc'
+                WHERE native_kinds IS NULL AND native_kind = 'yrc'
+                  AND lyric_kind = 'lrc'
+                """
+            )
             # 1.6 and earlier stored provider failures as no_match. Reclassify
             # them once so the 2.x retry policy actually picks them up instead
             # of reusing a stale "no match" forever.
@@ -295,6 +311,21 @@ class State:
                 "SELECT * FROM plans WHERE path=?", (path,)
             ).fetchone()
 
+    def find_native(self, source: str, source_id: str) -> sqlite3.Row | None:
+        """Newest plan that stored this exact ``SOURCE:ID``'s native lyric.
+
+        ``output`` addresses songs by ID, and a song that was planned before
+        already has the provider's own text on disk — re-downloading it would
+        be the only way to get *less* information.
+        """
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM plans WHERE source=? AND source_id=?"
+                " AND native_lyric IS NOT NULL AND native_lyric != ''"
+                " ORDER BY planned_at DESC LIMIT 1",
+                (source, str(source_id)),
+            ).fetchone()
+
     def upsert_plan(
         self, result: PlanResult, fingerprint: str, src_set: str = ""
     ) -> None:
@@ -308,8 +339,8 @@ class State:
                     path,fingerprint,planned_at,status,reason,source,source_id,
                     match_title,match_artist,match_album,match_duration,
                     duration_diff,score,lyric,lyric_sha,lyric_kind,lyric_lines,
-                    native_lyric,native_kind,src_set
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    native_lyric,native_kind,native_kinds,src_set
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(path) DO UPDATE SET
                     fingerprint=excluded.fingerprint,
                     planned_at=excluded.planned_at,
@@ -329,6 +360,7 @@ class State:
                     lyric_lines=excluded.lyric_lines,
                     native_lyric=excluded.native_lyric,
                     native_kind=excluded.native_kind,
+                    native_kinds=excluded.native_kinds,
                     src_set=excluded.src_set
                 """,
                 (
@@ -351,6 +383,9 @@ class State:
                     lyrics_line_count(lyric),
                     native,
                     result.native_kind or (lyric_kind(lyric) if lyric else None),
+                    ",".join(result.native_kinds)
+                    or result.native_kind
+                    or (lyric_kind(lyric) if lyric else None),
                     src_set,
                 ),
             )

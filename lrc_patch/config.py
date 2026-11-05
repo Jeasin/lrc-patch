@@ -14,12 +14,25 @@ def default_state_dir() -> Path:
     root = Path(base).expanduser() if base else Path.home() / ".local" / "state"
     return root / "lrc-patch"
 
-def default_lrc_dir() -> Path:
+def default_lyr_dir() -> Path:
+    """Where ``output`` drops exported lyric files.
+
+    Named ``lyr`` rather than ``lrc``: the directory holds ``.alrc`` / ``.yrc``
+    / ``.qrc`` / ``.ttml`` as often as plain ``.lrc``, and the old name read
+    like a promise about the format.
+    """
+    base = os.environ.get("XDG_CACHE_HOME")
+    root = Path(base).expanduser() if base else Path.home() / ".cache"
+    return root / "lrc-patch" / "lyr"
+
+
+def legacy_lyr_dir() -> Path:
+    """The pre-2.15 export mirror (``lrc-patch/lrc``), kept only for cleanup."""
     base = os.environ.get("XDG_CACHE_HOME")
     root = Path(base).expanduser() if base else Path.home() / ".cache"
     return root / "lrc-patch" / "lrc"
 
-APP_VERSION = "2.14"
+APP_VERSION = "2.15"
 
 # Bump when the scoring rules change: old ambiguous/suspect plans are then
 # retried once instead of being reused with the previous rules.

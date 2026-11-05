@@ -199,6 +199,7 @@ def plan_from_lyrics(
     check_timestamps: bool,
     native_lyrics: str = "",
     native_kind: str = "",
+    native_kinds: tuple[str, ...] = (),
 ) -> PlanResult:
     """Common tail: timestamp sanity check, then ready or suspect."""
     if check_timestamps:
@@ -215,6 +216,7 @@ def plan_from_lyrics(
                 diff,
                 native_lyrics,
                 native_kind,
+                native_kinds,
             )
         issue = lrc_timestamp_issue(lyrics, track.duration)
         if issue:
@@ -228,6 +230,7 @@ def plan_from_lyrics(
                 diff,
                 native_lyrics,
                 native_kind,
+                native_kinds,
             )
     return PlanResult(
         track,
@@ -239,6 +242,7 @@ def plan_from_lyrics(
         diff,
         native_lyrics,
         native_kind,
+        native_kinds,
     )
 
 # A picked ID only needs to be *identified*, not trusted: the score floor is
@@ -450,6 +454,7 @@ def plan_with_pick(
         check_timestamps,
         fetched.native_lyrics,
         fetched.native_kind,
+        fetched.native_kinds,
     )
 
 def keep_previous_plan(
@@ -514,6 +519,7 @@ def plan_one(
             check_timestamps,
             sidecar.lyrics,
             lyric_kind(sidecar.lyrics),
+            (lyric_kind(sidecar.lyrics),),
         )
 
     notes: list[str] = []
@@ -576,6 +582,7 @@ def plan_one(
             check_timestamps,
             fetched.native_lyrics,
             fetched.native_kind,
+            fetched.native_kinds,
         )
 
     if best_partial:

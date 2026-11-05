@@ -23,6 +23,7 @@ COMMAND_NAMES = {
     "scan",
     "plan",
     "apply",
+    "output",
     "verify",
     "rollback",
     "candidates",
@@ -66,6 +67,7 @@ _EXAMPLES = [
     ('lrcpatch plan --pick ne:123 "Ado/某首.m4a"', "人工指定候选"),
     ('lrcpatch plan --pick ne:123 --apply "Ado/某首.m4a"', "指定并直接写入"),
     ('lrcpatch apply "Ado"', "只写 ✓ 可写入"),
+    ('lrcpatch output ne:1815109506 --lrc --a2', "导出歌词文件（不动音频）"),
     ('lrcpatch verify "Ado"', "写入后复核"),
     ('lrcpatch status', "看状态库与缓存分布"),
     ('lrcpatch rollback --yes "Ado"', "回滚"),
@@ -164,6 +166,7 @@ def main_help(config: Config | None = None) -> str:
                 ("plan", "查询候选并生成计划（默认命令），不写音频"),
                 ("candidates", "列出候选 SOURCE:ID 与分数，供 --pick 使用"),
                 ("apply", "写入 ✓ 可写入，逐文件校验后原子替换"),
+                ("output", "导出歌词文件（可一次导多个格式，不动音频）"),
                 ("verify", "复核已写入的歌词、标签、封面、音频"),
                 ("rollback", "移除本工具写入且之后未被改动的歌词"),
                 ("status", "预览状态库里的计划、缓存与报告（只读）"),
@@ -197,7 +200,7 @@ def main_help(config: Config | None = None) -> str:
         [
             (
                 "plan",
-                "--pick SRC:ID  --pick-file FILE  --apply  --html [FILE]  --lrc\n"
+                "--pick SRC:ID  --pick-file FILE  --apply  --html [FILE]\n"
                 "--src LIST  --workers N  --refresh  --force  --retry-failed\n"
                 "--duration-tolerance SEC  --no-timestamp-check\n"
                 "--a2  --eslrc  --yrc  --qrc  --ttml",
@@ -208,16 +211,20 @@ def main_help(config: Config | None = None) -> str:
             ),
             (
                 "apply",
-                "--pick SRC:ID  --pick-file FILE  --lrc  --force\n"
+                "--pick SRC:ID  --pick-file FILE  --force\n"
                 "--src LIST  --workers N  --refresh  --no-preflight\n"
                 "--a2  --eslrc  --yrc  --qrc  --ttml",
+            ),
+            (
+                "output",
+                "--out DIR  --lrc  --a2  --eslrc  --yrc  --qrc  --ttml  --force  --refresh",
             ),
             ("scan", "--summary  --plans"),
             ("status", "--json"),
             ("rollback", "--yes"),
             (
                 "clean",
-                "--dry-run  --days N  --http  --reports  --lrc  --picks  --plans  --journal  --all",
+                "--dry-run  --days N  --http  --reports  --lyr  --picks  --plans  --journal  --all",
             ),
             ("config", "--init"),
         ]
@@ -328,12 +335,13 @@ def main_help(config: Config | None = None) -> str:
 
 {style("歌词格式", "1;36")}
 {formats}
-  plan 取词时把源的原生歌词一起存下（ne 多为 YRC，qq 为 QRC，lrclib 为 LRC/TXT），并记下这次要写的产物格式；
-  plan 与 candidates 的“原生”列标明源给的是什么，apply 时再按 --a2 / --eslrc / --ttml / --qrc 转换，
-  所以想换格式不必重新联网，`lrcpatch apply --a2` 就够；换成原生格式本身则原样输出。
+  plan 取词时把源的原生歌词一起存下，并记下源一次给了哪些格式：netease 常常同时给逐字 YRC 和逐行 LRC，
+  所以 plan 的格式列写 YRC/LRC 这样的集合（只给一种就只写一种），apply 从其中挑一种写进音频。
+  apply 时再按 --a2 / --eslrc / --ttml / --qrc 转换，所以想换格式不必重新联网，`lrcpatch apply --a2` 就够。
   私有格式（--yrc / --qrc）只在原生就是它时才可能；原生是逐行 LRC 时无法凭空生成逐字，会明说而不是硬写。
   A2 / ESLRC 与普通 LRC 共用行时间轴校验；YRC / QRC / TTML 只识别不校验。
-  导出后缀按格式走：.alrc / .eslrc / .yrc / .qrc / .ttml，逐行用 .lrc，纯文本用 .txt。
+  只想拿到歌词文件、不动音频，用 lrcpatch output（可一次导多种格式）；后缀按格式走：
+  .alrc / .eslrc / .yrc / .qrc / .ttml，逐行用 .lrc，纯文本用 .txt。
 
 {style("强制与刷新", "1;36")}
   --refresh   只作用于网络：忽略 HTTP 缓存，重新请求。计划里已有的结论仍然复用。
@@ -367,7 +375,7 @@ PLAN_EPILOG = """\
 示例
   lrcpatch plan "結束バンド"
   lrcpatch plan --workers 2 "Ado" "YOASOBI/(2023)THE BOOK 3"
-  lrcpatch plan --lrc --lrc-dir ~/.cache/lrc-patch/lrc "米津玄師"
+  lrcpatch plan --apply "米津玄師"
   lrcpatch plan --html "結束バンド"
   lrcpatch plan --pick ne:2003496467 "結束バンド/11 忘れてやらない.m4a"
   lrcpatch plan --pick qq:123 qq:456 "周杰伦/(2000)Jay"
@@ -408,6 +416,25 @@ APPLY_EPILOG = """\
   开始前会检查目标目录可写且空间足够；确实需要跳过时加 --no-preflight。
 """
 
+OUTPUT_EPILOG = """\
+示例
+  lrcpatch output ne:1815109506                    源的原生格式，不转换
+  lrcpatch output ne:1815109506 --lrc --a2         同时导出 .lrc 与 .alrc
+  lrcpatch output ne:1815109735 qq:293055026 --ttml --yrc --qrc
+  lrcpatch output ne:1815109506 --out ~/Desktop/lyr
+
+说明
+  output 只写歌词文件，不动音频；apply 才是写进音频。两者都从源的原生歌词出发，所以格式转换不联网。
+  不给格式参数 = 导出源的原生格式（ne 通常是 YRC，qq 是 QRC，lrclib 是 LRC/TXT），这是信息最全的一版。
+  可以一次给多个格式，每个格式写一个文件，后缀按格式走：.lrc / .alrc / .eslrc / .yrc / .qrc / .ttml / .txt。
+  转不出来的会明说原因而不是写一个错后缀的文件：私有格式（YRC/QRC）只能由源原样提供，
+  逐字格式也要求原生带逐字时间轴；逐行 LRC 永远转得出来。
+  文件名是「歌手 - 标题 [SOURCE:ID]」，同一个 ID 重复导出会跳过，--force 才覆盖。
+  之前 plan 取过的 ID，原生歌词已经在状态库里，output 不会再去请求；--refresh 强制重查。
+  导出目录默认 $XDG_CACHE_HOME/lrc-patch/lyr，用 --out 改；lrcpatch clean --lyr 会清掉它。
+"""
+
+
 VERIFY_EPILOG = """\
 示例
   lrcpatch verify "結束バンド"
@@ -438,7 +465,7 @@ CLEAN_EPILOG = """\
   lrcpatch clean --all                清全部，且不限天数
 
 说明
-  清理对象分三处：状态库（HTTP 缓存 / 计划 / 回滚记录）、reports/（CSV 与 HTML 复核页）、cache/lrc（--lrc 导出的镜像）。
+  清理对象分三处：状态库（HTTP 缓存 / 计划 / 回滚记录）、reports/（CSV 与 HTML 复核页）、cache/lyr（output 导出的歌词）。
   默认只清可再生的内容：已过期缓存、超过 --days（默认 30 天）的报告、导出与 pick 模板。
   --all 不看时间：所有类别都清空，包括刚生成的报告和刚查好的计划。
   计划状态用于断点续跑，回滚记录用于 rollback，因此只在明确指定 --plans / --journal 或 --all 时才删除；删了就要重新查询、且无法回滚。
@@ -497,44 +524,53 @@ def add_tree_option(
     )
 
 
+# The six formats ``output`` can write, in the order they are offered.  ``lrc``
+# is missing from the target flags of plan/apply on purpose: line-timed LRC is
+# the default there, not a conversion to ask for.
+FORMAT_HELP = {
+    "lrc": "逐行 LRC（.lrc）",
+    "a2": "逐字：LRC A2（尖括号 <mm:ss.xx>，.alrc）",
+    "eslrc": "逐字：ESLyric / SPL（方括号 [mm:ss.xx]，.eslrc）",
+    "yrc": "逐字：网易云原生 YRC（仅 ne 源，.yrc）",
+    "qrc": "逐字：QQ 原生 QRC（仅 qq 源，.qrc）",
+    "ttml": "逐字：TTML（Apple Music XML，.ttml）",
+}
+
+
 def add_lrc_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--lrc",
-        action="store_true",
-        help="同时把歌词保存为 .lrc 文件",
-    )
-    parser.add_argument(
-        "--lrc-dir",
-        type=Path,
-        metavar="DIR",
-        help=".lrc 输出目录（默认 $XDG_CACHE_HOME/lrc-patch/lrc）",
-    )
+    """The one format to write; mutually exclusive, because apply writes one."""
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument(
         "--a2",
         action="store_true",
-        help="逐字：把源歌词转成 LRC A2（尖括号 <mm:ss.xx>）内嵌，导出用 .alrc",
+        help="逐字：把源歌词转成 LRC A2（尖括号 <mm:ss.xx>）内嵌",
     )
     fmt.add_argument(
         "--eslrc",
         action="store_true",
-        help="逐字：转成 ESLyric（方括号 [mm:ss.xx]）内嵌，导出用 .eslrc",
+        help="逐字：转成 ESLyric（方括号 [mm:ss.xx]）内嵌",
     )
     fmt.add_argument(
         "--yrc",
         action="store_true",
-        help="逐字：保留网易云原生 YRC（仅 ne 源），导出用 .yrc",
+        help="逐字：保留网易云原生 YRC（仅 ne 源）",
     )
     fmt.add_argument(
         "--qrc",
         action="store_true",
-        help="逐字：保留 QQ 原生 QRC（仅 qq 源），导出用 .qrc",
+        help="逐字：保留 QQ 原生 QRC（仅 qq 源）",
     )
     fmt.add_argument(
         "--ttml",
         action="store_true",
-        help="逐字：转成 TTML（Apple Music XML），导出用 .ttml",
+        help="逐字：转成 TTML（Apple Music XML）",
     )
+
+
+def add_output_format_options(parser: argparse.ArgumentParser) -> None:
+    """The formats to export; several at once, each to its own file."""
+    for name, help_text in FORMAT_HELP.items():
+        parser.add_argument(f"--{name}", action="store_true", help=help_text)
 
 
 def add_network_options(parser: argparse.ArgumentParser) -> None:
@@ -895,6 +931,51 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         "--progress-every", type=int, metavar="N", default=10, help="每 N 首打印进度"
     )
 
+    output_cmd = sub.add_parser(
+        "output",
+        prog="lrcpatch output",
+        usage="lrcpatch output [--参数 …] SOURCE:ID …",
+        help="把歌词导出成文件，可一次导出多种格式",
+        description="按 SOURCE:ID 导出歌词文件，不碰音频；可一次给出多个格式。",
+        epilog=OUTPUT_EPILOG,
+        formatter_class=HelpFormatter,
+        add_help=False,
+    )
+    add_help_option(output_cmd)
+    output_cmd.add_argument(
+        "--out",
+        type=Path,
+        metavar="DIR",
+        help="导出目录（默认 $XDG_CACHE_HOME/lrc-patch/lyr）",
+    )
+    output_cmd.add_argument(
+        "--state-dir",
+        type=Path,
+        metavar="DIR",
+        help="状态、缓存与报告目录（默认 $XDG_STATE_HOME/lrc-patch）",
+    )
+    output_cmd.add_argument(
+        "--no-color",
+        action="store_true",
+        help="关闭彩色输出（也可设 NO_COLOR=1）",
+    )
+    add_output_format_options(output_cmd)
+    add_network_options(output_cmd)
+    output_cmd.add_argument(
+        "--refresh", action="store_true", help="忽略 HTTP 缓存并重查"
+    )
+    output_cmd.add_argument(
+        "--force",
+        action="store_true",
+        help="覆盖已存在的同名文件（默认跳过）",
+    )
+    output_cmd.add_argument(
+        "paths",
+        nargs="*",
+        metavar="SOURCE:ID",
+        help="要导出的候选 ID，例如 ne:1815109506；可给多个",
+    )
+
     verify = sub.add_parser(
         "verify",
         prog="lrcpatch verify",
@@ -986,10 +1067,10 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         help="状态、缓存与报告目录（默认 $XDG_STATE_HOME/lrc-patch）",
     )
     clean.add_argument(
-        "--lrc-dir",
+        "--out",
         type=Path,
         metavar="DIR",
-        help="--lrc 导出目录（默认 $XDG_CACHE_HOME/lrc-patch/lrc）",
+        help="output 的导出目录（默认 $XDG_CACHE_HOME/lrc-patch/lyr）",
     )
     clean.add_argument(
         "--no-color",
@@ -1008,7 +1089,13 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         "--http", action="store_true", help="清 HTTP 缓存（默认只清已过期的）"
     )
     clean.add_argument("--reports", action="store_true", help="清旧 CSV 报告与 HTML 复核页")
-    clean.add_argument("--lrc", action="store_true", help="清旧的 --lrc 导出镜像")
+    clean.add_argument(
+        "--lyr",
+        "--lrc",
+        dest="lyr",
+        action="store_true",
+        help="清 output 导出的歌词（含旧的 lrc 目录）",
+    )
     clean.add_argument("--picks", action="store_true", help="清旧的 pick 模板")
     clean.add_argument(
         "--plans", action="store_true", help="清旧计划状态（之后需要重新查询）"
@@ -1059,6 +1146,7 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
         plan,
         candidates,
         apply_cmd,
+        output_cmd,
         verify,
         rollback,
         clean,
@@ -1116,7 +1204,30 @@ def looks_like_pick_file(value: str) -> bool:
     )
 
 
-def reject_unknown_options(options: list[str], specs: dict[str, int]) -> None:
+def option_owners(parser: argparse.ArgumentParser) -> dict[str, set[str]]:
+    """Which commands accept which option, so "wrong command" gets said out loud.
+
+    ``--lrc`` is a real flag of ``clean`` but a removed one of ``apply``; the
+    global option table cannot tell those apart, and argparse only says
+    "unrecognized arguments".
+    """
+    owners: dict[str, set[str]] = {}
+    for action in parser._actions:  # noqa: SLF001
+        if not isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            continue
+        for name, subparser in action.choices.items():
+            for sub in subparser._actions:  # noqa: SLF001
+                for option in sub.option_strings:
+                    owners.setdefault(option, set()).add(name)
+    return owners
+
+
+def reject_unknown_options(
+    options: list[str],
+    specs: dict[str, int],
+    command: str | None = None,
+    owners: dict[str, set[str]] | None = None,
+) -> None:
     """Turn argparse's bare "unrecognized arguments" into a usable hint.
 
     A single typo (``--no-warp``) otherwise kills a run after the folder scan,
@@ -1126,7 +1237,23 @@ def reject_unknown_options(options: list[str], specs: dict[str, int]) -> None:
     messages: list[str] = []
     for token in options:
         name = token.split("=", 1)[0] if token.startswith("--") else token
-        if not name.startswith("-") or name in known:
+        if not name.startswith("-"):
+            continue
+        if name in known:
+            # Accepted somewhere, maybe not here: `apply --lrc` is a removed
+            # flag, `plan --tsv` belongs to candidates.
+            allowed = (owners or {}).get(name)
+            if command and allowed and command not in allowed:
+                if name in {"--lrc", "--lrc-dir"} and "clean" in allowed:
+                    messages.append(
+                        f"{name} 是 clean 的参数（清导出目录）；"
+                        "想把歌词导出成文件，用 lrcpatch output --lrc <SOURCE:ID>"
+                    )
+                else:
+                    messages.append(
+                        f"{name} 是 {'/'.join(sorted(allowed))} 的参数，"
+                        f"{command} 不接受它"
+                    )
             continue
         # A negative number is an option *value* (--tree-limit -1), not a flag;
         # argparse accepts it, so it must not be reported as an unknown option.
@@ -1135,6 +1262,12 @@ def reject_unknown_options(options: list[str], specs: dict[str, int]) -> None:
         except ValueError:
             pass
         else:
+            continue
+        if name in {"--lrc", "--lrc-dir"}:
+            messages.append(
+                f"{name} 已移除：导出歌词文件改用 lrcpatch output"
+                "（可一次导多种格式，不动音频）"
+            )
             continue
         if "wrap" in name or "warp" in name:
             messages.append(

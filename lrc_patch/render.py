@@ -20,7 +20,14 @@ from .config import APP_VERSION, source_label
 from .models import Track, TreeEntry
 from .sorting import name_key, sort_paths
 from .state import row_get
-from .text import lyric_kind, lyric_line_count, lyric_tag, write_text_atomic
+from .text import (
+    kind_set,
+    kind_set_label,
+    lyric_kind,
+    lyric_line_count,
+    lyric_tag,
+    write_text_atomic,
+)
 
 
 def default_report_path(state_dir: Path, prefix: str) -> Path:
@@ -736,28 +743,39 @@ def print_scan_list(
     # after `plan --force` a track with embedded lyrics still has a verdict, and
     # hiding it made the row look like the database knew nothing about it.
     cache_labels: dict[int, str] = {}
-    cache_tones: dict[int, str] = {}
+    cache_plain: dict[int, str] = {}
     for track in tracks:
         info = (cached or {}).get(str(track.path))
         label = ""
+        plain = ""
         if info:
-            source, score, status = info
+            source, score, status, kinds = info
             if source and status in CACHE_TONE:
                 # "qq:100" is an invitation to apply; a cached but unready
                 # verdict gets a question mark so the two never read alike.
                 # A gated score of 0 is not worth printing.
                 source = source_label(source)
-                label = f"{source}:{score}" if score else source
-                label += "" if status == "ready" else "?"
+                head = f"{source}:{score}" if score else source
+                head += "" if status == "ready" else "?"
+                tone = CACHE_TONE[status]
                 if track.has_lyrics and status == "ready":
                     # A ready plan on a file that already has lyrics is a
                     # comparison, not an instruction: apply would need --force.
                     # Cyan says "known", green would say "will be written".
-                    cache_tones[id(track)] = "36"
-                else:
-                    cache_tones[id(track)] = CACHE_TONE[status]
+                    tone = "36"
+                # "ne:100/YRC/LRC": the score says it will be written, the
+                # formats say from what — each in its own colour, the same
+                # palette the lyric column uses.
+                parts = [(head, tone)]
+                for kind in kind_set(kinds):
+                    parts.append(("/", "90"))
+                    parts.append((lyric_tag(kind), LYRIC_COLORS.get(kind, tone)))
+                label = "".join(style(text, code) for text, code in parts)
+                tags = kind_set_label(kinds)
+                plain = f"{head}/{tags}" if tags else head
         cache_labels[id(track)] = label
-    cache_width = max((disp_width(label) for label in cache_labels.values()), default=0)
+        cache_plain[id(track)] = plain
+    cache_width = max((disp_width(text) for text in cache_plain.values()), default=0)
 
     with_lyrics = sum(1 for track in tracks if track.has_lyrics)
     print(
@@ -807,10 +825,7 @@ def print_scan_list(
                 + style(pad_display(lyric, lyric_width), tone)
             )
             if cache_width:
-                line += "  " + style(
-                    pad_display(cache_labels[id(track)], cache_width),
-                    cache_tones.get(id(track), "90"),
-                )
+                line += "  " + pad_display(cache_labels[id(track)], cache_width)
             if gaps[id(track)]:
                 line += "  " + style(gaps[id(track)], "33")
             print(line.rstrip())
@@ -923,7 +938,11 @@ def plan_fields(row: sqlite3.Row) -> tuple[tuple[str, ...], str]:
     if status in {"ready", "applied"}:
         diff = row["duration_diff"]
         kind = str(row["lyric_kind"] or "")
-        tag = lyric_tag(kind) if kind else ""
+        # The provider's offer, not just what gets written: one netease answer
+        # can carry YRC *and* LRC, and repeating that in a trailing note made
+        # the row read as if "LRC 57 行" were the whole story.
+        served = row_get(row, "native_kinds", "") or row_get(row, "native_kind", "")
+        tag = kind_set_label(served) or (lyric_tag(kind) if kind else "")
         lines = row["lyric_lines"] or 0
         artist, notes = _reason_parts(str(row["reason"] or ""))
         # `match_artist` is the artist; `reason` is a message that *starts* with
@@ -943,21 +962,11 @@ def plan_fields(row: sqlite3.Row) -> tuple[tuple[str, ...], str]:
             artist,
             truncate_display(album, ALBUM_CAP) if album else "",
         )
-        # The provider's own format is what apply would convert from, so say
-        # it whenever it is not what was written — and name the flag that would
-        # have kept the word timing, since "LRC" alone looks like the upstream
-        # copy simply has none.  Skip it when the note already said so: the
-        # kana notice ends with "原生 QRC 仍在状态库", and printing both read
-        # like two different facts.
-        native = str(row_get(row, "native_kind", "") or "")
+        # The format column already names what the provider serves, including
+        # the word-timed form when there is one — no trailing note repeating
+        # it.  What stays in the note is the *surprise* (a dropped 注音 track)
+        # or the reason the score is not 100.
         tail = [part for part in (notes,) if part]
-        if native and native != kind and not any(
-            f"原生 {lyric_tag(native)}" in part for part in tail
-        ):
-            label = f"原生 {lyric_tag(native)}"
-            if native in {"yrc", "qrc"}:
-                label += f"（逐字，apply --{native} 可取）"
-            tail.append(label)
         return cells, "；".join(tail) or ("匹配通过" if not any(cells) else "")
     if status == "skip_existing":
         return (), "已有歌词，未覆盖"
