@@ -122,20 +122,30 @@ def choose_candidate(
     candidates: list[Candidate],
     tolerance: float = DEFAULT_DURATION_TOLERANCE,
 ) -> tuple[Candidate | None, int, float, str]:
-    scored: list[tuple[int, float, Candidate]] = []
-    seen: set[tuple[str, str]] = set()
+    # The same recording is usually listed more than once — the single, the
+    # album, the compilation — with an identical title / artist / duration and
+    # a different album name.  Dedupe on *the best score*, not on the first
+    # entry in the provider's relevance order: netease puts the single first,
+    # so the old "first wins" rule threw away the copy whose album matched the
+    # file and then reported the weaker score (feedback 20261105-2026).
+    best: dict[tuple[str, str, float], tuple[int, float, Candidate]] = {}
     for candidate in candidates:
+        score, diff = score_candidate(track, candidate, tolerance)
+        if not score:
+            continue
         key = (
             norm_loose(candidate.title),
             norm_loose(candidate.artist_text),
             round(candidate.duration, 1),
         )
-        if key in seen:
-            continue
-        seen.add(key)
-        score, diff = score_candidate(track, candidate, tolerance)
-        if score:
-            scored.append((score, diff, candidate))
+        current = best.get(key)
+        if current is None or (score, -diff, candidate.synced) > (
+            current[0],
+            -current[1],
+            current[2].synced,
+        ):
+            best[key] = (score, diff, candidate)
+    scored = list(best.values())
     if not scored:
         return None, 0, 999.0, "无标题/艺术家/时长同时匹配的候选"
     scored.sort(key=lambda x: (-x[0], x[1], -x[2].synced))

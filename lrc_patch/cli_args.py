@@ -207,7 +207,7 @@ def main_help(config: Config | None = None) -> str:
             ),
             (
                 "candidates",
-                "--top N  --src LIST  --workers N  --template [FILE]  --tsv  --all  --refresh",
+                "--top N  --probe N  --src LIST  --workers N  --template [FILE]  --tsv  --all  --refresh",
             ),
             (
                 "apply",
@@ -353,7 +353,7 @@ def main_help(config: Config | None = None) -> str:
 {states}
 
 {style("网络与缓存", "1;36")}
-  每首曲目通常只有 1 次搜索 + 1 次取词：只有当第一条搜索里没有任何标题与艺术家都对得上的候选时，才补发 1 次仅用标题的搜索；已经能确定结果就不再追问。--top 只决定 candidates 显示几行，不影响请求数。
+  每首曲目通常只有 1 次搜索 + 1 次取词：只有当第一条搜索里没有任何标题与艺术家都对得上的候选时，才补发 1 次仅用标题的搜索；已经能确定结果就不再追问。--top 只决定 candidates 显示几行；那几行要不要取词确认格式由 candidates 的 --probe 决定，plan 始终只取首选那条。
   ne 约 0.9s 一次，并发不会突破最小间隔；被限流（code 405/406、HTTP 429）时先放慢重试，仍失败就暂停该源约 180s，其余曲目立即失败而不是继续撞墙。
   服务过载（HTTP 500/502/503/504）走退避，两次耗尽后暂停 60s 起。
   请求失败记为 ✗ 失败，不是「无匹配」，不写缓存，也不覆盖已有的 ✓ 计划。
@@ -812,8 +812,9 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
             "--all 不带路径 = 整个音乐库里所有曲目（含已有歌词、已经 ✓ 的），不是只查上次 plan 那批。\n\n"
             "状态库按文件路径逐条记录，每首取它自己最后一次 plan 的结果（文件大小或修改时间变了就不算数），不存在「整库最近一次」的快照；因此不同专辑可能来自不同次运行。用 status 看整体分布。\n\n"
             "输出是一张按专辑对齐的表：状态 / 候选 ID / 分数 / 时长差 / 原生 / 标题 / 歌手 / 专辑。分数是标题+歌手+专辑的总分（满分 100），时长差单独一列，超过容差显示红色。"
-            "“原生”是源会给出的格式：qq=QRC、lrclib=LRC/TXT；ne 只有取词后才知道是逐字 YRC 还是逐行 LRC，所以之前没查过的那条显示 ?，查过一次（plan 过）就写实际格式。"
-            "apply 时再决定转成什么。排序先看是否在容差内，容差外的不会排在可用的前面。\n\n"
+            "排序先看是否在容差内，容差外的不会排在可用的前面。\n\n"
+            "“原生”是源会给出的格式：qq 只从 QRC 容器里取词、lrclib 在搜索结果里就带同步标记，所以直接写 QRC / LRC；ne 同一首可能给逐字 YRC，也可能只有逐行 LRC，取词前无法判断，因此默认对每源前 --probe N 条候选取一次词，把实际格式写上去（取词走 HTTP 缓存，随后的 plan 直接复用），--probe 0 关闭取词、没查过的仍显示 ?。"
+            "apply 时再决定转成什么。\n\n"
             "整张专辑要人工决定时用 --template：自动匹配的曲目直接写成可用行，需要确认的曲目连同候选一起注释掉，改完交给 plan --pick-file。"
         ),
         formatter_class=HelpFormatter,
@@ -826,6 +827,13 @@ def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
     add_source_option(candidates, source_default)
     candidates.add_argument(
         "--top", type=int, metavar="N", default=3, help="每源最多显示 N 条"
+    )
+    candidates.add_argument(
+        "--probe",
+        type=int,
+        metavar="N",
+        default=3,
+        help="为每源前 N 条候选取一次词，把「原生」写成真实格式（0 = 不取，只标 ?）",
     )
     candidates.add_argument(
         "--all",

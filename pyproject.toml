@@ -1,6 +1,6 @@
 [project]
 name = "lrc-patch"
-version = "2.15"
+version = "2.16"
 description = "Batch lyrics planning and embedding for a local music library"
 readme = "README.md"
 requires-python = ">=3.9"

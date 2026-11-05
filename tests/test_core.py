@@ -48,6 +48,7 @@ from lrc_patch.lyric_fmt import (
 from lrc_patch.matching import (
     assign_picks,
     best_partial_candidate,
+    choose_candidate,
     keep_previous_plan,
     parse_pick,
     pick_alternatives,
@@ -2502,6 +2503,105 @@ class CandidatesNativeKindTests(unittest.TestCase):
         self.assertEqual(
             commands.known_native_sets(state_dir), {("netease", "42"): "yrc"}
         )
+
+
+class DuplicateCandidateTests(unittest.TestCase):
+    """One recording is often listed twice; judge it by its best copy.
+
+    netease puts the single first and the album second, so the old "keep the
+    first of an identical title/artist/duration" rule threw the album copy away
+    and planned 85 while `candidates` showed 100 (feedback 20261105-2026).
+    """
+
+    def _candidate(self, source_id: str, album: str) -> Candidate:
+        return Candidate(
+            source="netease",
+            source_id=source_id,
+            title="Track",
+            artists=["Artist"],
+            album=album,
+            duration=200.0,
+        )
+
+    def test_the_album_copy_wins_even_when_it_is_listed_second(self) -> None:
+        chosen, score, _, _ = choose_candidate(
+            make_track(), [self._candidate("1", "Single"), self._candidate("2", "Album")]
+        )
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen.source_id, "2")
+        self.assertEqual(score, 100)
+
+    def test_a_worse_duplicate_does_not_win_by_coming_first(self) -> None:
+        chosen, score, _, _ = choose_candidate(
+            make_track(), [self._candidate("2", "Album"), self._candidate("1", "Single")]
+        )
+        self.assertEqual(chosen.source_id, "2")
+        self.assertEqual(score, 100)
+
+
+class CandidateProbeTests(unittest.TestCase):
+    """`candidates` may fetch a lyric to learn the format before `plan` runs."""
+
+    class _ProbeSource:
+        name = "netease"
+
+        def __init__(self, kinds: tuple[str, ...] = ("yrc", "lrc")) -> None:
+            self.kinds = kinds
+            self.fetches = 0
+
+        def fetch(self, candidate: Candidate) -> FetchResult:
+            self.fetches += 1
+            return FetchResult(
+                lyrics="[00:00.00]あ\n",
+                native_lyrics="[0,1000](0,10)あ",
+                native_kind=self.kinds[0],
+                native_kinds=self.kinds,
+            )
+
+    def _args(self, *extra: str):
+        return build_parser().parse_args(["candidates", "--library", "/lib", *extra])
+
+    def _results(self, track: Track) -> dict[str, list]:
+        candidate = Candidate(
+            source="netease",
+            source_id="1815109735",
+            title=track.title,
+            artists=["Artist"],
+            album=track.album,
+            duration=track.duration,
+        )
+        return {str(track.path): [("netease", [candidate], None, False)]}
+
+    def test_a_probe_fills_in_the_served_set(self) -> None:
+        track = make_track()
+        source = self._ProbeSource()
+        found = commands.probe_formats(
+            [track], self._results(track), [source], self._args(), {}
+        )
+        self.assertEqual(found, {("netease", "1815109735"): "yrc,lrc"})
+        self.assertEqual(source.fetches, 1)
+
+    def test_a_format_a_plan_already_knows_is_not_fetched_again(self) -> None:
+        track = make_track()
+        source = self._ProbeSource()
+        found = commands.probe_formats(
+            [track],
+            self._results(track),
+            [source],
+            self._args(),
+            {("netease", "1815109735"): "lrc"},
+        )
+        self.assertEqual(found, {})
+        self.assertEqual(source.fetches, 0)
+
+    def test_probe_zero_keeps_the_table_offline(self) -> None:
+        track = make_track()
+        source = self._ProbeSource()
+        found = commands.probe_formats(
+            [track], self._results(track), [source], self._args("--probe", "0"), {}
+        )
+        self.assertEqual(found, {})
+        self.assertEqual(source.fetches, 0)
 
 
 class CandidatesCommandTests(unittest.TestCase):

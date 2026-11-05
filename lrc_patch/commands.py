@@ -963,6 +963,70 @@ class CandRow:
         return self.ident
 
 
+def probe_formats(
+    tracks: list[Track],
+    results: dict[str, list],
+    sources: list[Any],
+    args: argparse.Namespace,
+    known: dict[tuple[str, str], str],
+) -> dict[tuple[str, str], str]:
+    """Fetch the lyric for the shown candidates whose format is unknowable.
+
+    Only netease needs this: QQ answers out of its QRC container and LRCLIB
+    says in the search result whether it has timing.  Each probe is one lyric
+    request that lands in the same HTTP cache ``plan`` reads, so the cost is
+    paid once and the following ``plan`` is free.
+    """
+    source = next((item for item in sources if item.name == "netease"), None)
+    if source is None:
+        return {}
+    per_source = min(getattr(args, "top", 3), int(getattr(args, "probe", 0)))
+    if per_source <= 0:
+        return {}
+    work: list[Candidate] = []
+    for track in tracks:
+        for name, candidates, error, skipped in results[str(track.path)]:
+            if name != "netease" or skipped or error is not None or not candidates:
+                continue
+            ranked = ranked_candidates(track, candidates, args.duration_tolerance)
+            for _within, _meta, _score, _diff, candidate in ranked[:per_source]:
+                if candidate.instrumental:
+                    continue
+                if (candidate.source, candidate.source_id) in known:
+                    continue
+                work.append(candidate)
+    if not work:
+        return {}
+    found: dict[tuple[str, str], str] = {}
+    guard = threading.Lock()
+
+    def probe(candidate: Candidate) -> None:
+        try:
+            fetched = source.fetch(candidate)
+        except Exception:
+            # A probe is a nicety: a failed one leaves the "?" in place.
+            return
+        if not fetched.native_kinds:
+            return
+        with guard:
+            # Same shape the plan table stores (``"yrc,lrc"``), so the row
+            # renders through one code path either way.
+            found[(candidate.source, candidate.source_id)] = ",".join(
+                fetched.native_kinds
+            )
+
+    live = ProgressLine()
+    live.start(f"取词确认 0/{len(work)}")
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, getattr(args, "workers", 4))) as pool:
+        futures = [pool.submit(probe, candidate) for candidate in work]
+        for _future in as_completed(futures):
+            done += 1
+            live.update(f"取词确认 {done}/{len(work)}")
+    live.close()
+    return found
+
+
 def known_native_sets(state_dir: Path) -> dict[tuple[str, str], str]:
     """``(source, source_id) -> served formats``, learned from earlier plans.
 
@@ -982,6 +1046,33 @@ def known_native_sets(state_dir: Path) -> dict[tuple[str, str], str]:
         if source and source_id and kinds:
             out.setdefault((source, source_id), kinds)
     return out
+
+
+def ranked_candidates(
+    track: Track, candidates: list[Candidate], tolerance: float
+) -> list[tuple[bool, int, int, float, Candidate]]:
+    """Every candidate with its scores, ordered the way the table shows it.
+
+    Ranking is by metadata *first*: a correct title/artist with a long duration
+    gap should outrank a cover that happens to be closer — but only among
+    candidates that could actually be written.  A live version 13s off must not
+    sit above the right recording.
+    """
+    ranked: list[tuple[bool, int, int, float, Candidate]] = []
+    for candidate in candidates:
+        score, diff = score_candidate(track, candidate, tolerance)
+        metadata_score, _ = score_candidate(track, candidate, 999.0)
+        ranked.append((diff <= tolerance, metadata_score, score, diff, candidate))
+    ranked.sort(
+        key=lambda item: (
+            not item[0],
+            -item[1],
+            -item[2],
+            item[3],
+            -int(item[4].synced),
+        )
+    )
+    return ranked
 
 
 def candidate_rows(
@@ -1011,25 +1102,7 @@ def candidate_rows(
                 )
             )
             continue
-        ranked = []
-        for candidate in candidates:
-            score, diff = score_candidate(track, candidate, args.duration_tolerance)
-            # Rank by metadata first: a correct title/artist with a long
-            # duration gap should outrank a cover that happens to be closer —
-            # but only among candidates that could actually be written.  A
-            # live version 13s off must not sit above the right recording.
-            metadata_score, _ = score_candidate(track, candidate, 999.0)
-            within = diff <= args.duration_tolerance
-            ranked.append((within, metadata_score, score, diff, candidate))
-        ranked.sort(
-            key=lambda item: (
-                not item[0],
-                -item[1],
-                -item[2],
-                item[3],
-                -int(item[4].synced),
-            )
-        )
+        ranked = ranked_candidates(track, candidates, args.duration_tolerance)
         for within, metadata_score, score, diff, candidate in ranked[: args.top]:
             if candidate.instrumental:
                 # Adopting it yields ♪ 纯音乐, not a lyric: do not mark ✓.
@@ -1417,6 +1490,12 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
     live.close()
 
     known = known_native_sets(state_dir)
+    # "原生" is only honest if the table actually knows the answer.  A previous
+    # plan knows it for its own track; for everything else netease has to be
+    # asked, so ask — one lyric request per shown candidate, cached for the
+    # `plan` that follows.
+    if not args.tsv and getattr(args, "probe", 0):
+        known.update(probe_formats(wanted, results, sources, args, known))
     rows_by_track: dict[str, list[CandRow]] = {
         str(track.path): candidate_rows(track, results[str(track.path)], args, known)
         for track in wanted
@@ -1484,15 +1563,6 @@ def cmd_candidates(args: argparse.Namespace, state: State, state_dir: Path) -> i
         + style("--pick-file", "36")
         + "。"
     )
-    if any(row.kind == "?" for rows in rows_by_track.values() for row in rows):
-        print_meta(
-            "原生",
-            style(
-                "? = 这一条只是搜索结果，还没取词（不联网就不知道）；"
-                "plan 或 output 取过之后，这里写真实格式（可能 YRC，可能只有 LRC）",
-                "90",
-            ),
-        )
     if getattr(args, "template", None):
         template_path = write_pick_template(
             template_target(args, state_dir), wanted, rows_by_track
