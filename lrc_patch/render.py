@@ -601,13 +601,19 @@ def format_size(size: int) -> str:
 
 
 LYRIC_COLORS = {
-    "plain": "36",
-    "lrc": "32",
-    "a2": "1;32",
-    "eslrc": "1;33",
-    "yrc": "1;34",
-    "qrc": "1;36",
-    "ttml": "1;35",
+    # One hue per format, all clearly apart: LRC and A2 used to be plain green
+    # and *bold* green, which is a shade, not a difference — the two are the
+    # easiest pair to confuse and the one the eye lands on first in `scan`.
+    # 256-colour codes keep the warmth/lightness readable on a dark terminal;
+    # a terminal without 256-colour support falls back to its default colour
+    # rather than printing escape garbage.
+    "plain": "38;5;246",  # 灰   — 没有时间轴
+    "lrc": "38;5;114",  # 绿   — 逐行
+    "a2": "38;5;215",  # 橙   — 逐字（A2）
+    "eslrc": "38;5;141",  # 紫   — 逐字（ESLyric）
+    "yrc": "38;5;75",  # 蓝   — 网易云私有
+    "qrc": "38;5;80",  # 青   — QQ 私有
+    "ttml": "38;5;211",  # 粉   — XML
 }
 
 

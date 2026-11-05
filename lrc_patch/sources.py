@@ -30,6 +30,7 @@ from typing import Any, Callable
 from .config import HTTP_UA
 from .errors import SourceError
 from .lyric_fmt import (
+    count_ruby,
     has_timing,
     lines_to_lrc,
     lines_to_plain,
@@ -940,6 +941,18 @@ class QqSource:
             return FetchResult(instrumental=False, note="无可用歌词")
         lyrics, note = render_native(native, native_kind, self.target_format)
         lyrics = sanitize_lyrics(lyrics)
+        # QRC carries 注音 as a `[kana:…]` tag — a second, syllable-timed
+        # annotation.  No target except QRC itself can hold it, so it is
+        # dropped rather than smuggled in as a 2 KB lyric line; the native text
+        # stays in the plan database, which is what `apply --qrc` reads.
+        ruby = count_ruby(native, native_kind)
+        if ruby and (self.target_format or "lrc").lower() != "qrc":
+            label = (self.target_format or "lrc").upper()
+            dropped = (
+                f"注音（kana）{ruby} 行放不进 {label}，已丢弃；"
+                "原生 QRC 仍在状态库，apply --qrc 可取回"
+            )
+            note = f"{note}；{dropped}" if note else dropped
         if not lyrics:
             return FetchResult(instrumental=False, note=note or "无可用歌词")
         return FetchResult(

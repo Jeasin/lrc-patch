@@ -237,7 +237,7 @@ lrcpatch apply
 | ESLRC | ESLyric / SPL 逐字 | `[00:12.34][00:12.34]逐[00:12.50]字` |
 | YRC | 网易云逐字 | `[1200,5000](1200,300,0)逐(1500,300,0)字` |
 | QRC | QQ 音乐逐字 | `[1200,5000]逐(1200,300)字(1500,300)` |
-| TTML | Apple Music | XML |
+| TTML | Apple Music | `<p begin="00:00:12.340" end="00:00:15.000"><span …>逐</span><span …>字</span></p>` |
 
 `plan` 取词时会把源的原生歌词一起存进状态库，`plan` 与 `candidates` 的"原生"列标明源给的是什么：
 
@@ -247,6 +247,24 @@ lrcpatch apply
 - 导出后缀跟着格式走：`.alrc` / `.eslrc` / `.yrc` / `.qrc` / `.ttml`，逐行用 `.lrc`，纯文本用 `.txt`。
 
 私有格式（`--yrc` / `--qrc`）只在原生就是它时才可能：YRC 只来自网易云，QRC 只来自 QQ。
+
+### 转换时会丢什么
+
+三种公开逐字格式装得下的东西并不一样，先把这张表摆出来，省得转完才发现少了东西：
+
+| | 词起点 | 词时长 | 注音 | LRC 标签 |
+|---|---|---|---|---|
+| A2 / ESLRC | ✓ | ✗ 下一个词的起点就是上一个词的终点 | ✗ | ✓ 只留标准标签 |
+| TTML | ✓ | ✓ | ✗ | ✗ XML 里没地方放 |
+| YRC / QRC | ✓ | ✓ | 仅 QRC | ✓ |
+
+**精度**：A2 / ESLRC 的时间戳是 `mm:ss.cc`，毫秒四舍五入到 10ms（`1203ms → 00:01.20`），所以把这两种文件读回来是"准到 10ms"，不是逐毫秒还原；TTML 写 `hh:mm:ss.mmm`，毫秒原样。原生文本一直在状态库里，切回 `--qrc` / `--yrc` 不受影响。
+
+**注音**：QQ 把日文歌的假名注音塞在原生 QRC 的 `[kana:…]` 标签里——那是第二条按音节对齐的时间轴。A2 和 ESLRC 只有一条时间轴，TTML 的 ruby 又没有可依据的编码规范（硬猜会猜错），所以**转换时不写进文件**。原生 QRC 一直留在状态库，`apply --qrc` 就能取回带注音的原件；plan 的备注里会写「注音（kana）1 行放不进 A2，已丢弃」。以前这条标签会被当成一行 2KB 的歌词贴在 `00:00`，现在不会了。
+
+**标签**：`[ti:]`、`[ar:]`、`[al:]`、`[by:]`、`[offset:]` 这类标准标签跟着走，`[kana:]`、`[klyric:]` 这类源私有的不跟。旧版本存下的计划里如果还带着注音那行，`apply` 时会就地清掉，不用重新 plan。
+
+TTML 写的是标准形状：`<?xml …?><tt xmlns=… xml:lang="ja"><body><div><p begin end>`，每个词一个 `<span begin end>`，`xml:lang` 按歌词文字自动判断（假名→`ja`、汉字→`zh`、其余→`en`）。
 
 ## 写入安全
 
@@ -430,11 +448,11 @@ lrc_patch/
   sources.py        # 网易云 / QQ / LRCLIB，重试、限速与缓存
   matching.py       # 打分、候选配对、状态机
   audio.py          # 读写标签、原子替换、校验
-  lyric_fmt.py      # 各格式解析与互相转换
+  lyric_fmt.py      # 各格式解析与互相转换（含往返测试用的 parse_a2/eslrc/ttml）
   qrc.py            # QQ QRC 解密（3DES + zlib）
   state.py          # SQLite 状态库
   render.py         # 终端表格与对齐
-tests/test_core.py  # 154 个用例，覆盖解析、打分、写入、回滚与 CLI
+tests/test_core.py  # 167 个用例，覆盖解析、格式转换往返、打分、写入、回滚与 CLI
 ```
 
 CI 在 Python 3.9 / 3.11 / 3.13 上跑同一套测试。

@@ -42,7 +42,7 @@ from .config import (
     write_config_template,
 )
 from .errors import ToolError, VerificationError
-from .lyric_fmt import render_native
+from .lyric_fmt import render_native, strip_provider_tags
 from .matching import (
     assign_picks,
     keep_previous_plan,
@@ -1485,7 +1485,11 @@ def lyric_for_target(row: Any, target: str | None) -> tuple[str, str]:
         lyric_kind(stored) if stored else ""
     )
     if not target or target == stored_kind:
-        return stored, stored_kind
+        # A plan stored before 2.13 still carries QQ's `[kana:…]` blob as a
+        # lyric line.  Cleaning it here means apply writes the file the user
+        # asked for without needing a re-plan (and without touching `--qrc`,
+        # where the tag belongs).
+        return strip_provider_tags(stored, stored_kind), stored_kind
     tag = FORMAT_TAGS.get(target, target.upper())
     native = row_get(row, "native_lyric", "") or ""
     native_kind = row_get(row, "native_kind", "") or stored_kind

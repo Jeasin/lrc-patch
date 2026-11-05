@@ -28,7 +28,22 @@ from lrc_patch.config import (
     write_config_template,
 )
 from lrc_patch.errors import SourceError, ToolError
-from lrc_patch.lyric_fmt import has_timing, lines_to_plain, parse_qrc, render_native
+from lrc_patch.lyric_fmt import (
+    count_ruby,
+    has_timing,
+    lines_to_a2,
+    lines_to_eslrc,
+    lines_to_lrc,
+    lines_to_plain,
+    lines_to_ttml,
+    parse_a2,
+    parse_eslrc,
+    parse_qrc,
+    parse_ttml,
+    parse_yrc,
+    render_native,
+    strip_provider_tags,
+)
 from lrc_patch.matching import (
     assign_picks,
     best_partial_candidate,
@@ -2177,6 +2192,168 @@ class StateSummaryTests(unittest.TestCase):
             self.assertEqual(summary["cache"]["rows"], 2)
             self.assertEqual(summary["cache"]["expired"], 1)
             self.assertTrue(summary["plans"]["latest"])
+
+
+class LyricFormatTests(unittest.TestCase):
+    """Native → public verbatim conversion, and back again.
+
+    QQ and netease both ship a second, syllable-timed ``[kana:…]`` track for
+    Japanese songs.  Nothing but QRC can hold it, and it used to be written out
+    as one 2 KB lyric line at 00:00 in every converted file.
+    """
+
+    NATIVE = (
+        "[ti:ノーチラス]\n"
+        "[ar:ヨルシカ]\n"
+        "[kana:1と1けい(6723,229)1な(6952,190)1ま]\n"
+        "[1000,2000](1000,180)時(1180,200)計(1380,300)が(1680,200)鳴(1880,320)った\n"
+        "[3200,1500](3200,200)や(3400,200)っと(3600,300)眼(3900,800)\n"
+    )
+
+    def _converted(self) -> dict[str, str]:
+        lines = parse_qrc(self.NATIVE)
+        return {
+            "lrc": lines_to_lrc(lines),
+            "a2": lines_to_a2(lines),
+            "eslrc": lines_to_eslrc(lines),
+            "ttml": lines_to_ttml(lines),
+        }
+
+    def test_ruby_never_reaches_a_converted_file(self) -> None:
+        for name, text in self._converted().items():
+            with self.subTest(format=name):
+                self.assertNotIn("kana:", text)
+                self.assertNotIn("6723", text)
+
+    def test_standard_tags_travel_but_xml_has_no_tags(self) -> None:
+        converted = self._converted()
+        for name in ("lrc", "a2", "eslrc"):
+            self.assertIn("[ti:ノーチラス]", converted[name])
+        self.assertNotIn("[ti:", converted["ttml"])
+
+    def test_count_ruby_sees_the_kana_tag(self) -> None:
+        self.assertEqual(count_ruby(self.NATIVE, "qrc"), 1)
+        self.assertEqual(count_ruby("[00:01.00]歌詞\n", "lrc"), 0)
+
+    def test_a2_round_trip_keeps_every_word_start(self) -> None:
+        a2 = lines_to_a2(parse_qrc(self.NATIVE))
+        source = [line for line in parse_qrc(self.NATIVE) if line.words]
+        back = [line for line in parse_a2(a2) if line.words]
+        self.assertEqual(len(back), len(source))
+        for before, after in zip(source, back):
+            self.assertEqual(
+                [word.start for word in before.words],
+                [word.start for word in after.words],
+            )
+            self.assertEqual(
+                "".join(word.text for word in before.words),
+                "".join(word.text for word in after.words),
+            )
+
+    def test_eslrc_round_trip_keeps_every_word_start(self) -> None:
+        eslrc = lines_to_eslrc(parse_qrc(self.NATIVE))
+        back = [line for line in parse_eslrc(eslrc) if line.words]
+        self.assertEqual([word.text for word in back[0].words][:3], ["時", "計", "が"])
+        self.assertEqual([word.start for word in back[0].words][:3], [1000, 1180, 1380])
+
+    def test_ttml_round_trip_is_exact_to_the_millisecond(self) -> None:
+        ttml = lines_to_ttml(parse_qrc(self.NATIVE))
+        back = [line for line in parse_ttml(ttml) if line.words]
+        self.assertEqual(back[0].words[0].start, 1000)
+        self.assertEqual(back[0].words[0].dur, 180)
+        self.assertEqual(back[0].dur, 2000)
+
+    def test_ttml_carries_word_spans_and_a_language(self) -> None:
+        ttml = self._converted()["ttml"]
+        self.assertIn('xml:lang="ja"', ttml)
+        self.assertIn("<div>", ttml)
+        self.assertIn(
+            '<span begin="00:00:01.000" end="00:00:01.180">時</span>', ttml
+        )
+        # Clock time, not offset time: offset time is legal TTML but Apple and
+        # every lyric player in practice read the clock form.
+        self.assertIn('begin="00:00:01.000"', ttml)
+        self.assertNotIn('begin="1.000s"', ttml)
+
+    def test_a2_quantises_to_centiseconds(self) -> None:
+        # The format writes mm:ss.cc, so 1203 ms has to become 1200: saying so
+        # keeps the round-trip tolerance honest instead of pretending the
+        # conversion is exact.
+        a2 = lines_to_a2(parse_qrc("[0,1000](0,100)あ(1203,100)い\n"))
+        self.assertIn("<00:01.20>い", a2)
+
+    def test_rounding_a_stamp_up_does_not_produce_second_60(self) -> None:
+        a2 = lines_to_a2(parse_qrc("[59999,1000](59999,100)あ\n"))
+        self.assertTrue(a2.startswith("[01:00.00]"), a2)
+
+    def test_ttml_reads_offset_time_too(self) -> None:
+        xml = (
+            '<tt xmlns="http://www.w3.org/ns/ttml"><body><div>'
+            '<p begin="12.34s" end="13.5s">hi</p>'
+            "</div></body></tt>"
+        )
+        lines = parse_ttml(xml)
+        self.assertEqual((lines[0].start, lines[0].dur), (12340, 1160))
+
+    def test_a_line_timed_lyric_cannot_be_dressed_as_ttml(self) -> None:
+        lyrics, note = render_native("[00:01.00]我爱\n", "lrc", "ttml")
+        self.assertIn("逐字", note)
+        self.assertEqual(lyrics.strip(), "[00:01.00]我爱")
+
+    def test_a_timed_line_without_words_keeps_its_stamp(self) -> None:
+        # QRC can carry "[1000,2000]plain" with no syllables; the stamp used to
+        # be dropped on the way to LRC, turning a timed line into an untimed one.
+        self.assertEqual(
+            lines_to_lrc(parse_qrc("[1000,2000]纯文本\n")).strip(),
+            "[00:01.00]纯文本",
+        )
+
+    def test_legacy_plans_are_cleaned_without_a_replan(self) -> None:
+        legacy = "[ti:x]\n[kana:1あ]\n[00:01.00]詞\n"
+        cleaned = strip_provider_tags(legacy, "lrc")
+        self.assertNotIn("kana:", cleaned)
+        self.assertIn("[00:01.00]詞", cleaned)
+        # A native QRC keeps its tag: that is what --qrc is for.
+        native = "[0,100](0,10)あ\n[kana:1あ]\n"
+        self.assertEqual(strip_provider_tags(native, "qrc"), native)
+
+    def test_netease_json_credits_are_not_lyrics(self) -> None:
+        # The newer YRC mixes JSON credit lines into the timeline; they used to
+        # come out as a lyric line beginning with '{"t":0'.
+        yrc = (
+            '{"t":0,"c":[{"tx":"作词 : Ayase"}]}\n'
+            "[1000,2000](1000,300,0)時(1300,300,0)計\n"
+        )
+        lines = parse_yrc(yrc)
+        self.assertEqual([line.text for line in lines if line.tag], ['{"t":0,"c":[{"tx":"作词 : Ayase"}]}'])
+        self.assertNotIn('{"t"', lines_to_a2(lines))
+        self.assertEqual(lines_to_a2(lines).strip(), "[00:01.00]<00:01.00>時<00:01.30>計")
+
+
+class FormatColorTests(unittest.TestCase):
+    """`scan` has to tell seven formats apart at a glance."""
+
+    def test_every_format_gets_its_own_colour(self) -> None:
+        colours = list(render.LYRIC_COLORS.values())
+        self.assertEqual(len(colours), len(set(colours)))
+
+    def test_a2_is_not_a_shade_of_lrc(self) -> None:
+        # The original pair was green and *bold* green: same hue, same
+        # terminal column, indistinguishable on purpose-built dark themes.
+        self.assertNotEqual(render.LYRIC_COLORS["a2"], render.LYRIC_COLORS["lrc"])
+
+    def test_the_help_table_reads_the_palette_instead_of_literal_codes(self) -> None:
+        # Two places paint the format tags: `scan` and `§ 格式` in the help.
+        # They drifted once (both hardcoded `1;32` for A2); reading the same
+        # map is the only thing that keeps them together.
+        import inspect
+
+        from lrc_patch import cli_args
+
+        source = inspect.getsource(cli_args)
+        for key in ("plain", "lrc", "a2", "eslrc", "yrc", "qrc", "ttml"):
+            with self.subTest(format=key):
+                self.assertIn(f'LYRIC_COLORS["{key}"]', source)
 
 
 if __name__ == "__main__":

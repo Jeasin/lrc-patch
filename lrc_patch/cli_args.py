@@ -16,7 +16,7 @@ from .config import (
     source_label,
 )
 from .errors import ToolError
-from .render import disp_width, style
+from .render import LYRIC_COLORS, disp_width, style
 
 
 COMMAND_NAMES = {
@@ -225,13 +225,17 @@ def main_help(config: Config | None = None) -> str:
 
     formats = _table(
         [
-            ("TXT", style("TXT", "36"), "纯文本，没有时间轴"),
-            ("LRC", style("LRC", "32"), "逐行时间轴，最常见的格式"),
-            ("A2", style("A2", "1;32"), "LRC A2 逐字（尖括号 <mm:ss.xx> 标记）"),
-            ("ESLRC", style("ESLRC", "1;33"), "ESLyric / SPL 逐字（行内方括号 [mm:ss.xx]）"),
-            ("YRC", style("YRC", "1;34"), "网易云逐字 [起始,时长](起始,时长,0)"),
-            ("QRC", style("QRC", "1;36"), "QQ 音乐逐字 [起始,时长]文本(起始,时长)"),
-            ("TTML", style("TTML", "1;35"), "Apple Music 的 XML 歌词"),
+            ("TXT", style("TXT", LYRIC_COLORS["plain"]), "纯文本，没有时间轴"),
+            ("LRC", style("LRC", LYRIC_COLORS["lrc"]), "逐行时间轴，最常见的格式"),
+            ("A2", style("A2", LYRIC_COLORS["a2"]), "LRC A2 逐字（尖括号 <mm:ss.xx> 标记）"),
+            (
+                "ESLRC",
+                style("ESLRC", LYRIC_COLORS["eslrc"]),
+                "ESLyric / SPL 逐字（行内方括号 [mm:ss.xx]）",
+            ),
+            ("YRC", style("YRC", LYRIC_COLORS["yrc"]), "网易云逐字 [起始,时长](起始,时长,0)"),
+            ("QRC", style("QRC", LYRIC_COLORS["qrc"]), "QQ 音乐逐字 [起始,时长]文本(起始,时长)"),
+            ("TTML", style("TTML", LYRIC_COLORS["ttml"]), "Apple Music 的 XML 歌词"),
         ],
         indent="  ",
     )
